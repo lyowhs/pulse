@@ -17,10 +17,7 @@ var signCmd = &cobra.Command{
 }
 
 func init() {
-	signCmd.Flags().String("key", "", "hex or base58 encoded signing key (required, env: PULSE_KEY)")
 	signCmd.Flags().String("message", "", "message to sign (required, env: PULSE_MESSAGE)")
-
-	viper.BindPFlag("key", signCmd.Flags().Lookup("key"))
 	viper.BindPFlag("message", signCmd.Flags().Lookup("message"))
 
 	keysCmd.AddCommand(signCmd)

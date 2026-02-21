@@ -4,18 +4,16 @@ import (
 	"encoding/hex"
 	falcon "example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
-	"io"
-	"os"
-	"strings"
 
 	"github.com/mr-tron/base58"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 var pubkeyCmd = &cobra.Command{
 	Use:   "pubkey",
 	Short: "Derive the public key from a secret key",
-	Long:  "Derive the Falcon verifying (public) key from a hex or base58 encoded signing (secret) key read from stdin. The output encoding matches the input encoding.",
+	Long:  "Derive the Falcon verifying (public) key from a hex or base58 encoded signing (secret) key. The output encoding matches the input encoding.",
 	RunE:  runPubkey,
 }
 
@@ -24,19 +22,10 @@ func init() {
 }
 
 func runPubkey(cmd *cobra.Command, args []string) error {
-	stat, err := os.Stdin.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to stat stdin: %w", err)
+	input := viper.GetString("key")
+	if input == "" {
+		return fmt.Errorf("--key is required")
 	}
-	if stat.Mode()&os.ModeCharDevice != 0 {
-		return fmt.Errorf("no input provided: pipe a secret key to this command")
-	}
-
-	raw, err := io.ReadAll(cmd.InOrStdin())
-	if err != nil {
-		return fmt.Errorf("failed to read stdin: %w", err)
-	}
-	input := strings.TrimSpace(string(raw))
 
 	skey, isHex, err := decodeKey(input)
 	if err != nil {
