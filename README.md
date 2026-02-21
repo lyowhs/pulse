@@ -100,30 +100,40 @@ $ pulse keys pubkey --key "$(cat signing.key)" > verifying.key
 
 ### keys sign
 
-Sign a message using a signing key. The signature is printed to stdout as a base64-encoded string.
+Sign a message using a signing key.
 
 ```
-pulse keys sign --key <secret-key> --message <message>
+pulse keys sign --key <secret-key> --message <message> --base64 | --binary
 ```
 
 | Flag | Description |
 |---|---|
 | `--key` | Hex, base58, or raw binary encoded signing key (required, env: `PULSE_KEY`) |
 | `--message` | Message to sign (required, env: `PULSE_MESSAGE`) |
+| `--base64` | Output the signature as a base64-encoded string |
+| `--binary` | Output the signature as raw binary bytes |
+
+`--base64` and `--binary` are mutually exclusive.
 
 **Examples**
 
-Sign a message:
+Sign a message and output base64:
 
 ```sh
-$ pulse keys sign --key "$SK" --message "Hello World!"
+$ pulse keys sign --key "$SK" --message "Hello World!" --base64
 ObHohkPYPEy9fB0jUuyCkF0aLwyDOOP+Gc7x1R...
+```
+
+Sign a binary message and write a binary signature to a file:
+
+```sh
+$ pulse keys sign --key "$SK" --message "$(cat data.bin)" --binary > sig.bin
 ```
 
 Store the signature in a shell variable:
 
 ```sh
-SIG=$(pulse keys sign --key "$SK" --message "Hello World!")
+SIG=$(pulse keys sign --key "$SK" --message "Hello World!" --base64)
 ```
 
 ---
@@ -133,35 +143,46 @@ SIG=$(pulse keys sign --key "$SK" --message "Hello World!")
 Verify a signature against a message and public key. Exits with code `0` and prints `signature valid` on success, or exits with a non-zero code and prints `signature invalid` on failure.
 
 ```
-pulse keys verify --pubkey <public-key> --message <message> --signature <signature>
+pulse keys verify --pubkey <public-key> --message <message> --signature <signature> --base64 | --binary
 ```
 
 | Flag | Description |
 |---|---|
 | `--pubkey` | Hex, base58, or raw binary encoded verifying key (required, env: `PULSE_PUBKEY`) |
 | `--message` | Message that was signed (required, env: `PULSE_MESSAGE`) |
-| `--signature` | Base64 encoded signature (required, env: `PULSE_SIGNATURE`) |
+| `--signature` | Signature to verify (required, env: `PULSE_SIGNATURE`) |
+| `--base64` | Signature is base64-encoded |
+| `--binary` | Signature is raw binary bytes |
+
+`--base64` and `--binary` are mutually exclusive.
 
 **Examples**
 
-Verify a valid signature:
+Verify a valid base64 signature:
 
 ```sh
-$ pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG"
+$ pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG" --base64
+signature valid
+```
+
+Verify a binary signature against a binary message:
+
+```sh
+$ pulse keys verify --pubkey "$PK" --message "$(cat data.bin)" --signature "$(cat sig.bin)" --binary
 signature valid
 ```
 
 Verify with the wrong message (exits non-zero):
 
 ```sh
-$ pulse keys verify --pubkey "$PK" --message "Wrong message" --signature "$SIG"
+$ pulse keys verify --pubkey "$PK" --message "Wrong message" --signature "$SIG" --base64
 Error: signature invalid
 ```
 
 Verify with a tampered signature (exits non-zero):
 
 ```sh
-$ pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "aW52YWxpZA=="
+$ pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "aW52YWxpZA==" --base64
 Error: signature invalid
 ```
 
@@ -177,10 +198,10 @@ SK=$(pulse keys keygen --base58)
 PK=$(pulse keys pubkey --key "$SK")
 
 # Sign
-SIG=$(pulse keys sign --key "$SK" --message "Hello World!")
+SIG=$(pulse keys sign --key "$SK" --message "Hello World!" --base64)
 
 # Verify
-pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG"
+pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG" --base64
 # signature valid
 ```
 
@@ -199,8 +220,8 @@ All flags can be set via environment variables, which is useful for scripting wi
 export PULSE_KEY=$(pulse keys keygen --base58)
 export PULSE_PUBKEY=$(pulse keys pubkey)
 export PULSE_MESSAGE="Hello World!"
-export PULSE_SIGNATURE=$(pulse keys sign)
+export PULSE_SIGNATURE=$(pulse keys sign --base64)
 
-pulse keys verify
+pulse keys verify --base64
 # signature valid
 ```
