@@ -1,14 +1,12 @@
 package keys
 
 import (
-	"crypto"
-	"encoding/base64"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	fndsa "example.com/pulse/pulse/pkg/crypto/falcon"
+	"example.com/pulse/pulse/pkg/keys"
 )
 
 func signCommand() *cobra.Command {
@@ -37,16 +35,11 @@ func runSign(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--message is required")
 	}
 
-	skey, _, err := decodeKey(key)
+	sig, err := keys.Sign(key, []byte(msg))
 	if err != nil {
-		return fmt.Errorf("failed to decode signing key: %w", err)
+		return err
 	}
 
-	sig, err := fndsa.Sign(nil, skey, fndsa.DOMAIN_NONE, crypto.Hash(0), []byte(msg))
-	if err != nil {
-		return fmt.Errorf("sign failed: %w", err)
-	}
-
-	fmt.Println(base64.StdEncoding.EncodeToString(sig))
+	fmt.Println(sig)
 	return nil
 }

@@ -1,13 +1,11 @@
 package keys
 
 import (
-	"encoding/hex"
 	"fmt"
 
-	"github.com/mr-tron/base58"
 	"github.com/spf13/cobra"
 
-	falcon "example.com/pulse/pulse/pkg/crypto/falcon"
+	"example.com/pulse/pulse/pkg/keys"
 )
 
 func keygenCommand() *cobra.Command {
@@ -33,15 +31,16 @@ func runKeygen(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("one of --hex or --base58 is required")
 	}
 
-	skey, _, err := falcon.KeyGen(9, nil)
-	if err != nil {
-		return fmt.Errorf("keygen failed: %w", err)
+	enc := keys.Base58
+	if useHex {
+		enc = keys.Hex
 	}
 
-	if useHex {
-		fmt.Println(hex.EncodeToString(skey))
-	} else {
-		fmt.Println(base58.Encode(skey))
+	sk, err := keys.Generate(enc)
+	if err != nil {
+		return err
 	}
+
+	fmt.Println(sk)
 	return nil
 }

@@ -1,14 +1,12 @@
 package keys
 
 import (
-	"crypto"
-	"encoding/base64"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	fndsa "example.com/pulse/pulse/pkg/crypto/falcon"
+	"example.com/pulse/pulse/pkg/keys"
 )
 
 func verifyCommand() *cobra.Command {
@@ -46,17 +44,10 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--signature is required")
 	}
 
-	vkey, _, err := decodeKey(pubkey)
+	ok, err := keys.Verify(pubkey, []byte(msg), sigStr)
 	if err != nil {
-		return fmt.Errorf("failed to decode public key: %w", err)
+		return err
 	}
-
-	sig, err := base64.StdEncoding.DecodeString(sigStr)
-	if err != nil {
-		return fmt.Errorf("failed to decode signature: %w", err)
-	}
-
-	ok := fndsa.Verify(vkey, fndsa.DOMAIN_NONE, crypto.Hash(0), []byte(msg), sig)
 	if ok {
 		fmt.Println("signature valid")
 		return nil

@@ -1,14 +1,12 @@
 package keys
 
 import (
-	"encoding/hex"
 	"fmt"
 
-	"github.com/mr-tron/base58"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	falcon "example.com/pulse/pulse/pkg/crypto/falcon"
+	"example.com/pulse/pulse/pkg/keys"
 )
 
 func pubkeyCommand() *cobra.Command {
@@ -26,33 +24,11 @@ func runPubkey(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--key is required")
 	}
 
-	skey, isHex, err := decodeKey(input)
+	pk, err := keys.PublicKey(input)
 	if err != nil {
-		return fmt.Errorf("failed to decode secret key: %w", err)
+		return err
 	}
 
-	vkey, err := falcon.PublicKeyFromSecretKey(skey)
-	if err != nil {
-		return fmt.Errorf("failed to derive public key: %w", err)
-	}
-
-	if isHex {
-		fmt.Println(hex.EncodeToString(vkey))
-	} else {
-		fmt.Println(base58.Encode(vkey))
-	}
+	fmt.Println(pk)
 	return nil
-}
-
-// decodeKey attempts to decode the input as hex first, then falls back to
-// base58. Returns the decoded bytes and whether hex encoding was used.
-func decodeKey(input string) ([]byte, bool, error) {
-	if b, err := hex.DecodeString(input); err == nil {
-		return b, true, nil
-	}
-	b, err := base58.Decode(input)
-	if err != nil {
-		return nil, false, fmt.Errorf("input is neither valid hex nor valid base58")
-	}
-	return b, false, nil
 }
