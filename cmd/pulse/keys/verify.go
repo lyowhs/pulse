@@ -1,30 +1,31 @@
-package main
+package keys
 
 import (
 	"crypto"
 	"encoding/base64"
-	"example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	fndsa "example.com/pulse/pulse/pkg/crypto/falcon"
 )
 
-var verifyCmd = &cobra.Command{
-	Use:   "verify",
-	Short: "Verify a Falcon signature",
-	RunE:  runVerify,
-}
+func verifyCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "verify",
+		Short: "Verify a Falcon signature",
+		RunE:  runVerify,
+	}
 
-func init() {
-	verifyCmd.Flags().String("pubkey", "", "hex or base58 encoded verifying key (required, env: PULSE_PUBKEY)")
-	verifyCmd.Flags().String("message", "", "message that was signed (required, env: PULSE_MESSAGE)")
-	verifyCmd.Flags().String("signature", "", "base64 encoded signature (required, env: PULSE_SIGNATURE)")
+	cmd.Flags().String("pubkey", "", "hex or base58 encoded verifying key (required, env: PULSE_PUBKEY)")
+	cmd.Flags().String("message", "", "message that was signed (required, env: PULSE_MESSAGE)")
+	cmd.Flags().String("signature", "", "base64 encoded signature (required, env: PULSE_SIGNATURE)")
 
-	viper.BindPFlag("pubkey", verifyCmd.Flags().Lookup("pubkey"))
-	viper.BindPFlag("signature", verifyCmd.Flags().Lookup("signature"))
+	viper.BindPFlag("pubkey", cmd.Flags().Lookup("pubkey"))
+	viper.BindPFlag("signature", cmd.Flags().Lookup("signature"))
 
-	keysCmd.AddCommand(verifyCmd)
+	return cmd
 }
 
 func runVerify(cmd *cobra.Command, args []string) error {

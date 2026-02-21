@@ -1,26 +1,28 @@
-package main
+package keys
 
 import (
 	"encoding/hex"
-	falcon "example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
 
 	"github.com/mr-tron/base58"
 	"github.com/spf13/cobra"
+
+	falcon "example.com/pulse/pulse/pkg/crypto/falcon"
 )
 
-var keygenCmd = &cobra.Command{
-	Use:   "keygen",
-	Short: "Generate a new Falcon-512 key pair",
-	Long:  "Generate a Falcon-512 (FN-DSA) key pair and print the signing key to stdout.",
-	RunE:  runKeygen,
-}
+func keygenCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "keygen",
+		Short: "Generate a new Falcon-512 key pair",
+		Long:  "Generate a Falcon-512 (FN-DSA) key pair and print the signing key to stdout.",
+		RunE:  runKeygen,
+	}
 
-func init() {
-	keygenCmd.Flags().Bool("hex", false, "output signing key as a hex-encoded string")
-	keygenCmd.Flags().Bool("base58", false, "output signing key as a base58-encoded string")
-	keygenCmd.MarkFlagsMutuallyExclusive("hex", "base58")
-	keysCmd.AddCommand(keygenCmd)
+	cmd.Flags().Bool("hex", false, "output signing key as a hex-encoded string")
+	cmd.Flags().Bool("base58", false, "output signing key as a base58-encoded string")
+	cmd.MarkFlagsMutuallyExclusive("hex", "base58")
+
+	return cmd
 }
 
 func runKeygen(cmd *cobra.Command, args []string) error {

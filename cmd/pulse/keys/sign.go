@@ -1,24 +1,26 @@
-package main
+package keys
 
 import (
 	"crypto"
 	"encoding/base64"
-	"example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	fndsa "example.com/pulse/pulse/pkg/crypto/falcon"
 )
 
-var signCmd = &cobra.Command{
-	Use:   "sign",
-	Short: "Sign a message using a Falcon signing key",
-	RunE:  runSign,
-}
+func signCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "sign",
+		Short: "Sign a message using a Falcon signing key",
+		RunE:  runSign,
+	}
 
-func init() {
-	signCmd.Flags().String("message", "", "message to sign (required, env: PULSE_MESSAGE)")
-	keysCmd.AddCommand(signCmd)
+	cmd.Flags().String("message", "", "message to sign (required, env: PULSE_MESSAGE)")
+
+	return cmd
 }
 
 func runSign(cmd *cobra.Command, args []string) error {

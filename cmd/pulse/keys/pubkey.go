@@ -1,24 +1,23 @@
-package main
+package keys
 
 import (
 	"encoding/hex"
-	falcon "example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
 
 	"github.com/mr-tron/base58"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	falcon "example.com/pulse/pulse/pkg/crypto/falcon"
 )
 
-var pubkeyCmd = &cobra.Command{
-	Use:   "pubkey",
-	Short: "Derive the public key from a secret key",
-	Long:  "Derive the Falcon verifying (public) key from a hex or base58 encoded signing (secret) key. The output encoding matches the input encoding.",
-	RunE:  runPubkey,
-}
-
-func init() {
-	keysCmd.AddCommand(pubkeyCmd)
+func pubkeyCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "pubkey",
+		Short: "Derive the public key from a secret key",
+		Long:  "Derive the Falcon verifying (public) key from a hex or base58 encoded signing (secret) key. The output encoding matches the input encoding.",
+		RunE:  runPubkey,
+	}
 }
 
 func runPubkey(cmd *cobra.Command, args []string) error {
