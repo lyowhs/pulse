@@ -1,0 +1,71 @@
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/mr-tron/base58"
+	"github.com/spf13/cobra"
+
+	falcon "example.com/pulse/pulse/pkg/falcon"
+)
+
+var pubkeyCmd = &cobra.Command{
+	Use:   "pubkey",
+	Short: "Derive the public key from a secret key",
+	Long:  "Derive the Falcon verifying (public) key from a hex or base58 encoded signing (secret) key read from stdin. The output encoding matches the input encoding.",
+	RunE:  runPubkey,
+}
+
+func init() {
+	keysCmd.AddCommand(pubkeyCmd)
+}
+
+func runPubkey(cmd *cobra.Command, args []string) error {
+	stat, err := os.Stdin.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat stdin: %w", err)
+	}
+	if stat.Mode()&os.ModeCharDevice != 0 {
+		return fmt.Errorf("no input provided: pipe a secret key to this command")
+	}
+
+	raw, err := io.ReadAll(cmd.InOrStdin())
+	if err != nil {
+		return fmt.Errorf("failed to read stdin: %w", err)
+	}
+	input := strings.TrimSpace(string(raw))
+
+	skey, isHex, err := decodeKey(input)
+	if err != nil {
+		return fmt.Errorf("failed to decode secret key: %w", err)
+	}
+
+	vkey, err := falcon.PublicKeyFromSecretKey(skey)
+	if err != nil {
+		return fmt.Errorf("failed to derive public key: %w", err)
+	}
+
+	if isHex {
+		fmt.Println(hex.EncodeToString(vkey))
+	} else {
+		fmt.Println(base58.Encode(vkey))
+	}
+	return nil
+}
+
+// decodeKey attempts to decode the input as hex first, then falls back to
+// base58. Returns the decoded bytes and whether hex encoding was used.
+func decodeKey(input string) ([]byte, bool, error) {
+	if b, err := hex.DecodeString(input); err == nil {
+		return b, true, nil
+	}
+	b, err := base58.Decode(input)
+	if err != nil {
+		return nil, false, fmt.Errorf("input is neither valid hex nor valid base58")
+	}
+	return b, false, nil
+}
