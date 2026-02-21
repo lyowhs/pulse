@@ -9,7 +9,16 @@
       "Bash(/tmp/pubkeycheck.go:*)",
       "Bash(go run:*)",
       "Bash(go test:*)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "WebSearch",
+      "WebFetch(domain:eprint.iacr.org)",
+      "WebFetch(domain:crypto.stanford.edu)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:blog.trailofbits.com)",
+      "WebFetch(domain:docs.chia.net)",
+      "WebFetch(domain:docs.quilibrium.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:drops.dagstuhl.de)"
     ]
   }
 }
