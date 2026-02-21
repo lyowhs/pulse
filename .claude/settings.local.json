@@ -5,7 +5,11 @@
       "Bash(go mod tidy:*)",
       "Bash(go get:*)",
       "Bash(/tmp/pulse keygen:*)",
-      "Bash(/tmp/pulse keys:*)"
+      "Bash(/tmp/pulse keys:*)",
+      "Bash(/tmp/pubkeycheck.go:*)",
+      "Bash(go run:*)",
+      "Bash(go test:*)",
+      "Bash(echo:*)"
     ]
   }
 }
