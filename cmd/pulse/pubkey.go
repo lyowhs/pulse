@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	falcon "example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
 	"io"
 	"os"
@@ -9,8 +10,6 @@ import (
 
 	"github.com/mr-tron/base58"
 	"github.com/spf13/cobra"
-
-	falcon "example.com/pulse/pulse/pkg/falcon"
 )
 
 var pubkeyCmd = &cobra.Command{

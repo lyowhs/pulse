@@ -2,13 +2,12 @@ package main
 
 import (
 	"crypto"
+	"example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-
-	falcon "example.com/pulse/pulse/pkg/falcon"
 )
 
 var signCmd = &cobra.Command{
@@ -46,7 +45,7 @@ func runSign(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to read signing key: %w", err)
 	}
 
-	sig, err := falcon.Sign(nil, skey, falcon.DOMAIN_NONE, crypto.Hash(0), []byte(msg))
+	sig, err := fndsa.Sign(nil, skey, fndsa.DOMAIN_NONE, crypto.Hash(0), []byte(msg))
 	if err != nil {
 		return fmt.Errorf("sign failed: %w", err)
 	}

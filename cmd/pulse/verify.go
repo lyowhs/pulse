@@ -2,13 +2,12 @@ package main
 
 import (
 	"crypto"
+	"example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-
-	falcon "example.com/pulse/pulse/pkg/falcon"
 )
 
 var verifyCmd = &cobra.Command{
@@ -53,7 +52,7 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to read signature: %w", err)
 	}
 
-	ok := falcon.Verify(vkey, falcon.DOMAIN_NONE, crypto.Hash(0), []byte(msg), sig)
+	ok := fndsa.Verify(vkey, fndsa.DOMAIN_NONE, crypto.Hash(0), []byte(msg), sig)
 	if ok {
 		fmt.Println("signature valid")
 		return nil

@@ -1,8 +1,8 @@
 package fndsa
 
 import (
-	"testing"
 	sha3 "golang.org/x/crypto/sha3"
+	"testing"
 )
 
 func TestSigningKeySize(t *testing.T) {
