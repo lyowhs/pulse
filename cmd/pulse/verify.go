@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
+
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -16,7 +17,7 @@ var verifyCmd = &cobra.Command{
 }
 
 func init() {
-	verifyCmd.Flags().String("pubkey", "", "path to verifying key file (required, env: PULSE_PUBKEY)")
+	verifyCmd.Flags().String("pubkey", "", "hex or base58 encoded verifying key (required, env: PULSE_PUBKEY)")
 	verifyCmd.Flags().String("message", "", "message that was signed (required, env: PULSE_MESSAGE)")
 	verifyCmd.Flags().String("signature", "", "base64 encoded signature (required, env: PULSE_SIGNATURE)")
 
@@ -28,7 +29,10 @@ func init() {
 
 func runVerify(cmd *cobra.Command, args []string) error {
 	pubkey := viper.GetString("pubkey")
-	msg := viper.GetString("message")
+	msg, _ := cmd.Flags().GetString("message")
+	if msg == "" {
+		msg = viper.GetString("message")
+	}
 	sigStr := viper.GetString("signature")
 
 	if pubkey == "" {
@@ -41,12 +45,17 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--signature is required")
 	}
 
+	vkey, _, err := decodeKey(pubkey)
+	if err != nil {
+		return fmt.Errorf("failed to decode public key: %w", err)
+	}
+
 	sig, err := base64.StdEncoding.DecodeString(sigStr)
 	if err != nil {
 		return fmt.Errorf("failed to decode signature: %w", err)
 	}
 
-	ok := fndsa.Verify([]byte(pubkey), fndsa.DOMAIN_NONE, crypto.Hash(0), []byte(msg), sig)
+	ok := fndsa.Verify(vkey, fndsa.DOMAIN_NONE, crypto.Hash(0), []byte(msg), sig)
 	if ok {
 		fmt.Println("signature valid")
 		return nil

@@ -18,7 +18,10 @@
       "WebFetch(domain:docs.chia.net)",
       "WebFetch(domain:docs.quilibrium.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:drops.dagstuhl.de)"
+      "WebFetch(domain:drops.dagstuhl.de)",
+      "Bash(chmod:*)",
+      "Bash(PULSE_BIN=/tmp/pulse /Users/lyowhs/Git/pulse/scripts/test_sign_verify.sh:*)",
+      "Bash(bash /Users/lyowhs/Git/pulse/scripts/test_sign_verify.sh)"
     ]
   }
 }

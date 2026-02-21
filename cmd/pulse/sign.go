@@ -18,14 +18,15 @@ var signCmd = &cobra.Command{
 
 func init() {
 	signCmd.Flags().String("message", "", "message to sign (required, env: PULSE_MESSAGE)")
-	viper.BindPFlag("message", signCmd.Flags().Lookup("message"))
-
 	keysCmd.AddCommand(signCmd)
 }
 
 func runSign(cmd *cobra.Command, args []string) error {
 	key := viper.GetString("key")
-	msg := viper.GetString("message")
+	msg, _ := cmd.Flags().GetString("message")
+	if msg == "" {
+		msg = viper.GetString("message")
+	}
 
 	if key == "" {
 		return fmt.Errorf("--key is required")
