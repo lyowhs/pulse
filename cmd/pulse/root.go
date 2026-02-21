@@ -14,7 +14,7 @@ var cfgFile string
 
 var rootCmd = &cobra.Command{
 	Use:   "pulse",
-	Short: "Post-quantum cryptography CLI using Falcon (FN-DSA)",
+	Short: "Post-quantum cryptography CLI",
 }
 
 func Execute() {

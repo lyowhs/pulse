@@ -12,7 +12,7 @@ import (
 func verifyCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "verify",
-		Short: "Verify a Falcon signature",
+		Short: "Verify a signature",
 		RunE:  runVerify,
 	}
 

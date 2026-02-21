@@ -2,6 +2,7 @@ package keys
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -13,7 +14,7 @@ func pubkeyCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "pubkey",
 		Short: "Derive the public key from a secret key",
-		Long:  "Derive the Falcon verifying (public) key from a hex or base58 encoded signing (secret) key. The output encoding matches the input encoding.",
+		Long:  "Derive the verifying (public) key from a hex, base58, or binary encoded signing (secret) key. The output encoding matches the input encoding.",
 		RunE:  runPubkey,
 	}
 }
@@ -24,11 +25,17 @@ func runPubkey(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--key is required")
 	}
 
+	_, enc, _ := keys.Decode(input)
+
 	pk, err := keys.PublicKey(input)
 	if err != nil {
 		return err
 	}
 
+	if enc == keys.Binary {
+		os.Stdout.Write([]byte(pk))
+		return nil
+	}
 	fmt.Println(pk)
 	return nil
 }

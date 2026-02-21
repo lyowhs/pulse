@@ -1,6 +1,6 @@
 # Pulse
 
-Post-quantum cryptography CLI using [Falcon (FN-DSA)](https://falcon-sign.info), a lattice-based digital signature scheme being standardised by NIST.
+Post-quantum cryptography CLI.
 
 ## keys
 
@@ -12,24 +12,25 @@ pulse keys [--key <secret-key>] <command>
 
 | Flag | Description |
 |---|---|
-| `--key` | Hex or base58 encoded signing key (env: `PULSE_KEY`) |
+| `--key` | Hex, base58, or raw binary encoded signing key (env: `PULSE_KEY`) |
 
 ---
 
 ### keys keygen
 
-Generate a new Falcon-512 key pair and print the signing (secret) key to stdout. The output encoding is selected with a required flag.
+Generate a new signing key pair and print the signing (secret) key to stdout. The output encoding is selected with a required flag.
 
 ```
-pulse keys keygen --hex | --base58
+pulse keys keygen --hex | --base58 | --binary
 ```
 
 | Flag | Description |
 |---|---|
 | `--hex` | Output the signing key as a hex-encoded string |
 | `--base58` | Output the signing key as a base58-encoded string |
+| `--binary` | Output the signing key as raw binary bytes |
 
-`--hex` and `--base58` are mutually exclusive.
+`--hex`, `--base58`, and `--binary` are mutually exclusive.
 
 **Examples**
 
@@ -47,6 +48,12 @@ $ pulse keys keygen --hex
 5968014d2a3f8bc4e1f2a09c3b7d56e1a84f2c...
 ```
 
+Generate a raw binary signing key:
+
+```sh
+$ pulse keys keygen --binary > signing.key
+```
+
 Store a key in a shell variable for use in subsequent commands:
 
 ```sh
@@ -57,7 +64,7 @@ SK=$(pulse keys keygen --base58)
 
 ### keys pubkey
 
-Derive the verifying (public) key from a signing (secret) key. The output encoding matches the input encoding — a base58 key produces a base58 public key, and a hex key produces a hex public key.
+Derive the verifying (public) key from a signing (secret) key. The output encoding matches the input encoding — a base58 key produces a base58 public key, a hex key produces a hex public key, and a binary key produces raw binary output.
 
 ```
 pulse keys pubkey --key <secret-key>
@@ -65,7 +72,7 @@ pulse keys pubkey --key <secret-key>
 
 | Flag | Description |
 |---|---|
-| `--key` | Hex or base58 encoded signing key (required, env: `PULSE_KEY`) |
+| `--key` | Hex, base58, or raw binary encoded signing key (required, env: `PULSE_KEY`) |
 
 **Examples**
 
@@ -83,11 +90,17 @@ $ pulse keys keygen --base58 | xargs -I{} pulse keys pubkey --key {}
 32kWXnipz7SmWmRCGjGoJ4NokAPCiwZf3ACpKAu...
 ```
 
+Derive a public key from a binary signing key file:
+
+```sh
+$ pulse keys pubkey --key "$(cat signing.key)" > verifying.key
+```
+
 ---
 
 ### keys sign
 
-Sign a message using a Falcon signing key. The signature is printed to stdout as a base64-encoded string.
+Sign a message using a signing key. The signature is printed to stdout as a base64-encoded string.
 
 ```
 pulse keys sign --key <secret-key> --message <message>
@@ -95,7 +108,7 @@ pulse keys sign --key <secret-key> --message <message>
 
 | Flag | Description |
 |---|---|
-| `--key` | Hex or base58 encoded signing key (required, env: `PULSE_KEY`) |
+| `--key` | Hex, base58, or raw binary encoded signing key (required, env: `PULSE_KEY`) |
 | `--message` | Message to sign (required, env: `PULSE_MESSAGE`) |
 
 **Examples**
@@ -117,7 +130,7 @@ SIG=$(pulse keys sign --key "$SK" --message "Hello World!")
 
 ### keys verify
 
-Verify a Falcon signature against a message and public key. Exits with code `0` and prints `signature valid` on success, or exits with a non-zero code and prints `signature invalid` on failure.
+Verify a signature against a message and public key. Exits with code `0` and prints `signature valid` on success, or exits with a non-zero code and prints `signature invalid` on failure.
 
 ```
 pulse keys verify --pubkey <public-key> --message <message> --signature <signature>
@@ -125,7 +138,7 @@ pulse keys verify --pubkey <public-key> --message <message> --signature <signatu
 
 | Flag | Description |
 |---|---|
-| `--pubkey` | Hex or base58 encoded verifying key (required, env: `PULSE_PUBKEY`) |
+| `--pubkey` | Hex, base58, or raw binary encoded verifying key (required, env: `PULSE_PUBKEY`) |
 | `--message` | Message that was signed (required, env: `PULSE_MESSAGE`) |
 | `--signature` | Base64 encoded signature (required, env: `PULSE_SIGNATURE`) |
 

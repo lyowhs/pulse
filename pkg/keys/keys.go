@@ -1,6 +1,7 @@
-// Package keys provides domain logic for Falcon key generation, public key
+// Package keys provides domain logic for key generation, public key
 // derivation, message signing, and signature verification. Keys are
-// represented as encoded strings (hex or base58); signatures are base64.
+// represented as encoded strings (hex, base58, or raw binary); signatures
+// are base64.
 package keys
 
 import (
@@ -14,16 +15,17 @@ import (
 	fndsa "example.com/pulse/pulse/pkg/crypto/falcon"
 )
 
-// Encoding represents the string encoding format used for a key.
+// Encoding represents the encoding format used for a key.
 type Encoding uint8
 
 const (
 	Hex    Encoding = iota
 	Base58 Encoding = iota
+	Binary Encoding = iota
 )
 
-// Generate generates a new Falcon-512 signing key and returns it encoded in
-// the specified format.
+// Generate generates a new signing key and returns it encoded in the specified
+// format.
 func Generate(enc Encoding) (string, error) {
 	skey, _, err := fndsa.KeyGen(9, nil)
 	if err != nil {
@@ -74,23 +76,27 @@ func Verify(encodedPublicKey string, message []byte, base64Sig string) (bool, er
 	return fndsa.Verify(vkey, fndsa.DOMAIN_NONE, crypto.Hash(0), message, sig), nil
 }
 
-// Decode decodes a hex or base58 encoded key, returning the raw bytes and
-// detected encoding. Hex is tried first.
+// Decode decodes a key, returning its raw bytes and detected encoding.
+// Hex is tried first, then base58. If neither matches, the input is treated
+// as raw binary bytes.
 func Decode(encoded string) ([]byte, Encoding, error) {
 	if b, err := hex.DecodeString(encoded); err == nil {
 		return b, Hex, nil
 	}
-	b, err := base58.Decode(encoded)
-	if err != nil {
-		return nil, 0, fmt.Errorf("key is neither valid hex nor valid base58")
+	if b, err := base58.Decode(encoded); err == nil {
+		return b, Base58, nil
 	}
-	return b, Base58, nil
+	return []byte(encoded), Binary, nil
 }
 
 // Encode encodes raw key bytes into the specified format.
 func Encode(raw []byte, enc Encoding) string {
-	if enc == Hex {
+	switch enc {
+	case Hex:
 		return hex.EncodeToString(raw)
+	case Base58:
+		return base58.Encode(raw)
+	default: // Binary
+		return string(raw)
 	}
-	return base58.Encode(raw)
 }

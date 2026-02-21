@@ -12,7 +12,7 @@ import (
 func signCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "sign",
-		Short: "Sign a message using a Falcon signing key",
+		Short: "Sign a message using a signing key",
 		RunE:  runSign,
 	}
 

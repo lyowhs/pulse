@@ -6,7 +6,7 @@ import (
 )
 
 func TestGenerateAndPublicKey(t *testing.T) {
-	for _, enc := range []Encoding{Hex, Base58} {
+	for _, enc := range []Encoding{Hex, Base58, Binary} {
 		sk, err := Generate(enc)
 		if err != nil {
 			t.Fatalf("Generate: %v", err)
@@ -37,6 +37,13 @@ func TestPublicKeyPreservesEncoding(t *testing.T) {
 	_, enc, _ = Decode(pkB58)
 	if enc != Base58 {
 		t.Fatal("expected base58 encoding to be preserved")
+	}
+
+	skBin, _ := Generate(Binary)
+	pkBin, _ := PublicKey(skBin)
+	_, enc, _ = Decode(pkBin)
+	if enc != Binary {
+		t.Fatal("expected binary encoding to be preserved")
 	}
 }
 
@@ -113,9 +120,24 @@ func TestDecodeBase58(t *testing.T) {
 	}
 }
 
-func TestDecodeInvalid(t *testing.T) {
-	_, _, err := Decode("not-valid-!!!")
-	if err == nil {
-		t.Fatal("expected error for invalid input")
+func TestDecodeBinary(t *testing.T) {
+	sk, _ := Generate(Binary)
+	raw, enc, _ := Decode(sk)
+	if enc != Binary {
+		t.Fatal("expected Binary encoding")
+	}
+	if len(raw) == 0 {
+		t.Fatal("expected non-empty raw bytes")
+	}
+}
+
+func TestDecodeArbitraryFallsToBinary(t *testing.T) {
+	input := "not-valid-hex-or-base58-!!!"
+	raw, enc, _ := Decode(input)
+	if enc != Binary {
+		t.Fatal("expected Binary fallback encoding")
+	}
+	if string(raw) != input {
+		t.Fatal("expected raw bytes to match input string")
 	}
 }
