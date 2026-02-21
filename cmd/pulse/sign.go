@@ -17,27 +17,27 @@ var signCmd = &cobra.Command{
 }
 
 func init() {
-	signCmd.Flags().String("sk", "", "hex or base58 encoded signing key (required, env: PULSE_SK)")
-	signCmd.Flags().String("msg", "", "message to sign (required, env: PULSE_MSG)")
+	signCmd.Flags().String("key", "", "hex or base58 encoded signing key (required, env: PULSE_KEY)")
+	signCmd.Flags().String("message", "", "message to sign (required, env: PULSE_MESSAGE)")
 
-	viper.BindPFlag("sk", signCmd.Flags().Lookup("sk"))
-	viper.BindPFlag("msg", signCmd.Flags().Lookup("msg"))
+	viper.BindPFlag("key", signCmd.Flags().Lookup("key"))
+	viper.BindPFlag("message", signCmd.Flags().Lookup("message"))
 
 	keysCmd.AddCommand(signCmd)
 }
 
 func runSign(cmd *cobra.Command, args []string) error {
-	skPath := viper.GetString("sk")
-	msg := viper.GetString("msg")
+	key := viper.GetString("key")
+	msg := viper.GetString("message")
 
-	if skPath == "" {
-		return fmt.Errorf("--sk is required")
+	if key == "" {
+		return fmt.Errorf("--key is required")
 	}
 	if msg == "" {
-		return fmt.Errorf("--msg is required")
+		return fmt.Errorf("--message is required")
 	}
 
-	skey, _, err := decodeKey(skPath)
+	skey, _, err := decodeKey(key)
 	if err != nil {
 		return fmt.Errorf("failed to decode signing key: %w", err)
 	}

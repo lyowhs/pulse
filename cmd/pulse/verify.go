@@ -2,10 +2,9 @@ package main
 
 import (
 	"crypto"
+	"encoding/base64"
 	"example.com/pulse/pulse/pkg/crypto/falcon"
 	"fmt"
-	"os"
-
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -17,42 +16,37 @@ var verifyCmd = &cobra.Command{
 }
 
 func init() {
-	verifyCmd.Flags().String("vk", "", "path to verifying key file (required, env: PULSE_VK)")
-	verifyCmd.Flags().String("msg", "", "message that was signed (required, env: PULSE_MSG)")
-	verifyCmd.Flags().String("sig", "", "path to signature file (required, env: PULSE_SIG)")
+	verifyCmd.Flags().String("pubkey", "", "path to verifying key file (required, env: PULSE_PUBKEY)")
+	verifyCmd.Flags().String("message", "", "message that was signed (required, env: PULSE_MESSAGE)")
+	verifyCmd.Flags().String("signature", "", "base64 encoded signature (required, env: PULSE_SIGNATURE)")
 
-	viper.BindPFlag("vk", verifyCmd.Flags().Lookup("vk"))
-	viper.BindPFlag("sig", verifyCmd.Flags().Lookup("sig"))
+	viper.BindPFlag("pubkey", verifyCmd.Flags().Lookup("pubkey"))
+	viper.BindPFlag("signature", verifyCmd.Flags().Lookup("signature"))
 
 	keysCmd.AddCommand(verifyCmd)
 }
 
 func runVerify(cmd *cobra.Command, args []string) error {
-	vkPath := viper.GetString("vk")
-	msg := viper.GetString("msg")
-	sigPath := viper.GetString("sig")
+	pubkey := viper.GetString("pubkey")
+	msg := viper.GetString("message")
+	sigStr := viper.GetString("signature")
 
-	if vkPath == "" {
-		return fmt.Errorf("--vk is required")
+	if pubkey == "" {
+		return fmt.Errorf("--pubkey is required")
 	}
 	if msg == "" {
-		return fmt.Errorf("--msg is required")
+		return fmt.Errorf("--message is required")
 	}
-	if sigPath == "" {
-		return fmt.Errorf("--sig is required")
+	if sigStr == "" {
+		return fmt.Errorf("--signature is required")
 	}
 
-	vkey, err := os.ReadFile(vkPath)
+	sig, err := base64.StdEncoding.DecodeString(sigStr)
 	if err != nil {
-		return fmt.Errorf("failed to read verifying key: %w", err)
+		return fmt.Errorf("failed to decode signature: %w", err)
 	}
 
-	sig, err := os.ReadFile(sigPath)
-	if err != nil {
-		return fmt.Errorf("failed to read signature: %w", err)
-	}
-
-	ok := fndsa.Verify(vkey, fndsa.DOMAIN_NONE, crypto.Hash(0), []byte(msg), sig)
+	ok := fndsa.Verify([]byte(pubkey), fndsa.DOMAIN_NONE, crypto.Hash(0), []byte(msg), sig)
 	if ok {
 		fmt.Println("signature valid")
 		return nil
