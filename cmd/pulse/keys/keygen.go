@@ -12,8 +12,8 @@ import (
 func keygenCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "keygen",
-		Short: "Generate a new signing key pair",
-		Long:  "Generate an FN-DSA key pair and print the signing key to stdout.",
+		Short: "Generate a new signing key",
+		Long:  "Generate a new signing key and print the signing key to stdout.",
 		RunE:  runKeygen,
 	}
 
