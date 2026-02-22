@@ -18,7 +18,10 @@ func signCommand() *cobra.Command {
 		RunE:  runSign,
 	}
 
-	cmd.Flags().String("message", "", "message to sign (required, env: PULSE_MESSAGE)")
+	cmd.Flags().String("message", "", "message string to sign (env: PULSE_MESSAGE)")
+	cmd.Flags().String("message-file", "", "file whose contents to sign (binary-safe)")
+	cmd.MarkFlagsMutuallyExclusive("message", "message-file")
+
 	cmd.Flags().Bool("base64", false, "output signature as a base64-encoded string")
 	cmd.Flags().Bool("binary", false, "output signature as raw binary bytes")
 	cmd.MarkFlagsMutuallyExclusive("base64", "binary")
@@ -28,24 +31,22 @@ func signCommand() *cobra.Command {
 
 func runSign(cmd *cobra.Command, args []string) error {
 	key := viper.GetString("key")
-	msg, _ := cmd.Flags().GetString("message")
-	if msg == "" {
-		msg = viper.GetString("message")
-	}
 	useBase64, _ := cmd.Flags().GetBool("base64")
 	useBinary, _ := cmd.Flags().GetBool("binary")
 
 	if key == "" {
 		return fmt.Errorf("--key is required")
 	}
-	if msg == "" {
-		return fmt.Errorf("--message is required")
-	}
 	if !useBase64 && !useBinary {
 		return fmt.Errorf("one of --base64 or --binary is required")
 	}
 
-	sig, err := keys.Sign(key, []byte(msg))
+	msgBytes, err := messageBytes(cmd)
+	if err != nil {
+		return err
+	}
+
+	sig, err := keys.Sign(key, msgBytes)
 	if err != nil {
 		return err
 	}

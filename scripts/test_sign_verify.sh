@@ -26,17 +26,16 @@ SIG=$("${PULSE[@]}" keys sign --key "$SK" --message "Hello World!" --base64)
 echo "    Signature:  ${SIG:0:32}..."
 
 echo "==> [base64] Verifying valid signature..."
-"${PULSE[@]}" keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG" --base64
-
+"${PULSE[@]}" keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG"
 echo "==> [base64] Verifying with wrong message (expecting invalid)..."
-if "${PULSE[@]}" keys verify --pubkey "$PK" --message "Wrong message!" --signature "$SIG" --base64 2>/dev/null; then
+if "${PULSE[@]}" keys verify --pubkey "$PK" --message "Wrong message!" --signature "$SIG" 2>/dev/null; then
     echo "    FAIL: signature should not have verified" >&2; exit 1
 fi
 echo "    signature invalid (correct)"
 
 echo "==> [base64] Verifying with tampered signature (expecting invalid)..."
 BAD_SIG=$(echo "$SIG" | tr 'A-Za-z' 'B-ZAb-za')
-if "${PULSE[@]}" keys verify --pubkey "$PK" --message "Hello World!" --signature "$BAD_SIG" --base64 2>/dev/null; then
+if "${PULSE[@]}" keys verify --pubkey "$PK" --message "Hello World!" --signature "$BAD_SIG" 2>/dev/null; then
     echo "    FAIL: signature should not have verified" >&2; exit 1
 fi
 echo "    signature invalid (correct)"
@@ -59,21 +58,34 @@ if [ "$SK_BYTES" -ne 1281 ]; then
     echo "    FAIL: expected 1281 bytes" >&2; exit 1
 fi
 
-echo "==> [binary] Generating base58 key pair..."
+echo "==> [binary] Deriving binary public key..."
+# Binary SK contains NUL bytes, so convert to hex for safe CLI arg passing,
+# then convert the resulting hex public key back to binary for the size check.
+SK_HEX=$(xxd -p "$TMPDIR_RUN/sk.bin" | tr -d '\n')
+PK_HEX=$("${PULSE[@]}" keys pubkey --key "$SK_HEX")
+printf '%s' "$PK_HEX" | xxd -r -p > "$TMPDIR_RUN/pk.bin"
+PK_BYTES=$(wc -c < "$TMPDIR_RUN/pk.bin" | tr -d ' ')
+echo "    Public key: (${PK_BYTES} bytes)"
+
+echo "==> [binary] Generating base58 key pair for sign/verify..."
 SK_B58=$("${PULSE[@]}" keys keygen --base58)
 PK_B58=$("${PULSE[@]}" keys pubkey --key "$SK_B58")
 
-echo "==> [binary] Signing 'Hello World!' with binary output..."
-"${PULSE[@]}" keys sign --key "$SK_B58" --message "Hello World!" --binary > "$TMPDIR_RUN/sig.bin"
+# Write a binary message file (arbitrary bytes including NUL).
+printf '\x00\x01\x02\x03\xde\xad\xbe\xef' > "$TMPDIR_RUN/msg.bin"
+
+echo "==> [binary] Signing binary message file with binary output..."
+"${PULSE[@]}" keys sign --key "$SK_B58" --message-file "$TMPDIR_RUN/msg.bin" --binary > "$TMPDIR_RUN/sig.bin"
 SIG_BYTES=$(wc -c < "$TMPDIR_RUN/sig.bin" | tr -d ' ')
 echo "    Signature:  (${SIG_BYTES} bytes)"
 
 echo "==> [binary] Confirming binary signature is valid (base64-encoding for verify)..."
 SIG_B64=$(base64 < "$TMPDIR_RUN/sig.bin" | tr -d '\n')
-"${PULSE[@]}" keys verify --pubkey "$PK_B58" --message "Hello World!" --signature "$SIG_B64" --base64
+"${PULSE[@]}" keys verify --pubkey "$PK_B58" --message-file "$TMPDIR_RUN/msg.bin" --signature "$SIG_B64"
 
-echo "==> [binary] Confirming binary signature fails for wrong message..."
-if "${PULSE[@]}" keys verify --pubkey "$PK_B58" --message "Wrong message!" --signature "$SIG_B64" --base64 2>/dev/null; then
+echo "==> [binary] Confirming binary signature fails for wrong message file..."
+printf '\xff\xfe\xfd' > "$TMPDIR_RUN/wrong_msg.bin"
+if "${PULSE[@]}" keys verify --pubkey "$PK_B58" --message-file "$TMPDIR_RUN/wrong_msg.bin" --signature "$SIG_B64" 2>/dev/null; then
     echo "    FAIL: signature should not have verified" >&2; exit 1
 fi
 echo "    signature invalid (correct)"

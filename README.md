@@ -103,31 +103,32 @@ $ pulse keys pubkey --key "$(cat signing.key)" > verifying.key
 Sign a message using a signing key.
 
 ```
-pulse keys sign --key <secret-key> --message <message> --base64 | --binary
+pulse keys sign --key <secret-key> --message <message> | --message-file <file>  --base64 | --binary
 ```
 
 | Flag | Description |
 |---|---|
 | `--key` | Hex, base58, or raw binary encoded signing key (required, env: `PULSE_KEY`) |
-| `--message` | Message to sign (required, env: `PULSE_MESSAGE`) |
+| `--message` | Message string to sign (env: `PULSE_MESSAGE`) |
+| `--message-file` | File whose contents to sign — binary-safe alternative to `--message` |
 | `--base64` | Output the signature as a base64-encoded string |
 | `--binary` | Output the signature as raw binary bytes |
 
-`--base64` and `--binary` are mutually exclusive.
+`--message` and `--message-file` are mutually exclusive. `--base64` and `--binary` are mutually exclusive.
 
 **Examples**
 
-Sign a message and output base64:
+Sign a string message and output base64:
 
 ```sh
 $ pulse keys sign --key "$SK" --message "Hello World!" --base64
 ObHohkPYPEy9fB0jUuyCkF0aLwyDOOP+Gc7x1R...
 ```
 
-Sign a binary message and write a binary signature to a file:
+Sign a binary file and write a binary signature:
 
 ```sh
-$ pulse keys sign --key "$SK" --message "$(cat data.bin)" --binary > sig.bin
+$ pulse keys sign --key "$SK" --message-file data.bin --binary > sig.bin
 ```
 
 Store the signature in a shell variable:
@@ -143,46 +144,45 @@ SIG=$(pulse keys sign --key "$SK" --message "Hello World!" --base64)
 Verify a signature against a message and public key. Exits with code `0` and prints `signature valid` on success, or exits with a non-zero code and prints `signature invalid` on failure.
 
 ```
-pulse keys verify --pubkey <public-key> --message <message> --signature <signature> --base64 | --binary
+pulse keys verify --pubkey <public-key> --message <message> | --message-file <file>  --signature <signature>
 ```
 
 | Flag | Description |
 |---|---|
 | `--pubkey` | Hex, base58, or raw binary encoded verifying key (required, env: `PULSE_PUBKEY`) |
-| `--message` | Message that was signed (required, env: `PULSE_MESSAGE`) |
-| `--signature` | Signature to verify (required, env: `PULSE_SIGNATURE`) |
-| `--base64` | Signature is base64-encoded |
-| `--binary` | Signature is raw binary bytes |
+| `--message` | Message string that was signed (env: `PULSE_MESSAGE`) |
+| `--message-file` | File whose contents were signed — binary-safe alternative to `--message` |
+| `--signature` | Base64 or binary encoded signature (required, env: `PULSE_SIGNATURE`) |
 
-`--base64` and `--binary` are mutually exclusive.
+`--message` and `--message-file` are mutually exclusive. The encoding of `--signature` is detected automatically: if the value is valid base64 it is used as-is; otherwise it is treated as raw binary bytes.
 
 **Examples**
 
-Verify a valid base64 signature:
+Verify a base64 signature against a string message:
 
 ```sh
-$ pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG" --base64
+$ pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG"
 signature valid
 ```
 
-Verify a binary signature against a binary message:
+Verify a binary signature against a binary file:
 
 ```sh
-$ pulse keys verify --pubkey "$PK" --message "$(cat data.bin)" --signature "$(cat sig.bin)" --binary
+$ pulse keys verify --pubkey "$PK" --message-file data.bin --signature "$(base64 < sig.bin)"
 signature valid
 ```
 
 Verify with the wrong message (exits non-zero):
 
 ```sh
-$ pulse keys verify --pubkey "$PK" --message "Wrong message" --signature "$SIG" --base64
+$ pulse keys verify --pubkey "$PK" --message "Wrong message" --signature "$SIG"
 Error: signature invalid
 ```
 
 Verify with a tampered signature (exits non-zero):
 
 ```sh
-$ pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "aW52YWxpZA==" --base64
+$ pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "aW52YWxpZA=="
 Error: signature invalid
 ```
 
@@ -190,7 +190,7 @@ Error: signature invalid
 
 ### Full example
 
-Generate a key pair, sign a message, and verify the signature in one pipeline:
+Generate a key pair, sign a message, and verify the signature:
 
 ```sh
 # Generate keys
@@ -201,7 +201,22 @@ PK=$(pulse keys pubkey --key "$SK")
 SIG=$(pulse keys sign --key "$SK" --message "Hello World!" --base64)
 
 # Verify
-pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG" --base64
+pulse keys verify --pubkey "$PK" --message "Hello World!" --signature "$SIG"
+# signature valid
+```
+
+Binary-only example using files throughout:
+
+```sh
+# Generate keys
+pulse keys keygen --binary > signing.key
+pulse keys pubkey --key "$(cat signing.key)" > verifying.key
+
+# Sign a binary file
+pulse keys sign --key "$(cat signing.key)" --message-file data.bin --binary > sig.bin
+
+# Verify
+pulse keys verify --pubkey "$(cat verifying.key)" --message-file data.bin --signature "$(base64 < sig.bin)"
 # signature valid
 ```
 
@@ -222,6 +237,6 @@ export PULSE_PUBKEY=$(pulse keys pubkey)
 export PULSE_MESSAGE="Hello World!"
 export PULSE_SIGNATURE=$(pulse keys sign --base64)
 
-pulse keys verify --base64
+pulse keys verify
 # signature valid
 ```

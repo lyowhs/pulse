@@ -18,11 +18,11 @@ func verifyCommand() *cobra.Command {
 	}
 
 	cmd.Flags().String("pubkey", "", "hex, base58, or binary encoded verifying key (required, env: PULSE_PUBKEY)")
-	cmd.Flags().String("message", "", "message that was signed (required, env: PULSE_MESSAGE)")
-	cmd.Flags().String("signature", "", "signature to verify (required, env: PULSE_SIGNATURE)")
-	cmd.Flags().Bool("base64", false, "signature is base64-encoded")
-	cmd.Flags().Bool("binary", false, "signature is raw binary bytes")
-	cmd.MarkFlagsMutuallyExclusive("base64", "binary")
+	cmd.Flags().String("message", "", "message string that was signed (env: PULSE_MESSAGE)")
+	cmd.Flags().String("message-file", "", "file whose contents were signed (binary-safe)")
+	cmd.MarkFlagsMutuallyExclusive("message", "message-file")
+
+	cmd.Flags().String("signature", "", "base64 or binary encoded signature (required, env: PULSE_SIGNATURE)")
 
 	viper.BindPFlag("pubkey", cmd.Flags().Lookup("pubkey"))
 	viper.BindPFlag("signature", cmd.Flags().Lookup("signature"))
@@ -32,33 +32,27 @@ func verifyCommand() *cobra.Command {
 
 func runVerify(cmd *cobra.Command, args []string) error {
 	pubkey := viper.GetString("pubkey")
-	msg, _ := cmd.Flags().GetString("message")
-	if msg == "" {
-		msg = viper.GetString("message")
-	}
 	sigStr := viper.GetString("signature")
-	useBase64, _ := cmd.Flags().GetBool("base64")
-	useBinary, _ := cmd.Flags().GetBool("binary")
 
 	if pubkey == "" {
 		return fmt.Errorf("--pubkey is required")
 	}
-	if msg == "" {
-		return fmt.Errorf("--message is required")
-	}
 	if sigStr == "" {
 		return fmt.Errorf("--signature is required")
 	}
-	if !useBase64 && !useBinary {
-		return fmt.Errorf("one of --base64 or --binary is required")
+
+	msgBytes, err := messageBytes(cmd)
+	if err != nil {
+		return err
 	}
 
-	// keys.Verify expects a base64-encoded signature; encode raw bytes if needed.
-	if useBinary {
+	// Auto-detect encoding: if the value is not valid base64, treat it as raw
+	// binary bytes and encode it so keys.Verify always receives base64.
+	if _, err := base64.StdEncoding.DecodeString(sigStr); err != nil {
 		sigStr = base64.StdEncoding.EncodeToString([]byte(sigStr))
 	}
 
-	ok, err := keys.Verify(pubkey, []byte(msg), sigStr)
+	ok, err := keys.Verify(pubkey, msgBytes, sigStr)
 	if err != nil {
 		return err
 	}
