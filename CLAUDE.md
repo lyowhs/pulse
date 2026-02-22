@@ -25,11 +25,12 @@ cmd/pulse/              # CLI entry point
   main.go               # Calls Execute()
   root.go               # Root cobra command, viper config (prefix: PULSE_)
   keys/                 # `pulse keys` subcommand package
-    keys.go             # Registers persistent --key flag and subcommands
+    keys.go             # Registers persistent --key/--key-file flags and subcommands
     keygen.go           # keys keygen --hex | --base58 | --binary
-    pubkey.go           # keys pubkey --key <sk>
-    sign.go             # keys sign --key <sk> --message|--message-file --base64|--binary
-    verify.go           # keys verify --pubkey <vk> --message|--message-file --signature <sig>
+    pubkey.go           # keys pubkey --key|--key-file <sk>
+    sign.go             # keys sign --key|--key-file <sk> --message|--message-file --base64|--binary
+    verify.go           # keys verify --pubkey|--pubkey-file <vk> --message|--message-file --signature <sig>
+    key.go              # shared signingKeyString() and verifyingKeyString() helpers
     message.go          # shared messageBytes() helper for sign and verify
 
 pkg/
@@ -52,4 +53,4 @@ pkg/
 
 **Binary I/O**: FN-DSA keys (1281 bytes) and signatures (666 bytes) structurally contain NUL bytes, so they cannot be passed as shell arguments. Binary keys/signatures must be written to files via redirection and passed with tools like `xxd` or `base64` when used as CLI arguments.
 
-**Cobra/Viper wiring**: `--key` is a persistent flag on the `keys` command bound to viper. `--pubkey` and `--signature` are bound per-command. `--message` falls back to viper but is read directly from the flag first to avoid subcommand scoping issues.
+**Cobra/Viper wiring**: `--key` and `--key-file` are persistent flags on the `keys` command, both bound to viper (`PULSE_KEY`, `PULSE_KEY_FILE`). `--pubkey`, `--pubkey-file`, and `--signature` are bound per-command. `--message` falls back to viper but is read directly from the flag first to avoid subcommand scoping issues.

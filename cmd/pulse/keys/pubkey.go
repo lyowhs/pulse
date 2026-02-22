@@ -5,7 +5,6 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 
 	"example.com/pulse/pulse/pkg/keys"
 )
@@ -20,9 +19,9 @@ func pubkeyCommand() *cobra.Command {
 }
 
 func runPubkey(cmd *cobra.Command, args []string) error {
-	input := viper.GetString("key")
-	if input == "" {
-		return fmt.Errorf("--key is required")
+	input, err := signingKeyString(cmd)
+	if err != nil {
+		return err
 	}
 
 	_, enc, _ := keys.Decode(input)

@@ -6,8 +6,6 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-
 	"example.com/pulse/pulse/pkg/keys"
 )
 
@@ -30,13 +28,13 @@ func signCommand() *cobra.Command {
 }
 
 func runSign(cmd *cobra.Command, args []string) error {
-	key := viper.GetString("key")
+	key, err := signingKeyString(cmd)
+	if err != nil {
+		return err
+	}
 	useBase64, _ := cmd.Flags().GetBool("base64")
 	useBinary, _ := cmd.Flags().GetBool("binary")
 
-	if key == "" {
-		return fmt.Errorf("--key is required")
-	}
 	if !useBase64 && !useBinary {
 		return fmt.Errorf("one of --base64 or --binary is required")
 	}

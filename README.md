@@ -12,7 +12,8 @@ pulse keys [--key <secret-key>] <command>
 
 | Flag | Description |
 |---|---|
-| `--key` | Hex, base58, or raw binary encoded signing key (env: `PULSE_KEY`) |
+| `--key` | Hex, base58, or binary encoded signing key (env: `PULSE_KEY`) |
+| `--key-file` | File containing the signing key — binary-safe alternative to `--key` (env: `PULSE_KEY_FILE`) |
 
 ---
 
@@ -72,7 +73,10 @@ pulse keys pubkey --key <secret-key>
 
 | Flag | Description |
 |---|---|
-| `--key` | Hex, base58, or raw binary encoded signing key (required, env: `PULSE_KEY`) |
+| `--key` | Hex, base58, or binary encoded signing key (env: `PULSE_KEY`) |
+| `--key-file` | File containing the signing key — binary-safe alternative to `--key` (env: `PULSE_KEY_FILE`) |
+
+`--key` and `--key-file` are mutually exclusive.
 
 **Examples**
 
@@ -108,13 +112,14 @@ pulse keys sign --key <secret-key> --message <message> | --message-file <file>  
 
 | Flag | Description |
 |---|---|
-| `--key` | Hex, base58, or raw binary encoded signing key (required, env: `PULSE_KEY`) |
+| `--key` | Hex, base58, or binary encoded signing key (env: `PULSE_KEY`) |
+| `--key-file` | File containing the signing key — binary-safe alternative to `--key` (env: `PULSE_KEY_FILE`) |
 | `--message` | Message string to sign (env: `PULSE_MESSAGE`) |
 | `--message-file` | File whose contents to sign — binary-safe alternative to `--message` |
 | `--base64` | Output the signature as a base64-encoded string |
 | `--binary` | Output the signature as raw binary bytes |
 
-`--message` and `--message-file` are mutually exclusive. `--base64` and `--binary` are mutually exclusive.
+`--key` and `--key-file` are mutually exclusive. `--message` and `--message-file` are mutually exclusive. `--base64` and `--binary` are mutually exclusive.
 
 **Examples**
 
@@ -149,12 +154,13 @@ pulse keys verify --pubkey <public-key> --message <message> | --message-file <fi
 
 | Flag | Description |
 |---|---|
-| `--pubkey` | Hex, base58, or raw binary encoded verifying key (required, env: `PULSE_PUBKEY`) |
+| `--pubkey` | Hex, base58, or binary encoded verifying key (env: `PULSE_PUBKEY`) |
+| `--pubkey-file` | File containing the verifying key — binary-safe alternative to `--pubkey` (env: `PULSE_PUBKEY_FILE`) |
 | `--message` | Message string that was signed (env: `PULSE_MESSAGE`) |
 | `--message-file` | File whose contents were signed — binary-safe alternative to `--message` |
 | `--signature` | Base64 or binary encoded signature (required, env: `PULSE_SIGNATURE`) |
 
-`--message` and `--message-file` are mutually exclusive. The encoding of `--signature` is detected automatically: if the value is valid base64 it is used as-is; otherwise it is treated as raw binary bytes.
+`--pubkey` and `--pubkey-file` are mutually exclusive. `--message` and `--message-file` are mutually exclusive. The encoding of `--signature` is detected automatically: if the value is valid base64 it is used as-is; otherwise it is treated as raw binary bytes.
 
 **Examples**
 
@@ -210,13 +216,13 @@ Binary-only example using files throughout:
 ```sh
 # Generate keys
 pulse keys keygen --binary > signing.key
-pulse keys pubkey --key "$(cat signing.key)" > verifying.key
+pulse keys pubkey --key-file signing.key > verifying.key
 
 # Sign a binary file
-pulse keys sign --key "$(cat signing.key)" --message-file data.bin --binary > sig.bin
+pulse keys sign --key-file signing.key --message-file data.bin --binary > sig.bin
 
 # Verify
-pulse keys verify --pubkey "$(cat verifying.key)" --message-file data.bin --signature "$(base64 < sig.bin)"
+pulse keys verify --pubkey-file verifying.key --message-file data.bin --signature "$(base64 < sig.bin)"
 # signature valid
 ```
 
@@ -227,7 +233,9 @@ All flags can be set via environment variables, which is useful for scripting wi
 | Variable | Equivalent flag |
 |---|---|
 | `PULSE_KEY` | `--key` |
+| `PULSE_KEY_FILE` | `--key-file` |
 | `PULSE_PUBKEY` | `--pubkey` |
+| `PULSE_PUBKEY_FILE` | `--pubkey-file` |
 | `PULSE_MESSAGE` | `--message` |
 | `PULSE_SIGNATURE` | `--signature` |
 

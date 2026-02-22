@@ -17,7 +17,10 @@ func verifyCommand() *cobra.Command {
 		RunE:  runVerify,
 	}
 
-	cmd.Flags().String("pubkey", "", "hex, base58, or binary encoded verifying key (required, env: PULSE_PUBKEY)")
+	cmd.Flags().String("pubkey", "", "hex, base58, or binary encoded verifying key (env: PULSE_PUBKEY)")
+	cmd.Flags().String("pubkey-file", "", "file containing the verifying key — binary-safe alternative to --pubkey (env: PULSE_PUBKEY_FILE)")
+	cmd.MarkFlagsMutuallyExclusive("pubkey", "pubkey-file")
+
 	cmd.Flags().String("message", "", "message string that was signed (env: PULSE_MESSAGE)")
 	cmd.Flags().String("message-file", "", "file whose contents were signed (binary-safe)")
 	cmd.MarkFlagsMutuallyExclusive("message", "message-file")
@@ -25,18 +28,18 @@ func verifyCommand() *cobra.Command {
 	cmd.Flags().String("signature", "", "base64 or binary encoded signature (required, env: PULSE_SIGNATURE)")
 
 	viper.BindPFlag("pubkey", cmd.Flags().Lookup("pubkey"))
+	viper.BindPFlag("pubkey-file", cmd.Flags().Lookup("pubkey-file"))
 	viper.BindPFlag("signature", cmd.Flags().Lookup("signature"))
 
 	return cmd
 }
 
 func runVerify(cmd *cobra.Command, args []string) error {
-	pubkey := viper.GetString("pubkey")
-	sigStr := viper.GetString("signature")
-
-	if pubkey == "" {
-		return fmt.Errorf("--pubkey is required")
+	pubkey, err := verifyingKeyString(cmd)
+	if err != nil {
+		return err
 	}
+	sigStr := viper.GetString("signature")
 	if sigStr == "" {
 		return fmt.Errorf("--signature is required")
 	}
