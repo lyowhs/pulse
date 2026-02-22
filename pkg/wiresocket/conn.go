@@ -9,7 +9,7 @@ import (
 )
 
 // ErrConnClosed is returned when an operation is performed on a closed Conn.
-var ErrConnClosed = errors.New("udpstream: connection closed")
+var ErrConnClosed = errors.New("wiresocket: connection closed")
 
 // Conn is a bidirectional encrypted event-stream connection.
 //

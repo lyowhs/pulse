@@ -71,7 +71,7 @@ func TestHandshakeAndEcho(t *testing.T) {
 	}
 	defer conn.Close()
 
-	want := []byte("hello, udpstream!")
+	want := []byte("hello, wiresocket!")
 	if err := conn.Send(ctx, &proto.Event{Type: "ping", Payload: want}); err != nil {
 		t.Fatal(err)
 	}

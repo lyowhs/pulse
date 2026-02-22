@@ -1,4 +1,4 @@
-// Package udpstream implements a secure, bidirectional event-stream protocol
+// Package wiresocket implements a secure, bidirectional event-stream protocol
 // over UDP, designed to serve 10,000s of simultaneous clients.
 //
 // # Protocol

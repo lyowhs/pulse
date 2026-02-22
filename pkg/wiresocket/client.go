@@ -45,7 +45,7 @@ func (cfg *DialConfig) defaults() {
 	}
 }
 
-// Dial connects to a udpstream server at addr, completes the Noise IK
+// Dial connects to a wiresocket server at addr, completes the Noise IK
 // handshake, and returns a bidirectional Conn.
 //
 // addr must be a host:port string resolvable as UDP (e.g. "server.example.com:9000").
@@ -55,13 +55,13 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 	// Resolve remote address.
 	raddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("udpstream: resolve %q: %w", addr, err)
+		return nil, fmt.Errorf("wiresocket: resolve %q: %w", addr, err)
 	}
 
 	// Bind a local UDP port (OS-assigned).
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 	if err != nil {
-		return nil, fmt.Errorf("udpstream: listen UDP: %w", err)
+		return nil, fmt.Errorf("wiresocket: listen UDP: %w", err)
 	}
 
 	kp, err := resolveClientKeypair(cfg.PrivateKey)
@@ -104,7 +104,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 
 		if _, err := conn.WriteToUDP(initBytes, raddr); err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("udpstream: send HandshakeInit: %w", err)
+			return nil, fmt.Errorf("wiresocket: send HandshakeInit: %w", err)
 		}
 
 		deadline := time.Now().Add(cfg.HandshakeTimeout)
@@ -145,7 +145,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 			}
 			if err := hs.ConsumeResp(resp); err != nil {
 				conn.Close()
-				return nil, fmt.Errorf("udpstream: handshake failed: %w", err)
+				return nil, fmt.Errorf("wiresocket: handshake failed: %w", err)
 			}
 			sendKey, recvKey := hs.TransportKeys(true) // true = initiator
 			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize)
@@ -175,7 +175,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 	}
 
 	conn.Close()
-	return nil, errors.New("udpstream: handshake timed out after retries")
+	return nil, errors.New("wiresocket: handshake timed out after retries")
 }
 
 // clientReadLoop runs in a background goroutine, reading incoming UDP packets

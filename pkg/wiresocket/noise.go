@@ -17,7 +17,7 @@ import (
 
 const (
 	noiseProtocolName = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
-	noisePrologue     = "UDPStream v1"
+	noisePrologue     = "wiresocket v1"
 
 	// Label prefixes for MAC1 and cookie derivation (WireGuard convention).
 	labelMAC1   = "mac1----"
@@ -114,11 +114,11 @@ func (ss *symmetricState) split() (initiatorSend, initiatorRecv [32]byte) {
 
 // noiseState carries state through a single Noise IK handshake.
 type noiseState struct {
-	sym         *symmetricState
-	localStatic Keypair
+	sym          *symmetricState
+	localStatic  Keypair
 	remoteStatic [32]byte // responder's static pub (known to initiator upfront)
-	localEph    Keypair
-	remoteEph   [32]byte // filled when receiving a message
+	localEph     Keypair
+	remoteEph    [32]byte // filled when receiving a message
 }
 
 // ─── initiator ───────────────────────────────────────────────────────────────
@@ -173,11 +173,11 @@ func (ns *noiseState) CreateInit(senderIndex uint32) (*HandshakeInit, error) {
 	}
 	copy(msg.Ephemeral[:], ns.localEph.Public[:])
 	if len(encS) != 48 {
-		return nil, errors.New("udpstream: unexpected encrypted_static length")
+		return nil, errors.New("wiresocket: unexpected encrypted_static length")
 	}
 	copy(msg.EncryptedStatic[:], encS)
 	if len(encTS) != 28 {
-		return nil, errors.New("udpstream: unexpected encrypted_timestamp length")
+		return nil, errors.New("wiresocket: unexpected encrypted_timestamp length")
 	}
 	copy(msg.EncryptedTimestamp[:], encTS)
 
@@ -238,7 +238,7 @@ func (ns *noiseState) ConsumeInit(msg *HandshakeInit) ([32]byte, error) {
 	// Verify MAC1.
 	expectedMAC1 := computeMAC1(ns.localStatic.Public, msg.mac1Body())
 	if expectedMAC1 != msg.MAC1 {
-		return [32]byte{}, errors.New("udpstream: MAC1 mismatch")
+		return [32]byte{}, errors.New("wiresocket: MAC1 mismatch")
 	}
 
 	// <- e
@@ -309,7 +309,7 @@ func (ns *noiseState) CreateResp(senderIndex, receiverIndex uint32) (*HandshakeR
 	}
 	copy(msg.Ephemeral[:], ns.localEph.Public[:])
 	if len(encNil) != 16 {
-		return nil, errors.New("udpstream: unexpected encrypted_nil length")
+		return nil, errors.New("wiresocket: unexpected encrypted_nil length")
 	}
 	copy(msg.EncryptedNil[:], encNil)
 
@@ -364,7 +364,7 @@ const maxTimestampSkew = 180 * time.Second
 
 func validateTimestamp(b []byte) error {
 	if len(b) < 12 {
-		return errors.New("udpstream: timestamp too short")
+		return errors.New("wiresocket: timestamp too short")
 	}
 	const taiOffset = uint64(0x4000000000000000)
 	secs := int64(binary.BigEndian.Uint64(b[:8]) - taiOffset)
@@ -374,7 +374,7 @@ func validateTimestamp(b []byte) error {
 		skew = -skew
 	}
 	if skew > maxTimestampSkew {
-		return errors.New("udpstream: handshake timestamp out of range")
+		return errors.New("wiresocket: handshake timestamp out of range")
 	}
 	return nil
 }

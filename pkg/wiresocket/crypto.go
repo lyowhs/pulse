@@ -116,7 +116,7 @@ func dh(priv, pub [32]byte) ([32]byte, error) {
 func encryptAEAD(dst []byte, key [32]byte, counter uint64, aad, plain []byte) []byte {
 	aead, err := chacha20poly1305.New(key[:])
 	if err != nil {
-		panic("udpstream: chacha20poly1305.New: " + err.Error())
+		panic("wiresocket: chacha20poly1305.New: " + err.Error())
 	}
 	return aead.Seal(dst, makeNonce(counter), plain, aad)
 }
@@ -159,7 +159,7 @@ func zeroize(b []byte) {
 	}
 }
 
-var errZeroDH = errors.New("udpstream: DH produced all-zero result (low-order point)")
+var errZeroDH = errors.New("wiresocket: DH produced all-zero result (low-order point)")
 
 // dhSafe wraps dh and rejects the all-zero result.
 func dhSafe(priv, pub [32]byte) ([32]byte, error) {

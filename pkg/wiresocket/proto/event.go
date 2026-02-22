@@ -1,5 +1,5 @@
 // Package proto defines the application-layer event types exchanged over an
-// encrypted udpstream session. Encoding is a hand-rolled protobuf wire format
+// encrypted wiresocket session. Encoding is a hand-rolled protobuf wire format
 // (field numbers match stream.proto) with no external code-generation
 // dependency — run "protoc --go_out=. stream.proto" to replace with generated
 // code if preferred.

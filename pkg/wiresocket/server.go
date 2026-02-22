@@ -86,7 +86,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	pub, err := pubFromPriv(cfg.PrivateKey)
 	if err != nil {
-		return nil, fmt.Errorf("udpstream: derive public key: %w", err)
+		return nil, fmt.Errorf("wiresocket: derive public key: %w", err)
 	}
 	kp := Keypair{Private: cfg.PrivateKey, Public: pub}
 
@@ -351,4 +351,4 @@ func basePoint() [32]byte {
 	return p
 }
 
-var errServerClosed = errors.New("udpstream: server closed")
+var errServerClosed = errors.New("wiresocket: server closed")

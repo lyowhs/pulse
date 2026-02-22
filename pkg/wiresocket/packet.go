@@ -60,7 +60,7 @@ func (m *HandshakeInit) marshal() []byte {
 
 func parseHandshakeInit(b []byte) (*HandshakeInit, error) {
 	if len(b) < sizeHandshakeInit || b[0] != typeHandshakeInit {
-		return nil, errors.New("udpstream: invalid HandshakeInit")
+		return nil, errors.New("wiresocket: invalid HandshakeInit")
 	}
 	m := &HandshakeInit{}
 	m.SenderIndex = binary.LittleEndian.Uint32(b[4:])
@@ -114,7 +114,7 @@ func (m *HandshakeResp) marshal() []byte {
 
 func parseHandshakeResp(b []byte) (*HandshakeResp, error) {
 	if len(b) < sizeHandshakeResp || b[0] != typeHandshakeResp {
-		return nil, errors.New("udpstream: invalid HandshakeResp")
+		return nil, errors.New("wiresocket: invalid HandshakeResp")
 	}
 	m := &HandshakeResp{}
 	m.SenderIndex = binary.LittleEndian.Uint32(b[4:])
@@ -144,9 +144,9 @@ func (m *HandshakeResp) mac1Body() []byte {
 //	[8:32] nonce (24 bytes, random)
 //	[32:64] encrypted_cookie (16 bytes cookie + 16 bytes tag)
 type CookieReply struct {
-	ReceiverIndex    uint32
-	Nonce            [24]byte
-	EncryptedCookie  [32]byte
+	ReceiverIndex   uint32
+	Nonce           [24]byte
+	EncryptedCookie [32]byte
 }
 
 func (m *CookieReply) marshal() []byte {
@@ -160,7 +160,7 @@ func (m *CookieReply) marshal() []byte {
 
 func parseCookieReply(b []byte) (*CookieReply, error) {
 	if len(b) < sizeCookieReply || b[0] != typeCookieReply {
-		return nil, errors.New("udpstream: invalid CookieReply")
+		return nil, errors.New("wiresocket: invalid CookieReply")
 	}
 	m := &CookieReply{}
 	m.ReceiverIndex = binary.LittleEndian.Uint32(b[4:])
@@ -194,7 +194,7 @@ func marshalDataHeader(idx uint32, counter uint64) []byte {
 
 func parseDataHeader(b []byte) (DataHeader, error) {
 	if len(b) < sizeDataHeader || b[0] != typeData {
-		return DataHeader{}, errors.New("udpstream: invalid DataHeader")
+		return DataHeader{}, errors.New("wiresocket: invalid DataHeader")
 	}
 	return DataHeader{
 		ReceiverIndex: binary.LittleEndian.Uint32(b[4:]),
