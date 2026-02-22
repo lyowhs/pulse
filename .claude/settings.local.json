@@ -22,7 +22,9 @@
       "Bash(chmod:*)",
       "Bash(PULSE_BIN=/tmp/pulse /Users/lyowhs/Git/pulse/scripts/test_sign_verify.sh:*)",
       "Bash(bash /Users/lyowhs/Git/pulse/scripts/test_sign_verify.sh)",
-      "Bash(go vet:*)"
+      "Bash(go vet:*)",
+      "Bash(pkill:*)",
+      "Bash(/tmp/genkey.go:*)"
     ]
   }
 }

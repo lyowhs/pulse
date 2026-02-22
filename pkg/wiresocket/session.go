@@ -51,7 +51,8 @@ type session struct {
 	done chan struct{}
 
 	// Activity tracking.
-	lastRecv atomic.Value // stores time.Time
+	lastRecv atomic.Value // stores time.Time — updated on every received packet
+	lastSend atomic.Value // stores time.Time — updated on every sent packet
 	created  time.Time
 }
 
@@ -73,7 +74,9 @@ func newSession(
 		done:        make(chan struct{}),
 		created:     time.Now(),
 	}
-	s.lastRecv.Store(time.Now())
+	now := time.Now()
+	s.lastRecv.Store(now)
+	s.lastSend.Store(now)
 	return s
 }
 
@@ -106,6 +109,9 @@ func (s *session) send(frame *proto.Frame) error {
 	ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, plain)
 
 	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
+	if err == nil {
+		s.lastSend.Store(time.Now())
+	}
 	return err
 }
 
@@ -164,16 +170,29 @@ func (s *session) receive(b []byte) bool {
 	return true
 }
 
-// isExpired reports whether the session has timed out or needs rekeying.
+// isExpired reports whether the session has been idle long enough to be
+// torn down.  Key-rotation thresholds (rekeyAfterTime, rekeyAfterMessages)
+// are intentionally excluded: exceeding them should trigger a new handshake,
+// not a session close.
 func (s *session) isExpired() bool {
 	lastRecv := s.lastRecv.Load().(time.Time)
-	return time.Since(lastRecv) > sessionTimeout ||
-		time.Since(s.created) > rekeyAfterTime ||
+	return time.Since(lastRecv) > sessionTimeout
+}
+
+// needsRekey reports whether the session has exceeded the recommended key
+// lifetime and a new handshake should be initiated.
+func (s *session) needsRekey() bool {
+	return time.Since(s.created) > rekeyAfterTime ||
 		atomic.LoadUint64(&s.sendCounter) >= rekeyAfterMessages
 }
 
 // needsKeepalive reports whether a keepalive packet should be sent.
+//
+// WireGuard rule: if we have received data from the peer but have not sent
+// anything in keepaliveInterval, send a keepalive so the peer's read loop
+// knows the session is still alive.
 func (s *session) needsKeepalive() bool {
+	lastSend := s.lastSend.Load().(time.Time)
 	lastRecv := s.lastRecv.Load().(time.Time)
-	return time.Since(lastRecv) > keepaliveInterval
+	return time.Since(lastSend) > keepaliveInterval && !lastRecv.IsZero()
 }

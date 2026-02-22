@@ -199,11 +199,16 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 		conn.SetReadDeadline(time.Time{})
 
 		if err != nil {
-			select {
-			case <-sess.done:
-			default:
-				// Treat read errors as session termination.
+			// A read timeout just means no packet arrived in the window —
+			// the session may still be healthy.  Check expiry and loop back.
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				if !sess.isExpired() {
+					continue
+				}
+				// Session has timed out — fall through to close.
 			}
+			// Real network error or expired session — terminate.
 			return
 		}
 		if n == 0 || src.String() != raddr.String() {

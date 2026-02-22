@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/viper"
 
 	"example.com/pulse/pulse/cmd/pulse/keys"
+	"example.com/pulse/pulse/cmd/pulse/server"
 )
 
 var cfgFile string
@@ -27,6 +28,7 @@ func init() {
 	cobra.OnInitialize(initConfig)
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: $HOME/.pulse.yaml)")
 	rootCmd.AddCommand(keys.Command())
+	rootCmd.AddCommand(server.Command())
 }
 
 func initConfig() {
