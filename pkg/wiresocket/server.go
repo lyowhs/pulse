@@ -188,6 +188,8 @@ func (s *Server) handlePacket(ctx context.Context, pkt incomingPacket) {
 		s.handleHandshakeInit(ctx, pkt)
 	case typeData:
 		s.handleData(pkt)
+	case typeDataFragment:
+		s.handleDataFragment(pkt)
 	case typeDisconnect:
 		s.handleDisconnect(pkt)
 	case typeKeepalive:
@@ -305,6 +307,27 @@ func (s *Server) handleData(pkt incomingPacket) {
 	sess.receive(pkt.data)
 }
 
+func (s *Server) handleDataFragment(pkt incomingPacket) {
+	const minLen = sizeDataHeader + sizeFragmentHeader + sizeAEADTag
+	if len(pkt.data) < minLen {
+		dbg("server: data fragment too short", "len", len(pkt.data))
+		return
+	}
+	idx := parseReceiverIndex(pkt.data)
+	val, ok := s.sessions.Load(idx)
+	if !ok {
+		dbg("server: data fragment for unknown session", "receiver_index", idx)
+		return
+	}
+	sess := val.(*session)
+	if sess.isDone() {
+		dbg("server: data fragment for closed session", "receiver_index", idx)
+		s.sessions.Delete(idx)
+		return
+	}
+	sess.receiveFragment(pkt.data)
+}
+
 func (s *Server) handleKeepalive(pkt incomingPacket) {
 	if len(pkt.data) < sizeKeepalive {
 		dbg("server: keepalive packet too short", "len", len(pkt.data))
@@ -384,6 +407,7 @@ func (s *Server) gc(ctx context.Context) {
 				if sess.needsKeepalive() {
 					sess.sendKeepalive()
 				}
+				sess.gcFragBufs(5 * time.Second)
 				return true
 			})
 		}

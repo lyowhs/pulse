@@ -245,6 +245,8 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 		switch buf[0] {
 		case typeData:
 			sess.receive(buf[:n])
+		case typeDataFragment:
+			sess.receiveFragment(buf[:n])
 		case typeKeepalive:
 			sess.receiveKeepalive(buf[:n])
 		case typeDisconnect:
@@ -273,6 +275,7 @@ func clientKeepaliveLoop(sess *session) {
 			if sess.needsKeepalive() {
 				sess.sendKeepalive()
 			}
+			sess.gcFragBufs(keepaliveInterval * 2)
 		}
 	}
 }

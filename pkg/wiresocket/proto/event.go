@@ -1,13 +1,11 @@
 // Package proto defines the application-layer event types exchanged over an
 // encrypted wiresocket session.
 //
-// Wire encoding is custom (not standard protobuf):
-//   - Each Event begins with a raw uint8 type byte (1 byte, always present).
-//   - The remaining fields use standard protobuf varint/LEN encoding (fields
-//     1, 2, 4, 5).  Field 3 is reserved for the type byte and never appears
-//     as a proto field tag on the wire.
+// Wire encoding is custom:
+//   - Each Event body begins with two raw bytes: [type][channel_id].
+//   - Any remaining bytes are the payload.
 //   - A Frame is a sequence of length-prefixed Event bodies (proto field 1,
-//     wire type LEN), identical to a repeated proto field.
+//     wire type LEN).
 package proto
 
 import (
@@ -17,11 +15,9 @@ import (
 
 // Event is a single application-level event.
 type Event struct {
-	Type        uint8  // event type (0–254 application-defined; 255 internal)
-	Sequence    uint64
-	TimestampUs int64
-	Payload     []byte
-	ChannelId   uint32
+	Type      uint8  // event type (0–254 application-defined; 255 internal)
+	ChannelId uint8  // logical channel (0 = default)
+	Payload   []byte // opaque binary payload
 }
 
 // Frame batches one or more Events into a single encrypted UDP payload.
@@ -58,50 +54,21 @@ func UnmarshalFrame(b []byte) (*Frame, error) {
 	return f, nil
 }
 
-// marshal serialises e.  The first byte is always the raw uint8 type; the
-// remaining fields use standard proto varint/LEN encoding and are omitted
-// when zero/empty.
+// marshal serialises e: [type byte][channel_id byte][payload...].
 func (e *Event) marshal() []byte {
-	b := []byte{e.Type}
-	if e.Sequence != 0 {
-		b = appendVarintField(b, 1, e.Sequence)
-	}
-	if e.TimestampUs != 0 {
-		b = appendVarintField(b, 2, uint64(e.TimestampUs))
-	}
-	if len(e.Payload) > 0 {
-		b = appendLenField(b, 4, e.Payload)
-	}
-	if e.ChannelId != 0 {
-		b = appendVarintField(b, 5, uint64(e.ChannelId))
-	}
-	return b
+	b := []byte{e.Type, e.ChannelId}
+	return append(b, e.Payload...)
 }
 
-// unmarshal parses e from wire bytes.  The first byte is consumed as the raw
-// type; the rest are decoded as proto fields.
+// unmarshal parses e from wire bytes.
 func (e *Event) unmarshal(b []byte) error {
-	if len(b) < 1 {
+	if len(b) < 2 {
 		return errors.New("proto: event body too short")
 	}
 	e.Type = b[0]
-	b = b[1:]
-	for len(b) > 0 {
-		field, wt, val, lv, rest, err := consumeField(b)
-		if err != nil {
-			return err
-		}
-		b = rest
-		switch {
-		case field == 1 && wt == 0:
-			e.Sequence = val
-		case field == 2 && wt == 0:
-			e.TimestampUs = int64(val)
-		case field == 4 && wt == 2:
-			e.Payload = append([]byte(nil), lv...)
-		case field == 5 && wt == 0:
-			e.ChannelId = uint32(val)
-		}
+	e.ChannelId = b[1]
+	if len(b) > 2 {
+		e.Payload = append([]byte(nil), b[2:]...)
 	}
 	return nil
 }
@@ -114,11 +81,6 @@ func appendVarint(b []byte, v uint64) []byte {
 		v >>= 7
 	}
 	return append(b, byte(v))
-}
-
-func appendVarintField(b []byte, field int, v uint64) []byte {
-	b = appendVarint(b, uint64(field<<3|0)) // wire type 0 = VARINT
-	return appendVarint(b, v)
 }
 
 func appendLenField(b []byte, field int, data []byte) []byte {

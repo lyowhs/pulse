@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"time"
 
 	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
@@ -22,7 +21,7 @@ var ErrConnClosed = errors.New("wiresocket: connection closed")
 // A Conn may safely be used from multiple goroutines simultaneously.
 type Conn struct {
 	sess     *session
-	channels sync.Map // uint32 → *Channel
+	channels sync.Map // uint8 → *Channel
 	ch0      *Channel // channel 0 — default channel for Send/Recv
 }
 
@@ -31,7 +30,7 @@ type Conn struct {
 func newConn(s *session) *Conn {
 	c := &Conn{sess: s}
 	c.ch0 = newChannel(0, c, cap(s.events))
-	c.channels.Store(uint32(0), c.ch0)
+	c.channels.Store(uint8(0), c.ch0)
 	dbg("conn created", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
 	go c.mux()
 	return c
@@ -86,7 +85,7 @@ func (c *Conn) mux() {
 
 // getOrOpenChannel returns the Channel for id, creating it if it does not
 // already exist.
-func (c *Conn) getOrOpenChannel(id uint32) *Channel {
+func (c *Conn) getOrOpenChannel(id uint8) *Channel {
 	if v, ok := c.channels.Load(id); ok {
 		return v.(*Channel)
 	}
@@ -101,7 +100,7 @@ func (c *Conn) getOrOpenChannel(id uint32) *Channel {
 // Channel returns the logical channel with the given id, creating it if it
 // does not already exist.  Channel 0 is the default channel shared with Send
 // and Recv.
-func (c *Conn) Channel(id uint32) *Channel {
+func (c *Conn) Channel(id uint8) *Channel {
 	return c.getOrOpenChannel(id)
 }
 
@@ -117,9 +116,6 @@ func (c *Conn) Send(ctx context.Context, e *proto.Event) error {
 	default:
 	}
 	e.ChannelId = 0 // enforce default channel
-	if e.TimestampUs == 0 {
-		e.TimestampUs = time.Now().UnixMicro()
-	}
 	return c.sess.send(&proto.Frame{Events: []*proto.Event{e}})
 }
 

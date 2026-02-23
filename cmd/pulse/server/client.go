@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -19,14 +21,14 @@ import (
 func clientCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "client <server-addr>",
-		Short: "Connect to a wiresocket server and send periodic test events",
+		Short: "Connect to a wiresocket server, send 100 KB echo events, and verify responses",
 		Args:  cobra.ExactArgs(1),
 		RunE:  runClient,
 	}
 
 	cmd.Flags().String("pubkey", "", "hex-encoded server public key (required)")
 	cmd.MarkFlagRequired("pubkey")
-	cmd.Flags().Duration("interval", 3*time.Second, "how often to send a test event")
+	cmd.Flags().Duration("interval", time.Minute, "how often to send a 100 KB echo event")
 	cmd.Flags().String("key", "", "hex-encoded client private key (generated if omitted)")
 
 	return cmd
@@ -75,9 +77,12 @@ func runClient(cmd *cobra.Command, args []string) error {
 
 	ch := conn.Channel(appChannel)
 
-	//var seq atomic.Uint64
+	// echoCh carries the payload most recently sent so the receive loop can
+	// verify the server echoed it back correctly.  Capacity 1: at most one
+	// echo is in-flight at a time.
+	echoCh := make(chan []byte, 1)
 
-	// Receive loop.
+	// Receive loop: match incoming events against the pending echo payload.
 	recvDone := make(chan struct{})
 	go func() {
 		defer close(recvDone)
@@ -86,13 +91,26 @@ func runClient(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return
 			}
-			logger.Printf("← " + formatEvent(serverAddr, e))
+			select {
+			case expected := <-echoCh:
+				if bytes.Equal(e.Payload, expected) {
+					logger.Printf("← echo ok    %d bytes verified", len(expected))
+				} else {
+					logger.Printf("← echo FAIL  got %d bytes, want %d bytes",
+						len(e.Payload), len(expected))
+				}
+			default:
+				logger.Printf("← unexpected %s", formatEvent(serverAddr, e))
+			}
 		}
 	}()
 
-	// Send loop: fire a test event every interval.
+	// Send loop: every interval generate a fresh 100 KB random payload and
+	// send it as an echo request.
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	var seq uint64
 
 	for {
 		select {
@@ -104,29 +122,34 @@ func runClient(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("connection closed by server")
 		case <-recvDone:
 			return fmt.Errorf("receive loop ended unexpectedly")
-			/*		case t := <-ticker.C:
-					s := seq.Add(1)
-					e := &proto.Event{
-						Sequence:    s,
-						TimestampUs: t.UnixMicro(),
-						Type:        eventTypeTest,
-						Payload:     []byte(fmt.Sprintf("event #%d from pulse client", s)),
-					}
-					if err := ch.Send(ctx, e); err != nil {
-						return fmt.Errorf("send: %w", err)
-					}
-
-					logger.Printf("→ " + formatEvent(serverAddr, e))*/
+		case <-ticker.C:
+			payload := make([]byte, 100*1024)
+			if _, err := rand.Read(payload); err != nil {
+				return fmt.Errorf("generate payload: %w", err)
+			}
+			seq++
+			e := &proto.Event{
+				Type:    eventTypeTest,
+				Payload: payload,
+			}
+			if err := ch.Send(ctx, e); err != nil {
+				return fmt.Errorf("send: %w", err)
+			}
+			// Register expected payload; discard any unverified previous one.
+			select {
+			case echoCh <- payload:
+			default:
+				<-echoCh
+				echoCh <- payload
+			}
+			logger.Printf("→ echo req   #%-6d 100 KB sent", seq)
 		}
 	}
 }
 
-// formatEvent returns a single-line description of an event, reusing the same
-// payload rendering logic as logEvent in serve.go.
+// formatEvent returns a single-line description of an event.
 func formatEvent(remote string, e *proto.Event) string {
-	ts := time.UnixMicro(e.TimestampUs).UTC().Format(time.RFC3339Nano)
-	base := fmt.Sprintf("[%s] seq=%-6d ts=%s type=%d",
-		remote, e.Sequence, ts, e.Type)
+	base := fmt.Sprintf("[%s] ch=%-3d type=%d", remote, e.ChannelId, e.Type)
 	switch {
 	case len(e.Payload) == 0:
 		return base

@@ -2,12 +2,26 @@ package wiresocket
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
+
+// maxReassemblyBufs is the maximum number of incomplete fragmented frames
+// buffered per session at one time.
+const maxReassemblyBufs = 64
+
+// reassemblyBuf accumulates fragments for a single fragmented frame.
+type reassemblyBuf struct {
+	frags    [][]byte  // indexed by frag_index; nil slot = not yet received
+	received uint8     // number of fragments received so far
+	total    uint8     // total expected (from frag_count)
+	lastSeen time.Time // updated on each received fragment; used for GC
+}
 
 // Session timing constants (WireGuard-inspired).
 const (
@@ -56,6 +70,11 @@ type session struct {
 	lastDataRecv atomic.Value // stores time.Time — updated only on received data packets
 	lastSend     atomic.Value // stores time.Time — updated on every sent packet
 	created      time.Time
+
+	// Fragment reassembly (receive side) and outgoing frame ID counter (send side).
+	fragCounter atomic.Uint32
+	fragMu      sync.Mutex
+	fragBufs    map[uint32]*reassemblyBuf
 }
 
 func newSession(
@@ -129,15 +148,20 @@ func (s *session) isDone() bool {
 	}
 }
 
-// send encrypts frame and writes it to the remote peer over the shared
-// UDPConn.  It is safe to call from multiple goroutines simultaneously.
+// send encrypts frame and writes it to the remote peer.  Frames larger than
+// maxFragmentPayload are automatically split across multiple typeDataFragment
+// packets.  It is safe to call from multiple goroutines simultaneously.
 func (s *session) send(frame *proto.Frame) error {
+	plain := frame.Marshal()
+	if len(plain) > maxFragmentPayload {
+		return s.sendFragments(plain)
+	}
+
 	counter, ok := s.nextCounter()
 	if !ok {
 		return ErrConnClosed
 	}
 
-	plain := frame.Marshal()
 	hdr := marshalDataHeader(s.remoteIndex, counter)
 	ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, plain)
 
@@ -153,6 +177,59 @@ func (s *session) send(frame *proto.Frame) error {
 		s.lastSend.Store(time.Now())
 	}
 	return err
+}
+
+// sendFragments splits plain into maxFragmentPayload-sized chunks and sends
+// each as an authenticated typeDataFragment packet.
+func (s *session) sendFragments(plain []byte) error {
+	fragCount := (len(plain) + maxFragmentPayload - 1) / maxFragmentPayload
+	if fragCount > 255 {
+		return errors.New("wiresocket: frame too large to fragment (exceeds 255 fragments)")
+	}
+
+	frameID := s.fragCounter.Add(1)
+	dbg("send fragments",
+		"local_index", s.localIndex,
+		"remote_index", s.remoteIndex,
+		"frame_id", frameID,
+		"frag_count", fragCount,
+		"total_bytes", len(plain),
+	)
+
+	for i := 0; i < fragCount; i++ {
+		start := i * maxFragmentPayload
+		end := start + maxFragmentPayload
+		if end > len(plain) {
+			end = len(plain)
+		}
+
+		// Fragment payload: [frame_id(4)][frag_index(1)][frag_count(1)][data]
+		fragPayload := make([]byte, sizeFragmentHeader+end-start)
+		binary.LittleEndian.PutUint32(fragPayload[0:], frameID)
+		fragPayload[4] = byte(i)
+		fragPayload[5] = byte(fragCount)
+		copy(fragPayload[sizeFragmentHeader:], plain[start:end])
+
+		counter, ok := s.nextCounter()
+		if !ok {
+			return ErrConnClosed
+		}
+
+		hdr := make([]byte, sizeDataHeader)
+		hdr[0] = typeDataFragment
+		hdr[4] = byte(s.remoteIndex)
+		hdr[5] = byte(s.remoteIndex >> 8)
+		hdr[6] = byte(s.remoteIndex >> 16)
+		hdr[7] = byte(s.remoteIndex >> 24)
+		binary.LittleEndian.PutUint64(hdr[8:], counter)
+
+		ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, fragPayload)
+		if _, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr); err != nil {
+			return err
+		}
+	}
+	s.lastSend.Store(time.Now())
+	return nil
 }
 
 // sendKeepalive sends a typeKeepalive packet (AEAD over empty payload).
@@ -310,6 +387,167 @@ func (s *session) dataActivity() time.Time {
 		return lastDataRecv
 	}
 	return lastSend
+}
+
+// receiveFragment decrypts and buffers an incoming typeDataFragment packet.
+// When all fragments of a frame have arrived it reassembles and delivers them.
+// Returns false if the packet should be silently dropped.
+func (s *session) receiveFragment(b []byte) bool {
+	const minLen = sizeDataHeader + sizeFragmentHeader + sizeAEADTag
+	if len(b) < minLen {
+		dbg("recv: fragment packet too short", "local_index", s.localIndex, "len", len(b))
+		return false
+	}
+
+	counter := binary.LittleEndian.Uint64(b[8:])
+	if !s.replay.check(counter) {
+		dbg("recv: fragment replay rejected", "local_index", s.localIndex, "counter", counter)
+		return false
+	}
+
+	plain, err := decryptAEAD(s.recvKey, counter, nil, b[sizeDataHeader:])
+	if err != nil {
+		dbg("recv: fragment decrypt failed", "local_index", s.localIndex, "counter", counter, "err", err)
+		return false
+	}
+	s.replay.update(counter)
+
+	if len(plain) < sizeFragmentHeader {
+		dbg("recv: fragment payload too short", "local_index", s.localIndex)
+		return false
+	}
+
+	frameID := binary.LittleEndian.Uint32(plain[0:])
+	fragIndex := plain[4]
+	fragCount := plain[5]
+	data := plain[sizeFragmentHeader:]
+
+	if fragCount == 0 || int(fragIndex) >= int(fragCount) {
+		dbg("recv: invalid fragment header",
+			"local_index", s.localIndex,
+			"frame_id", frameID,
+			"frag_index", fragIndex,
+			"frag_count", fragCount,
+		)
+		return false
+	}
+
+	s.fragMu.Lock()
+	if s.fragBufs == nil {
+		s.fragBufs = make(map[uint32]*reassemblyBuf)
+	}
+	buf, ok := s.fragBufs[frameID]
+	if !ok {
+		if len(s.fragBufs) >= maxReassemblyBufs {
+			s.fragMu.Unlock()
+			dbg("recv: reassembly buffer full, dropping fragment",
+				"local_index", s.localIndex,
+				"frame_id", frameID,
+			)
+			return false
+		}
+		buf = &reassemblyBuf{
+			frags:    make([][]byte, fragCount),
+			total:    fragCount,
+			lastSeen: time.Now(),
+		}
+		s.fragBufs[frameID] = buf
+	} else if buf.total != fragCount {
+		s.fragMu.Unlock()
+		dbg("recv: fragment count mismatch",
+			"local_index", s.localIndex,
+			"frame_id", frameID,
+			"got", fragCount,
+			"want", buf.total,
+		)
+		return false
+	}
+
+	if buf.frags[fragIndex] == nil {
+		buf.frags[fragIndex] = append([]byte(nil), data...)
+		buf.received++
+		buf.lastSeen = time.Now()
+	}
+
+	complete := buf.received == buf.total
+	var assembled []byte
+	if complete {
+		total := 0
+		for _, f := range buf.frags {
+			total += len(f)
+		}
+		assembled = make([]byte, 0, total)
+		for _, f := range buf.frags {
+			assembled = append(assembled, f...)
+		}
+		delete(s.fragBufs, frameID)
+	}
+	s.fragMu.Unlock()
+
+	if !complete {
+		return true
+	}
+
+	now := time.Now()
+	s.lastRecv.Store(now)
+	s.lastDataRecv.Store(now)
+
+	if len(assembled) == 0 {
+		return true
+	}
+
+	frame, err := proto.UnmarshalFrame(assembled)
+	if err != nil {
+		dbg("recv: fragment reassembly unmarshal failed",
+			"local_index", s.localIndex,
+			"frame_id", frameID,
+			"err", err,
+		)
+		return false
+	}
+	dbg("recv fragment assembled",
+		"local_index", s.localIndex,
+		"frame_id", frameID,
+		"total_bytes", len(assembled),
+		"events", len(frame.Events),
+	)
+	for _, e := range frame.Events {
+		select {
+		case s.events <- e:
+		case <-s.done:
+			return false
+		default:
+			dbg("recv: event buffer full, dropping oldest", "local_index", s.localIndex)
+			select {
+			case <-s.events:
+			default:
+			}
+			select {
+			case s.events <- e:
+			default:
+			}
+		}
+	}
+	return true
+}
+
+// gcFragBufs removes reassembly buffers that have not received a fragment
+// within maxAge, preventing unbounded memory growth from incomplete frames.
+func (s *session) gcFragBufs(maxAge time.Duration) {
+	deadline := time.Now().Add(-maxAge)
+	s.fragMu.Lock()
+	for id, buf := range s.fragBufs {
+		if buf.lastSeen.Before(deadline) {
+			dbg("session: dropping stale fragment buffer",
+				"local_index", s.localIndex,
+				"frame_id", id,
+				"received", buf.received,
+				"total", buf.total,
+			)
+			delete(s.fragBufs, id)
+		}
+	}
+	s.fragMu.Unlock()
 }
 
 // isExpired reports whether the session has been idle long enough to be torn

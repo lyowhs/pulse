@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"time"
 
 	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
@@ -20,19 +19,19 @@ const channelCloseType = uint8(255)
 // Channel is a logical multiplexed stream within a Conn.
 //
 // Multiple Channels can be opened over a single Conn, each identified by a
-// uint32 ID.  Channel 0 is the default channel, shared with Conn.Send and
+// uint8 ID.  Channel 0 is the default channel, shared with Conn.Send and
 // Conn.Recv.  All other IDs are free for the application to use.
 //
 // A Channel may safely be used from multiple goroutines simultaneously.
 type Channel struct {
-	id        uint32
+	id        uint8
 	conn      *Conn
 	events    chan *proto.Event
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
-func newChannel(id uint32, conn *Conn, bufSize int) *Channel {
+func newChannel(id uint8, conn *Conn, bufSize int) *Channel {
 	dbg("channel opened", "channel_id", id, "buf_size", bufSize)
 	return &Channel{
 		id:     id,
@@ -43,7 +42,7 @@ func newChannel(id uint32, conn *Conn, bufSize int) *Channel {
 }
 
 // ID returns this channel's identifier.
-func (ch *Channel) ID() uint32 { return ch.id }
+func (ch *Channel) ID() uint8 { return ch.id }
 
 // Send sends an event on this channel to the remote peer.
 //
@@ -60,10 +59,7 @@ func (ch *Channel) Send(ctx context.Context, e *proto.Event) error {
 	default:
 	}
 	e.ChannelId = ch.id
-	if e.TimestampUs == 0 {
-		e.TimestampUs = time.Now().UnixMicro()
-	}
-	dbg("channel send", "channel_id", ch.id, "event_type", e.Type, "seq", e.Sequence)
+	dbg("channel send", "channel_id", ch.id, "event_type", e.Type)
 	return ch.conn.sess.send(&proto.Frame{Events: []*proto.Event{e}})
 }
 

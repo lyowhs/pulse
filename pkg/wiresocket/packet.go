@@ -13,17 +13,25 @@ const (
 	typeData          = 4
 	typeDisconnect    = 5
 	typeKeepalive     = 6
+	typeDataFragment  = 7
 )
 
 // Wire sizes.
 const (
-	sizeHandshakeInit = 148 // 1+3+4+32+48+28+16+16
-	sizeHandshakeResp = 92  // 1+3+4+4+32+16+16+16
-	sizeCookieReply   = 64  // 1+3+4+24+32
-	sizeDataHeader    = 16  // 1+3+4+8  (payload follows)
-	sizeAEADTag       = 16
-	sizeKeepalive  = sizeDataHeader + sizeAEADTag // type=6, AEAD over empty payload
-	sizeDisconnect = sizeDataHeader + sizeAEADTag // type=5, same layout as keepalive
+	sizeHandshakeInit  = 148 // 1+3+4+32+48+28+16+16
+	sizeHandshakeResp  = 92  // 1+3+4+4+32+16+16+16
+	sizeCookieReply    = 64  // 1+3+4+24+32
+	sizeDataHeader     = 16  // 1+3+4+8  (payload follows)
+	sizeAEADTag        = 16
+	sizeKeepalive      = sizeDataHeader + sizeAEADTag // type=6, AEAD over empty payload
+	sizeDisconnect     = sizeDataHeader + sizeAEADTag // type=5, same layout as keepalive
+	sizeFragmentHeader = 6                            // frame_id(4) + frag_index(1) + frag_count(1)
+
+	// maxFragmentPayload is the maximum plaintext data bytes per fragment.
+	// Sized to keep the UDP datagram under 1232 bytes (IPv6 minimum path MTU
+	// of 1280 minus 40-byte IPv6 header minus 8-byte UDP header):
+	//   1232 - sizeDataHeader(16) - sizeFragmentHeader(6) - sizeAEADTag(16) = 1194
+	maxFragmentPayload = 1194
 )
 
 // ─── HandshakeInit ───────────────────────────────────────────────────────────
