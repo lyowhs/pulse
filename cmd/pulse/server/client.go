@@ -74,6 +74,8 @@ func runClient(cmd *cobra.Command, args []string) error {
 
 	logger.Printf("connected (local session index %d)", conn.LocalIndex())
 
+	ch := conn.Channel(appChannel)
+
 	var seq atomic.Uint64
 
 	// Receive loop.
@@ -81,7 +83,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 	go func() {
 		defer close(recvDone)
 		for {
-			e, err := conn.Recv(ctx)
+			e, err := ch.Recv(ctx)
 			if err != nil {
 				return
 			}
@@ -108,10 +110,10 @@ func runClient(cmd *cobra.Command, args []string) error {
 			e := &proto.Event{
 				Sequence:    s,
 				TimestampUs: t.UnixMicro(),
-				Type:        "test",
+				Type:        eventTypeTest,
 				Payload:     []byte(fmt.Sprintf("event #%d from pulse client", s)),
 			}
-			if err := conn.Send(ctx, e); err != nil {
+			if err := ch.Send(ctx, e); err != nil {
 				return fmt.Errorf("send: %w", err)
 			}
 			logger.Printf("→ " + formatEvent(serverAddr, e))
@@ -123,7 +125,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 // payload rendering logic as logEvent in serve.go.
 func formatEvent(remote string, e *proto.Event) string {
 	ts := time.UnixMicro(e.TimestampUs).UTC().Format(time.RFC3339Nano)
-	base := fmt.Sprintf("[%s] seq=%-6d ts=%s type=%q",
+	base := fmt.Sprintf("[%s] seq=%-6d ts=%s type=%d",
 		remote, e.Sequence, ts, e.Type)
 	switch {
 	case len(e.Payload) == 0:

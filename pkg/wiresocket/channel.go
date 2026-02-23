@@ -14,8 +14,8 @@ var ErrChannelClosed = errors.New("wiresocket: channel closed")
 
 // channelCloseType is the internal event type used to signal channel closure to
 // the remote peer.  It is intercepted by the mux goroutine and never delivered
-// to application code.
-const channelCloseType = "$wiresocket/channel.close"
+// to application code.  255 is reserved for wiresocket internal use.
+const channelCloseType = uint8(255)
 
 // Channel is a logical multiplexed stream within a Conn.
 //

@@ -71,17 +71,23 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	return srv.Serve(ctx)
 }
 
+const (
+	appChannel    = uint32(17)
+	eventTypeTest = uint8(1)
+)
+
 func makeHandler(logger *log.Logger) func(*wiresocket.Conn) {
 	return func(conn *wiresocket.Conn) {
 		logger.Printf("[%s] connected", conn.RemoteAddr())
 		defer logger.Printf("[%s] disconnected", conn.RemoteAddr())
 
+		ch := conn.Channel(appChannel)
 		for {
-			_, err := conn.Recv(context.Background())
+			e, err := ch.Recv(context.Background())
 			if err != nil {
 				return
 			}
-			//logEvent(logger, conn.RemoteAddr(), e)
+			logEvent(logger, conn.RemoteAddr(), e)
 		}
 	}
 }
@@ -90,13 +96,13 @@ func logEvent(logger *log.Logger, remote string, e *proto.Event) {
 	ts := time.UnixMicro(e.TimestampUs).UTC().Format(time.RFC3339Nano)
 	switch {
 	case len(e.Payload) == 0:
-		logger.Printf("[%s] seq=%-6d ts=%s type=%q",
+		logger.Printf("[%s] seq=%-6d ts=%s type=%d",
 			remote, e.Sequence, ts, e.Type)
 	case isPrintable(e.Payload) && len(e.Payload) <= 120:
-		logger.Printf("[%s] seq=%-6d ts=%s type=%q payload=%q",
+		logger.Printf("[%s] seq=%-6d ts=%s type=%d payload=%q",
 			remote, e.Sequence, ts, e.Type, e.Payload)
 	default:
-		logger.Printf("[%s] seq=%-6d ts=%s type=%q payload=<%d bytes> hex=%s",
+		logger.Printf("[%s] seq=%-6d ts=%s type=%d payload=<%d bytes> hex=%s",
 			remote, e.Sequence, ts, e.Type, len(e.Payload),
 			hex.EncodeToString(e.Payload[:min(len(e.Payload), 16)])+"…")
 	}
