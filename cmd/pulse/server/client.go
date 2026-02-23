@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -76,7 +75,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 
 	ch := conn.Channel(appChannel)
 
-	var seq atomic.Uint64
+	//var seq atomic.Uint64
 
 	// Receive loop.
 	recvDone := make(chan struct{})
@@ -105,18 +104,19 @@ func runClient(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("connection closed by server")
 		case <-recvDone:
 			return fmt.Errorf("receive loop ended unexpectedly")
-		case t := <-ticker.C:
-			s := seq.Add(1)
-			e := &proto.Event{
-				Sequence:    s,
-				TimestampUs: t.UnixMicro(),
-				Type:        eventTypeTest,
-				Payload:     []byte(fmt.Sprintf("event #%d from pulse client", s)),
-			}
-			if err := ch.Send(ctx, e); err != nil {
-				return fmt.Errorf("send: %w", err)
-			}
-			logger.Printf("→ " + formatEvent(serverAddr, e))
+			/*		case t := <-ticker.C:
+					s := seq.Add(1)
+					e := &proto.Event{
+						Sequence:    s,
+						TimestampUs: t.UnixMicro(),
+						Type:        eventTypeTest,
+						Payload:     []byte(fmt.Sprintf("event #%d from pulse client", s)),
+					}
+					if err := ch.Send(ctx, e); err != nil {
+						return fmt.Errorf("send: %w", err)
+					}
+
+					logger.Printf("→ " + formatEvent(serverAddr, e))*/
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package wiresocket
 
 import (
+	"encoding/binary"
 	"net"
 	"sync/atomic"
 	"time"
@@ -51,9 +52,10 @@ type session struct {
 	done chan struct{}
 
 	// Activity tracking.
-	lastRecv atomic.Value // stores time.Time — updated on every received packet
-	lastSend atomic.Value // stores time.Time — updated on every sent packet
-	created  time.Time
+	lastRecv     atomic.Value // stores time.Time — updated on every received packet (any type)
+	lastDataRecv atomic.Value // stores time.Time — updated only on received data packets
+	lastSend     atomic.Value // stores time.Time — updated on every sent packet
+	created      time.Time
 }
 
 func newSession(
@@ -76,6 +78,7 @@ func newSession(
 	}
 	now := time.Now()
 	s.lastRecv.Store(now)
+	s.lastDataRecv.Store(now)
 	s.lastSend.Store(now)
 	dbg("session created",
 		"local_index", localIndex,
@@ -99,6 +102,23 @@ func (s *session) close() {
 	}
 }
 
+// nextCounter atomically allocates the next send counter value.
+// If the counter wraps around at 2^64 (all nonce values exhausted), the
+// session is closed and (0, false) is returned — the caller must not send.
+// Closing the session forces the application to re-dial, which performs a
+// fresh Noise IK handshake and establishes new transport keys.
+func (s *session) nextCounter() (uint64, bool) {
+	next := atomic.AddUint64(&s.sendCounter, 1)
+	if next == 0 {
+		dbg("send counter wrapped at 2^64, closing session to force re-handshake",
+			"local_index", s.localIndex,
+		)
+		s.close()
+		return 0, false
+	}
+	return next - 1, true
+}
+
 // isDone reports whether the session has been closed.
 func (s *session) isDone() bool {
 	select {
@@ -112,7 +132,10 @@ func (s *session) isDone() bool {
 // send encrypts frame and writes it to the remote peer over the shared
 // UDPConn.  It is safe to call from multiple goroutines simultaneously.
 func (s *session) send(frame *proto.Frame) error {
-	counter := atomic.AddUint64(&s.sendCounter, 1) - 1
+	counter, ok := s.nextCounter()
+	if !ok {
+		return ErrConnClosed
+	}
 
 	plain := frame.Marshal()
 	hdr := marshalDataHeader(s.remoteIndex, counter)
@@ -132,20 +155,63 @@ func (s *session) send(frame *proto.Frame) error {
 	return err
 }
 
-// sendKeepalive sends an empty (nil-payload) data packet.
+// sendKeepalive sends a typeKeepalive packet (AEAD over empty payload).
 func (s *session) sendKeepalive() error {
+	counter, ok := s.nextCounter()
+	if !ok {
+		return ErrConnClosed
+	}
+
+	hdr := make([]byte, sizeDataHeader)
+	hdr[0] = typeKeepalive
+	hdr[4] = byte(s.remoteIndex)
+	hdr[5] = byte(s.remoteIndex >> 8)
+	hdr[6] = byte(s.remoteIndex >> 16)
+	hdr[7] = byte(s.remoteIndex >> 24)
+	binary.LittleEndian.PutUint64(hdr[8:], counter)
+
+	ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, nil)
 	dbg("send keepalive",
 		"local_index", s.localIndex,
 		"remote_addr", s.remoteAddr.String(),
 	)
-	return s.send(&proto.Frame{})
+	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
+	if err == nil {
+		s.lastSend.Store(time.Now())
+	}
+	return err
+}
+
+// receiveKeepalive authenticates an incoming typeKeepalive packet and updates
+// lastRecv.  Returns false if the packet is invalid or replayed.
+func (s *session) receiveKeepalive(b []byte) bool {
+	if len(b) < sizeKeepalive {
+		dbg("recv: keepalive packet too short", "local_index", s.localIndex, "len", len(b))
+		return false
+	}
+	counter := binary.LittleEndian.Uint64(b[8:])
+	if !s.replay.check(counter) {
+		dbg("recv: keepalive replay rejected", "local_index", s.localIndex, "counter", counter)
+		return false
+	}
+	if _, err := decryptAEAD(s.recvKey, counter, nil, b[sizeDataHeader:]); err != nil {
+		dbg("recv: keepalive decrypt failed", "local_index", s.localIndex, "counter", counter, "err", err)
+		return false
+	}
+	s.replay.update(counter)
+	s.lastRecv.Store(time.Now())
+	dbg("recv keepalive", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
+	return true
 }
 
 // sendDisconnect sends an authenticated disconnect notification to the remote
 // peer.  The packet has the same AEAD-over-empty-payload layout as a keepalive
 // but uses typeDisconnect (5) so the peer can immediately evict the session.
 func (s *session) sendDisconnect() error {
-	counter := atomic.AddUint64(&s.sendCounter, 1) - 1
+	counter, ok := s.nextCounter()
+	if !ok {
+		return ErrConnClosed
+	}
 
 	// Build a data-style header with typeDisconnect instead of typeData.
 	hdr := make([]byte, sizeDataHeader)
@@ -194,12 +260,12 @@ func (s *session) receive(b []byte) bool {
 		return false
 	}
 	s.replay.update(hdr.Counter)
-	s.lastRecv.Store(time.Now())
+	now := time.Now()
+	s.lastRecv.Store(now)
+	s.lastDataRecv.Store(now)
 
-	// Keepalive: empty plaintext.
 	if len(plain) == 0 {
-		dbg("recv keepalive", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
-		return true
+		return true // empty data frame — nothing to deliver
 	}
 
 	frame, err := proto.UnmarshalFrame(plain)
@@ -234,10 +300,21 @@ func (s *session) receive(b []byte) bool {
 	return true
 }
 
-// isExpired reports whether the session has been idle long enough to be
-// torn down.  Key-rotation thresholds (rekeyAfterTime, rekeyAfterMessages)
-// are intentionally excluded: exceeding them should trigger a new handshake,
-// not a session close.
+// dataActivity returns the most recent time the session sent or received a
+// data packet.  Keepalive receipt is intentionally excluded so that receiving
+// a keepalive does not suppress sending one in response.
+func (s *session) dataActivity() time.Time {
+	lastSend := s.lastSend.Load().(time.Time)
+	lastDataRecv := s.lastDataRecv.Load().(time.Time)
+	if lastDataRecv.After(lastSend) {
+		return lastDataRecv
+	}
+	return lastSend
+}
+
+// isExpired reports whether the session has been idle long enough to be torn
+// down.  Any received packet (including keepalives) counts as activity so that
+// a peer sending keepalives is not incorrectly declared dead.
 func (s *session) isExpired() bool {
 	lastRecv := s.lastRecv.Load().(time.Time)
 	return time.Since(lastRecv) > sessionTimeout
@@ -250,13 +327,9 @@ func (s *session) needsRekey() bool {
 		atomic.LoadUint64(&s.sendCounter) >= rekeyAfterMessages
 }
 
-// needsKeepalive reports whether a keepalive packet should be sent.
-//
-// WireGuard rule: if we have received data from the peer but have not sent
-// anything in keepaliveInterval, send a keepalive so the peer's read loop
-// knows the session is still alive.
+// needsKeepalive reports whether data has been idle long enough to warrant a
+// keepalive probe.  Keepalive receipt does not reset this timer, so a received
+// keepalive will still result in one being sent in response.
 func (s *session) needsKeepalive() bool {
-	lastSend := s.lastSend.Load().(time.Time)
-	lastRecv := s.lastRecv.Load().(time.Time)
-	return time.Since(lastSend) > keepaliveInterval && !lastRecv.IsZero()
+	return time.Since(s.dataActivity()) > keepaliveInterval
 }

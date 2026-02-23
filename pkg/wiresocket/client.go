@@ -245,6 +245,8 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 		switch buf[0] {
 		case typeData:
 			sess.receive(buf[:n])
+		case typeKeepalive:
+			sess.receiveKeepalive(buf[:n])
 		case typeDisconnect:
 			dbg("client: recv disconnect from server", "local_index", sess.localIndex)
 			return
@@ -268,7 +270,9 @@ func clientKeepaliveLoop(sess *session) {
 				sess.close()
 				return
 			}
-			sess.sendKeepalive()
+			if sess.needsKeepalive() {
+				sess.sendKeepalive()
+			}
 		}
 	}
 }

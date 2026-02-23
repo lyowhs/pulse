@@ -172,6 +172,7 @@ func (c *Conn) Done() <-chan struct{} {
 // remote peer so it can evict the session immediately.  Subsequent Send and
 // Recv calls will return ErrConnClosed.  Close is idempotent.
 func (c *Conn) Close() error {
+	dbg("conn close", "local_index", c.sess.localIndex, "remote_addr", c.sess.remoteAddr.String())
 	// Best-effort: ignore send errors (peer may already be gone).
 	_ = c.sess.sendDisconnect()
 	c.sess.close()

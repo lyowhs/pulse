@@ -12,6 +12,7 @@ const (
 	typeCookieReply   = 3
 	typeData          = 4
 	typeDisconnect    = 5
+	typeKeepalive     = 6
 )
 
 // Wire sizes.
@@ -21,8 +22,8 @@ const (
 	sizeCookieReply   = 64  // 1+3+4+24+32
 	sizeDataHeader    = 16  // 1+3+4+8  (payload follows)
 	sizeAEADTag       = 16
-	sizeKeepalive     = sizeDataHeader + sizeAEADTag // data packet with empty payload
-	sizeDisconnect    = sizeDataHeader + sizeAEADTag // same layout as keepalive, type=5
+	sizeKeepalive  = sizeDataHeader + sizeAEADTag // type=6, AEAD over empty payload
+	sizeDisconnect = sizeDataHeader + sizeAEADTag // type=5, same layout as keepalive
 )
 
 // ─── HandshakeInit ───────────────────────────────────────────────────────────

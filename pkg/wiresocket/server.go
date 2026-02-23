@@ -190,6 +190,8 @@ func (s *Server) handlePacket(ctx context.Context, pkt incomingPacket) {
 		s.handleData(pkt)
 	case typeDisconnect:
 		s.handleDisconnect(pkt)
+	case typeKeepalive:
+		s.handleKeepalive(pkt)
 	case typeCookieReply:
 		// Servers don't receive cookie replies.
 	}
@@ -301,6 +303,26 @@ func (s *Server) handleData(pkt incomingPacket) {
 		return
 	}
 	sess.receive(pkt.data)
+}
+
+func (s *Server) handleKeepalive(pkt incomingPacket) {
+	if len(pkt.data) < sizeKeepalive {
+		dbg("server: keepalive packet too short", "len", len(pkt.data))
+		return
+	}
+	idx := parseReceiverIndex(pkt.data)
+	val, ok := s.sessions.Load(idx)
+	if !ok {
+		dbg("server: keepalive for unknown session", "receiver_index", idx)
+		return
+	}
+	sess := val.(*session)
+	if sess.isDone() {
+		dbg("server: keepalive for closed session", "receiver_index", idx)
+		s.sessions.Delete(idx)
+		return
+	}
+	sess.receiveKeepalive(pkt.data)
 }
 
 func (s *Server) handleDisconnect(pkt incomingPacket) {
