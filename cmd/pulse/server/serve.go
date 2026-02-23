@@ -77,11 +77,11 @@ func makeHandler(logger *log.Logger) func(*wiresocket.Conn) {
 		defer logger.Printf("[%s] disconnected", conn.RemoteAddr())
 
 		for {
-			e, err := conn.Recv(context.Background())
+			_, err := conn.Recv(context.Background())
 			if err != nil {
 				return
 			}
-			logEvent(logger, conn.RemoteAddr(), e)
+			//logEvent(logger, conn.RemoteAddr(), e)
 		}
 	}
 }

@@ -64,8 +64,8 @@ func newSession(
 	eventBuf int,
 ) *session {
 	s := &session{
-		sendKey:    sendKey,
-		recvKey:    recvKey,
+		sendKey:     sendKey,
+		recvKey:     recvKey,
 		remoteIndex: remoteIndex,
 		localIndex:  localIndex,
 		remoteAddr:  addr,
@@ -77,6 +77,11 @@ func newSession(
 	now := time.Now()
 	s.lastRecv.Store(now)
 	s.lastSend.Store(now)
+	dbg("session created",
+		"local_index", localIndex,
+		"remote_index", remoteIndex,
+		"remote_addr", addr.String(),
+	)
 	return s
 }
 
@@ -85,6 +90,11 @@ func (s *session) close() {
 	select {
 	case <-s.done:
 	default:
+		dbg("session closed",
+			"local_index", s.localIndex,
+			"remote_index", s.remoteIndex,
+			"remote_addr", s.remoteAddr.String(),
+		)
 		close(s.done)
 	}
 }
@@ -108,6 +118,13 @@ func (s *session) send(frame *proto.Frame) error {
 	hdr := marshalDataHeader(s.remoteIndex, counter)
 	ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, plain)
 
+	dbg("send packet",
+		"local_index", s.localIndex,
+		"remote_index", s.remoteIndex,
+		"counter", counter,
+		"plain_bytes", len(plain),
+		"packet_bytes", len(ciphertext),
+	)
 	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
 	if err == nil {
 		s.lastSend.Store(time.Now())
@@ -117,6 +134,10 @@ func (s *session) send(frame *proto.Frame) error {
 
 // sendKeepalive sends an empty (nil-payload) data packet.
 func (s *session) sendKeepalive() error {
+	dbg("send keepalive",
+		"local_index", s.localIndex,
+		"remote_addr", s.remoteAddr.String(),
+	)
 	return s.send(&proto.Frame{})
 }
 
@@ -126,9 +147,11 @@ func (s *session) sendKeepalive() error {
 func (s *session) receive(b []byte) bool {
 	hdr, err := parseDataHeader(b)
 	if err != nil {
+		dbg("recv: bad data header", "local_index", s.localIndex, "err", err)
 		return false
 	}
 	if !s.replay.check(hdr.Counter) {
+		dbg("recv: replay rejected", "local_index", s.localIndex, "counter", hdr.Counter)
 		return false // replay or too old
 	}
 
@@ -136,6 +159,7 @@ func (s *session) receive(b []byte) bool {
 	// the counter itself is part of the nonce so no AAD is needed.
 	plain, err := decryptAEAD(s.recvKey, hdr.Counter, nil, b[sizeDataHeader:])
 	if err != nil {
+		dbg("recv: decrypt failed", "local_index", s.localIndex, "counter", hdr.Counter, "err", err)
 		return false
 	}
 	s.replay.update(hdr.Counter)
@@ -143,13 +167,21 @@ func (s *session) receive(b []byte) bool {
 
 	// Keepalive: empty plaintext.
 	if len(plain) == 0 {
+		dbg("recv keepalive", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
 		return true
 	}
 
 	frame, err := proto.UnmarshalFrame(plain)
 	if err != nil {
+		dbg("recv: frame unmarshal failed", "local_index", s.localIndex, "err", err)
 		return false
 	}
+	dbg("recv packet",
+		"local_index", s.localIndex,
+		"counter", hdr.Counter,
+		"plain_bytes", len(plain),
+		"events", len(frame.Events),
+	)
 	for _, e := range frame.Events {
 		select {
 		case s.events <- e:
@@ -157,6 +189,7 @@ func (s *session) receive(b []byte) bool {
 			return false
 		default:
 			// Drop oldest if buffer is full rather than blocking.
+			dbg("recv: event buffer full, dropping oldest", "local_index", s.localIndex)
 			select {
 			case <-s.events:
 			default:

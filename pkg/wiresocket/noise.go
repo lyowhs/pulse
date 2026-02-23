@@ -144,8 +144,11 @@ func newInitiatorState(local Keypair, remoteStatic [32]byte) (*noiseState, error
 // CreateInit builds and returns a HandshakeInit message plus the mac1 key
 // so the caller can stamp MAC1 before sending.
 func (ns *noiseState) CreateInit(senderIndex uint32) (*HandshakeInit, error) {
+	dbg("noise: CreateInit", "sender_index", senderIndex)
+
 	// -> e
 	ns.sym.mixHash(ns.localEph.Public[:])
+	dbg("noise: mixed ephemeral public key into h")
 
 	// -> es: DH(e_initiator, s_responder)
 	dhES, err := dhSafe(ns.localEph.Private, ns.remoteStatic)
@@ -153,9 +156,11 @@ func (ns *noiseState) CreateInit(senderIndex uint32) (*HandshakeInit, error) {
 		return nil, err
 	}
 	ns.sym.mixKey(dhES)
+	dbg("noise: DH(e_init, s_resp) done, mixed key (es)")
 
 	// -> s: encrypt initiator static public key
 	encS := ns.sym.encryptAndHash(ns.localStatic.Public[:])
+	dbg("noise: encrypted initiator static public key")
 
 	// -> ss: DH(s_initiator, s_responder)
 	dhSS, err := dhSafe(ns.localStatic.Private, ns.remoteStatic)
@@ -163,10 +168,12 @@ func (ns *noiseState) CreateInit(senderIndex uint32) (*HandshakeInit, error) {
 		return nil, err
 	}
 	ns.sym.mixKey(dhSS)
+	dbg("noise: DH(s_init, s_resp) done, mixed key (ss)")
 
 	// payload: TAI64N timestamp
 	ts := tai64n()
 	encTS := ns.sym.encryptAndHash(ts[:])
+	dbg("noise: encrypted TAI64N timestamp payload")
 
 	msg := &HandshakeInit{
 		SenderIndex: senderIndex,
@@ -183,6 +190,7 @@ func (ns *noiseState) CreateInit(senderIndex uint32) (*HandshakeInit, error) {
 
 	// Compute MAC1 over the message body (everything before the MAC fields).
 	msg.MAC1 = computeMAC1(ns.remoteStatic, msg.mac1Body())
+	dbg("noise: HandshakeInit built", "sender_index", senderIndex)
 	// MAC2 left as zero (no cookie yet).
 	return msg, nil
 }
@@ -190,9 +198,12 @@ func (ns *noiseState) CreateInit(senderIndex uint32) (*HandshakeInit, error) {
 // ConsumeResp processes a HandshakeResp received from the responder.
 // Call TransportKeys() afterward to get the symmetric keys.
 func (ns *noiseState) ConsumeResp(msg *HandshakeResp) error {
+	dbg("noise: ConsumeResp", "sender_index", msg.SenderIndex, "receiver_index", msg.ReceiverIndex)
+
 	// <- e
 	copy(ns.remoteEph[:], msg.Ephemeral[:])
 	ns.sym.mixHash(ns.remoteEph[:])
+	dbg("noise: mixed responder ephemeral into h")
 
 	// <- ee: DH(e_initiator, e_responder)
 	dhEE, err := dhSafe(ns.localEph.Private, ns.remoteEph)
@@ -200,6 +211,7 @@ func (ns *noiseState) ConsumeResp(msg *HandshakeResp) error {
 		return err
 	}
 	ns.sym.mixKey(dhEE)
+	dbg("noise: DH(e_init, e_resp) done, mixed key (ee)")
 
 	// <- se: DH(s_initiator, e_responder)
 	dhSE, err := dhSafe(ns.localStatic.Private, ns.remoteEph)
@@ -207,10 +219,16 @@ func (ns *noiseState) ConsumeResp(msg *HandshakeResp) error {
 		return err
 	}
 	ns.sym.mixKey(dhSE)
+	dbg("noise: DH(s_init, e_resp) done, mixed key (se)")
 
 	// Decrypt empty payload (just the AEAD tag — proves responder identity).
 	_, err = ns.sym.decryptAndHash(msg.EncryptedNil[:])
-	return err
+	if err != nil {
+		dbg("noise: ConsumeResp: decrypt nil payload failed", "err", err)
+		return err
+	}
+	dbg("noise: ConsumeResp: handshake complete")
+	return nil
 }
 
 // ─── responder ───────────────────────────────────────────────────────────────
@@ -235,15 +253,20 @@ func newResponderState(local Keypair) (*noiseState, error) {
 // Returns the initiator's static public key on success.
 // Call CreateResp() next to build the response.
 func (ns *noiseState) ConsumeInit(msg *HandshakeInit) ([32]byte, error) {
+	dbg("noise: ConsumeInit", "sender_index", msg.SenderIndex)
+
 	// Verify MAC1.
 	expectedMAC1 := computeMAC1(ns.localStatic.Public, msg.mac1Body())
 	if expectedMAC1 != msg.MAC1 {
+		dbg("noise: ConsumeInit: MAC1 mismatch")
 		return [32]byte{}, errors.New("wiresocket: MAC1 mismatch")
 	}
+	dbg("noise: MAC1 verified")
 
 	// <- e
 	copy(ns.remoteEph[:], msg.Ephemeral[:])
 	ns.sym.mixHash(ns.remoteEph[:])
+	dbg("noise: mixed initiator ephemeral into h")
 
 	// <- es: DH(s_responder, e_initiator)
 	dhES, err := dhSafe(ns.localStatic.Private, ns.remoteEph)
@@ -251,14 +274,17 @@ func (ns *noiseState) ConsumeInit(msg *HandshakeInit) ([32]byte, error) {
 		return [32]byte{}, err
 	}
 	ns.sym.mixKey(dhES)
+	dbg("noise: DH(s_resp, e_init) done, mixed key (es)")
 
 	// <- s: decrypt initiator static public key
 	plainS, err := ns.sym.decryptAndHash(msg.EncryptedStatic[:])
 	if err != nil {
+		dbg("noise: ConsumeInit: decrypt static key failed", "err", err)
 		return [32]byte{}, err
 	}
 	var initiatorPub [32]byte
 	copy(initiatorPub[:], plainS)
+	dbg("noise: decrypted initiator static public key")
 
 	// <- ss: DH(s_responder, s_initiator)
 	dhSS, err := dhSafe(ns.localStatic.Private, initiatorPub)
@@ -266,25 +292,33 @@ func (ns *noiseState) ConsumeInit(msg *HandshakeInit) ([32]byte, error) {
 		return [32]byte{}, err
 	}
 	ns.sym.mixKey(dhSS)
+	dbg("noise: DH(s_resp, s_init) done, mixed key (ss)")
 
 	// Decrypt timestamp payload (12 bytes).
 	tsPlain, err := ns.sym.decryptAndHash(msg.EncryptedTimestamp[:])
 	if err != nil {
+		dbg("noise: ConsumeInit: decrypt timestamp failed", "err", err)
 		return [32]byte{}, err
 	}
 	// Validate timestamp to prevent replay (must be within ±180 s of now).
 	if err := validateTimestamp(tsPlain); err != nil {
+		dbg("noise: ConsumeInit: timestamp validation failed", "err", err)
 		return [32]byte{}, err
 	}
+	dbg("noise: timestamp validated")
 
 	ns.remoteStatic = initiatorPub
+	dbg("noise: ConsumeInit complete")
 	return initiatorPub, nil
 }
 
 // CreateResp builds a HandshakeResp message after ConsumeInit succeeds.
 func (ns *noiseState) CreateResp(senderIndex, receiverIndex uint32) (*HandshakeResp, error) {
+	dbg("noise: CreateResp", "sender_index", senderIndex, "receiver_index", receiverIndex)
+
 	// -> e
 	ns.sym.mixHash(ns.localEph.Public[:])
+	dbg("noise: mixed responder ephemeral into h")
 
 	// -> ee: DH(e_responder, e_initiator)
 	dhEE, err := dhSafe(ns.localEph.Private, ns.remoteEph)
@@ -292,6 +326,7 @@ func (ns *noiseState) CreateResp(senderIndex, receiverIndex uint32) (*HandshakeR
 		return nil, err
 	}
 	ns.sym.mixKey(dhEE)
+	dbg("noise: DH(e_resp, e_init) done, mixed key (ee)")
 
 	// -> se: DH(e_responder, s_initiator)
 	dhSE, err := dhSafe(ns.localEph.Private, ns.remoteStatic)
@@ -299,9 +334,11 @@ func (ns *noiseState) CreateResp(senderIndex, receiverIndex uint32) (*HandshakeR
 		return nil, err
 	}
 	ns.sym.mixKey(dhSE)
+	dbg("noise: DH(e_resp, s_init) done, mixed key (se)")
 
 	// Encrypt empty payload.
 	encNil := ns.sym.encryptAndHash(nil)
+	dbg("noise: encrypted nil payload")
 
 	msg := &HandshakeResp{
 		SenderIndex:   senderIndex,
@@ -315,6 +352,7 @@ func (ns *noiseState) CreateResp(senderIndex, receiverIndex uint32) (*HandshakeR
 
 	// MAC1 over the response body, using the initiator's static pub as key.
 	msg.MAC1 = computeMAC1(ns.remoteStatic, msg.mac1Body())
+	dbg("noise: HandshakeResp built")
 	return msg, nil
 }
 

@@ -152,6 +152,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			case s.work <- pkt:
 			default:
 				// Worker queue full — drop packet (caller will retransmit).
+				dbg("server: worker queue full, dropping packet", "remote_addr", addr.String())
 			}
 		}
 	}()
@@ -193,13 +194,16 @@ func (s *Server) handlePacket(ctx context.Context, pkt incomingPacket) {
 }
 
 func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
+	dbg("server: recv HandshakeInit", "remote_addr", pkt.addr.String())
 	msg, err := parseHandshakeInit(pkt.data)
 	if err != nil {
+		dbg("server: parse HandshakeInit failed", "err", err)
 		return
 	}
 
 	// If under load, send a CookieReply and skip processing.
 	if s.cfg.UnderLoad != nil && s.cfg.UnderLoad() {
+		dbg("server: under load, sending CookieReply", "remote_addr", pkt.addr.String())
 		reply, err := s.cookies.BuildCookieReply(msg.SenderIndex, msg.MAC1, pkt.addr.String())
 		if err != nil {
 			return
@@ -214,11 +218,13 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	}
 	clientPub, err := hs.ConsumeInit(msg)
 	if err != nil {
+		dbg("server: ConsumeInit failed", "remote_addr", pkt.addr.String(), "err", err)
 		return // MAC1 or crypto failure — drop silently
 	}
 
 	// Optional authentication callback.
 	if s.cfg.Authenticate != nil && !s.cfg.Authenticate(clientPub) {
+		dbg("server: client rejected by Authenticate callback", "remote_addr", pkt.addr.String())
 		return
 	}
 
@@ -251,12 +257,21 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 
 	// Send the response.
 	s.conn.WriteToUDP(resp.marshal(), pkt.addr)
+	dbg("server: sent HandshakeResp",
+		"remote_addr", pkt.addr.String(),
+		"local_index", localIdx,
+		"remote_index", msg.SenderIndex,
+	)
 
 	// Hand the conn to the application.
 	if s.cfg.OnConnect != nil {
 		conn := newConn(sess)
 		go func() {
 			defer func() {
+				dbg("server: session ended",
+					"local_index", localIdx,
+					"remote_addr", pkt.addr.String(),
+				)
 				sess.close()
 				s.sessions.Delete(localIdx)
 				s.totalSessions.Add(-1)
@@ -268,15 +283,18 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 
 func (s *Server) handleData(pkt incomingPacket) {
 	if len(pkt.data) < sizeDataHeader {
+		dbg("server: data packet too short", "len", len(pkt.data))
 		return
 	}
 	idx := parseReceiverIndex(pkt.data)
 	val, ok := s.sessions.Load(idx)
 	if !ok {
+		dbg("server: data packet for unknown session", "receiver_index", idx)
 		return
 	}
 	sess := val.(*session)
 	if sess.isDone() {
+		dbg("server: data packet for closed session", "receiver_index", idx)
 		s.sessions.Delete(idx)
 		return
 	}
@@ -295,6 +313,11 @@ func (s *Server) gc(ctx context.Context) {
 			s.sessions.Range(func(k, v any) bool {
 				sess := v.(*session)
 				if sess.isDone() || sess.isExpired() {
+					dbg("server: gc evicting session",
+						"local_index", sess.localIndex,
+						"remote_addr", sess.remoteAddr.String(),
+						"expired", sess.isExpired(),
+					)
 					sess.close()
 					s.sessions.Delete(k)
 					s.totalSessions.Add(-1)
