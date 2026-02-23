@@ -17,6 +17,11 @@ message Event {
 
   // Opaque binary payload.
   bytes payload = 4;
+
+  // Logical channel identifier for multiplexing multiple streams over a single
+  // connection.  0 is the default channel (used by Conn.Send / Conn.Recv).
+  // Omitted on the wire when zero (proto3 default).
+  uint32 channel_id = 5;
 }
 
 // Frame batches one or more events into a single encrypted UDP payload.

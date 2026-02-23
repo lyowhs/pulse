@@ -39,6 +39,7 @@ func (cm *cookieManager) rotate() {
 		cm.prev = cm.secret
 		_ = randBytes(cm.secret[:])
 		cm.rotated = time.Now()
+		dbg("cookie: secret rotated")
 	}
 }
 
@@ -62,6 +63,7 @@ func (cm *cookieManager) makeCookie(addrStr string) [16]byte {
 // mac1 is the MAC1 value from the HandshakeInit — it serves as the
 // XChaCha20 encryption key so only the real initiator can decrypt it.
 func (cm *cookieManager) BuildCookieReply(receiverIndex uint32, mac1 [16]byte, addrStr string) (*CookieReply, error) {
+	dbg("cookie: building CookieReply", "receiver_index", receiverIndex, "remote_addr", addrStr)
 	cookie := cm.makeCookie(addrStr)
 
 	// Derive a 32-byte XChaCha20 key from mac1 (zero-extended).
@@ -89,6 +91,7 @@ func (cm *cookieManager) BuildCookieReply(receiverIndex uint32, mac1 [16]byte, a
 // ConsumeCookieReply decrypts a CookieReply using the local mac1 that was
 // sent in the original HandshakeInit.  Returns the 16-byte cookie.
 func ConsumeCookieReply(reply *CookieReply, mac1 [16]byte) ([16]byte, error) {
+	dbg("cookie: consuming CookieReply", "receiver_index", reply.ReceiverIndex)
 	var key [32]byte
 	copy(key[:], mac1[:])
 
@@ -98,8 +101,10 @@ func ConsumeCookieReply(reply *CookieReply, mac1 [16]byte) ([16]byte, error) {
 	}
 	plain, err := aead.Open(nil, reply.Nonce[:], reply.EncryptedCookie[:], nil)
 	if err != nil {
+		dbg("cookie: CookieReply decrypt failed", "err", err)
 		return [16]byte{}, err
 	}
+	dbg("cookie: CookieReply decrypted successfully")
 	var cookie [16]byte
 	copy(cookie[:], plain)
 	return cookie, nil

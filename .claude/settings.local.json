@@ -24,7 +24,12 @@
       "Bash(bash /Users/lyowhs/Git/pulse/scripts/test_sign_verify.sh)",
       "Bash(go vet:*)",
       "Bash(pkill:*)",
-      "Bash(/tmp/genkey.go:*)"
+      "Bash(/tmp/genkey.go:*)",
+      "Bash(protoc:*)",
+      "Bash(protoc-gen-go:*)",
+      "Bash(brew install:*)",
+      "Bash(go install:*)",
+      "Bash(PATH=\"$PATH:$HOME/go/bin\" protoc:*)"
     ]
   }
 }
