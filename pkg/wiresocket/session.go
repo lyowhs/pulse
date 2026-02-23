@@ -8,12 +8,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
 
 // maxReassemblyBufs is the maximum number of incomplete fragmented frames
 // buffered per session at one time.
 const maxReassemblyBufs = 64
+
+// sessionEvent pairs a decoded event with the channel it belongs to.
+// Used internally to route events from session to mux without storing
+// the channel ID on the Event itself.
+type sessionEvent struct {
+	channelId uint8
+	event     *Event
+}
 
 // reassemblyBuf accumulates fragments for a single fragmented frame.
 type reassemblyBuf struct {
@@ -59,8 +66,8 @@ type session struct {
 	// Shared UDP connection used to write outgoing packets.
 	udpConn *net.UDPConn
 
-	// Buffered channel delivering decrypted events to the application.
-	events chan *proto.Event
+	// Buffered channel delivering decrypted events to the mux goroutine.
+	events chan sessionEvent
 
 	// Closed to signal teardown.
 	done chan struct{}
@@ -103,7 +110,7 @@ func newSession(
 		localIndex:  localIndex,
 		remoteAddr:  addr,
 		udpConn:     conn,
-		events:      make(chan *proto.Event, eventBuf),
+		events:      make(chan sessionEvent, eventBuf),
 		done:        make(chan struct{}),
 		created:     time.Now(),
 		timeout:     timeout,
@@ -168,7 +175,7 @@ func (s *session) isDone() bool {
 // send encrypts frame and writes it to the remote peer.  Frames larger than
 // maxFragmentPayload are automatically split across multiple typeDataFragment
 // packets.  It is safe to call from multiple goroutines simultaneously.
-func (s *session) send(frame *proto.Frame) error {
+func (s *session) send(frame *Frame) error {
 	plain := frame.Marshal()
 	if len(plain) > maxFragmentPayload {
 		return s.sendFragments(plain)
@@ -362,7 +369,7 @@ func (s *session) receive(b []byte) bool {
 		return true // empty data frame — nothing to deliver
 	}
 
-	frame, err := proto.UnmarshalFrame(plain)
+	frame, err := UnmarshalFrame(plain)
 	if err != nil {
 		dbg("recv: frame unmarshal failed", "local_index", s.localIndex, "err", err)
 		return false
@@ -374,8 +381,9 @@ func (s *session) receive(b []byte) bool {
 		"events", len(frame.Events),
 	)
 	for _, e := range frame.Events {
+		se := sessionEvent{channelId: frame.ChannelId, event: e}
 		select {
-		case s.events <- e:
+		case s.events <- se:
 		case <-s.done:
 			return false
 		default:
@@ -386,7 +394,7 @@ func (s *session) receive(b []byte) bool {
 			default:
 			}
 			select {
-			case s.events <- e:
+			case s.events <- se:
 			default:
 			}
 		}
@@ -519,7 +527,7 @@ func (s *session) receiveFragment(b []byte) bool {
 		return true
 	}
 
-	frame, err := proto.UnmarshalFrame(assembled)
+	frame, err := UnmarshalFrame(assembled)
 	if err != nil {
 		dbg("recv: fragment reassembly unmarshal failed",
 			"local_index", s.localIndex,
@@ -535,8 +543,9 @@ func (s *session) receiveFragment(b []byte) bool {
 		"events", len(frame.Events),
 	)
 	for _, e := range frame.Events {
+		se := sessionEvent{channelId: frame.ChannelId, event: e}
 		select {
-		case s.events <- e:
+		case s.events <- se:
 		case <-s.done:
 			return false
 		default:
@@ -546,7 +555,7 @@ func (s *session) receiveFragment(b []byte) bool {
 			default:
 			}
 			select {
-			case s.events <- e:
+			case s.events <- se:
 			default:
 			}
 		}

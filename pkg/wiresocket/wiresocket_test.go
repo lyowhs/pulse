@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"example.com/pulse/pulse/pkg/wiresocket"
-	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
 
 // freePort finds an available UDP port by briefly binding one.
@@ -42,8 +41,8 @@ func TestHandshakeAndEcho(t *testing.T) {
 				if err != nil {
 					return
 				}
-				conn.Send(context.Background(), &proto.Event{
-					Type:    "pong",
+				conn.Send(context.Background(), &wiresocket.Event{
+					Type:    2, // pong
 					Payload: e.Payload,
 				})
 			}
@@ -72,7 +71,7 @@ func TestHandshakeAndEcho(t *testing.T) {
 	defer conn.Close()
 
 	want := []byte("hello, wiresocket!")
-	if err := conn.Send(ctx, &proto.Event{Type: "ping", Payload: want}); err != nil {
+	if err := conn.Send(ctx, &wiresocket.Event{Type: 1, Payload: want}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -80,8 +79,8 @@ func TestHandshakeAndEcho(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.Type != "pong" {
-		t.Errorf("got type %q, want %q", e.Type, "pong")
+	if e.Type != 2 {
+		t.Errorf("got type %d, want %d", e.Type, 2)
 	}
 	if string(e.Payload) != string(want) {
 		t.Errorf("got payload %q, want %q", e.Payload, want)
@@ -104,8 +103,8 @@ func TestConcurrentClients(t *testing.T) {
 				if err != nil {
 					return
 				}
-				conn.Send(context.Background(), &proto.Event{
-					Type:    "pong",
+				conn.Send(context.Background(), &wiresocket.Event{
+					Type:    2, // pong
 					Payload: e.Payload,
 				})
 			}
@@ -140,7 +139,7 @@ func TestConcurrentClients(t *testing.T) {
 			defer conn.Close()
 
 			msg := fmt.Sprintf("client-%d", id)
-			conn.Send(ctx, &proto.Event{Type: "ping", Payload: []byte(msg)})
+			conn.Send(ctx, &wiresocket.Event{Type: 1, Payload: []byte(msg)})
 			e, err := conn.Recv(ctx)
 			if err != nil {
 				errCh <- fmt.Errorf("client %d recv: %w", id, err)
@@ -161,30 +160,31 @@ func TestConcurrentClients(t *testing.T) {
 	t.Logf("active sessions after test: %d", srv.ActiveSessions())
 }
 
-// TestProtoRoundtrip verifies Event/Frame encode-decode correctness.
-func TestProtoRoundtrip(t *testing.T) {
-	original := &proto.Frame{
-		Events: []*proto.Event{
-			{Sequence: 1, TimestampUs: 1234567890, Type: "update", Payload: []byte{0xde, 0xad, 0xbe, 0xef}},
-			{Sequence: 2, Type: "ack"},
-			{Sequence: 3, Payload: []byte("binary\x00data")},
+// TestFrameRoundtrip verifies Frame/Event encode-decode correctness.
+func TestFrameRoundtrip(t *testing.T) {
+	original := &wiresocket.Frame{
+		ChannelId: 17,
+		Events: []*wiresocket.Event{
+			{Type: 1, Payload: []byte{0xde, 0xad, 0xbe, 0xef}},
+			{Type: 2},
+			{Type: 3, Payload: []byte("binary\x00data")},
 		},
 	}
 	b := original.Marshal()
-	got, err := proto.UnmarshalFrame(b)
+	got, err := wiresocket.UnmarshalFrame(b)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got.ChannelId != original.ChannelId {
+		t.Errorf("ChannelId: got %d, want %d", got.ChannelId, original.ChannelId)
 	}
 	if len(got.Events) != len(original.Events) {
 		t.Fatalf("got %d events, want %d", len(got.Events), len(original.Events))
 	}
 	for i, e := range got.Events {
 		orig := original.Events[i]
-		if e.Sequence != orig.Sequence {
-			t.Errorf("[%d] sequence: got %d, want %d", i, e.Sequence, orig.Sequence)
-		}
 		if e.Type != orig.Type {
-			t.Errorf("[%d] type: got %q, want %q", i, e.Type, orig.Type)
+			t.Errorf("[%d] type: got %d, want %d", i, e.Type, orig.Type)
 		}
 		if string(e.Payload) != string(orig.Payload) {
 			t.Errorf("[%d] payload: got %q, want %q", i, e.Payload, orig.Payload)

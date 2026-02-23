@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 
-	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
 
 // ErrChannelClosed is returned when an operation is performed on a closed Channel.
@@ -29,7 +28,7 @@ const channelCloseType = uint8(255)
 type Channel struct {
 	id        uint8
 	conn      *Conn
-	events    chan *proto.Event
+	events    chan *Event
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -39,7 +38,7 @@ func newChannel(id uint8, conn *Conn, bufSize int) *Channel {
 	return &Channel{
 		id:     id,
 		conn:   conn,
-		events: make(chan *proto.Event, bufSize),
+		events: make(chan *Event, bufSize),
 		done:   make(chan struct{}),
 	}
 }
@@ -52,7 +51,7 @@ func (ch *Channel) ID() uint8 { return ch.id }
 // For persistent conns, if the connection is currently down, Send blocks until
 // it is restored.  If ctx is cancelled before the send completes, ctx.Err()
 // is returned.
-func (ch *Channel) Send(ctx context.Context, e *proto.Event) error {
+func (ch *Channel) Send(ctx context.Context, e *Event) error {
 	for {
 		select {
 		case <-ch.done:
@@ -67,9 +66,8 @@ func (ch *Channel) Send(ctx context.Context, e *proto.Event) error {
 		if err != nil {
 			return err
 		}
-		e.ChannelId = ch.id
 		dbg("channel send", "channel_id", ch.id, "event_type", e.Type)
-		err = sess.send(&proto.Frame{Events: []*proto.Event{e}})
+		err = sess.send(&Frame{ChannelId: ch.id, Events: []*Event{e}})
 		if err == ErrConnClosed && ch.conn.isPersistent() {
 			dbg("channel send: connection lost, waiting for reconnect", "channel_id", ch.id)
 			continue
@@ -82,7 +80,7 @@ func (ch *Channel) Send(ctx context.Context, e *proto.Event) error {
 // the channel or underlying connection is closed.
 //
 // For persistent conns, Recv blocks transparently during reconnection.
-func (ch *Channel) Recv(ctx context.Context) (*proto.Event, error) {
+func (ch *Channel) Recv(ctx context.Context) (*Event, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -99,7 +97,7 @@ func (ch *Channel) Recv(ctx context.Context) (*proto.Event, error) {
 //
 // Prefer Recv for most use-cases; Events is provided for select-loop
 // integration where the caller drives its own multiplex logic.
-func (ch *Channel) Events() <-chan *proto.Event { return ch.events }
+func (ch *Channel) Events() <-chan *Event { return ch.events }
 
 // Done returns a channel that is closed when this channel is closed.
 func (ch *Channel) Done() <-chan struct{} { return ch.done }
@@ -116,11 +114,9 @@ func (ch *Channel) Close() error {
 	dbg("channel close (local)", "channel_id", ch.id)
 	// Notify the peer (best-effort; ignore send errors).
 	if sess := ch.conn.sessionFast(); sess != nil {
-		_ = sess.send(&proto.Frame{
-			Events: []*proto.Event{{
-				ChannelId: ch.id,
-				Type:      channelCloseType,
-			}},
+		_ = sess.send(&Frame{
+			ChannelId: ch.id,
+			Events:    []*Event{{Type: channelCloseType}},
 		})
 	}
 	ch.closeLocal()

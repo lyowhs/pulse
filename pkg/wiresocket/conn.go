@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
 
 // ErrConnClosed is returned when an operation is performed on a closed Conn.
@@ -193,30 +192,30 @@ func (c *Conn) mux(sess *session) {
 		select {
 		case <-sess.done:
 			return
-		case e, ok := <-sess.events:
+		case se, ok := <-sess.events:
 			if !ok {
 				return
 			}
 			// Intercept channel-close control events — never deliver to app.
-			if e.Type == channelCloseType {
-				dbg("mux: channel close from peer", "channel_id", e.ChannelId)
-				if v, ok := c.channels.LoadAndDelete(e.ChannelId); ok {
+			if se.event.Type == channelCloseType {
+				dbg("mux: channel close from peer", "channel_id", se.channelId)
+				if v, ok := c.channels.LoadAndDelete(se.channelId); ok {
 					v.(*Channel).closeLocal()
 				}
 				continue
 			}
-			ch := c.getOrOpenChannel(e.ChannelId)
+			ch := c.getOrOpenChannel(se.channelId)
 			// Deliver to the channel's buffer; drop oldest on overflow.
 			select {
-			case ch.events <- e:
+			case ch.events <- se.event:
 			default:
-				dbg("mux: channel buffer full, dropping oldest", "channel_id", e.ChannelId)
+				dbg("mux: channel buffer full, dropping oldest", "channel_id", se.channelId)
 				select {
 				case <-ch.events:
 				default:
 				}
 				select {
-				case ch.events <- e:
+				case ch.events <- se.event:
 				default:
 				}
 			}
@@ -249,8 +248,7 @@ func (c *Conn) Channel(id uint8) *Channel {
 //
 // For persistent conns, if the connection is currently down, Send blocks until
 // it is restored.  If ctx is cancelled the method returns ctx.Err().
-func (c *Conn) Send(ctx context.Context, e *proto.Event) error {
-	e.ChannelId = 0
+func (c *Conn) Send(ctx context.Context, e *Event) error {
 	for {
 		select {
 		case <-c.done:
@@ -263,7 +261,7 @@ func (c *Conn) Send(ctx context.Context, e *proto.Event) error {
 		if err != nil {
 			return err
 		}
-		err = sess.send(&proto.Frame{Events: []*proto.Event{e}})
+		err = sess.send(&Frame{Events: []*Event{e}})
 		if err == ErrConnClosed && c.isPersistent() {
 			continue
 		}
@@ -272,7 +270,7 @@ func (c *Conn) Send(ctx context.Context, e *proto.Event) error {
 }
 
 // SendFrame sends all events in frame as a single encrypted datagram.
-func (c *Conn) SendFrame(ctx context.Context, frame *proto.Frame) error {
+func (c *Conn) SendFrame(ctx context.Context, frame *Frame) error {
 	for {
 		select {
 		case <-c.done:
@@ -295,7 +293,7 @@ func (c *Conn) SendFrame(ctx context.Context, frame *proto.Frame) error {
 
 // Recv blocks until an event arrives on channel 0, ctx is cancelled, or the
 // connection is closed.
-func (c *Conn) Recv(ctx context.Context) (*proto.Event, error) {
+func (c *Conn) Recv(ctx context.Context) (*Event, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -310,7 +308,7 @@ func (c *Conn) Recv(ctx context.Context) (*proto.Event, error) {
 
 // Events returns the underlying read-only channel of incoming events on
 // channel 0.
-func (c *Conn) Events() <-chan *proto.Event {
+func (c *Conn) Events() <-chan *Event {
 	return c.ch0.events
 }
 

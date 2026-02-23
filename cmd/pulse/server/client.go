@@ -15,7 +15,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"example.com/pulse/pulse/pkg/wiresocket"
-	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
 
 func clientCommand() *cobra.Command {
@@ -103,7 +102,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 						len(e.Payload), len(expected))
 				}
 			default:
-				logger.Printf("← unexpected %s", formatEvent(serverAddr, e))
+				logger.Printf("← unexpected %s", formatEvent(serverAddr, appChannel, e))
 			}
 		}
 	}()
@@ -128,7 +127,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("generate payload: %w", err)
 			}
 			seq++
-			e := &proto.Event{
+			e := &wiresocket.Event{
 				Type:    eventTypeTest,
 				Payload: payload,
 			}
@@ -148,8 +147,8 @@ func runClient(cmd *cobra.Command, args []string) error {
 }
 
 // formatEvent returns a single-line description of an event.
-func formatEvent(remote string, e *proto.Event) string {
-	base := fmt.Sprintf("[%s] ch=%-3d type=%d", remote, e.ChannelId, e.Type)
+func formatEvent(remote string, ch uint8, e *wiresocket.Event) string {
+	base := fmt.Sprintf("[%s] ch=%-3d type=%d", remote, ch, e.Type)
 	switch {
 	case len(e.Payload) == 0:
 		return base

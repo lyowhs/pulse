@@ -13,7 +13,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"example.com/pulse/pulse/pkg/wiresocket"
-	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
 
 func serveCommand() *cobra.Command {
@@ -88,7 +87,7 @@ func makeHandler(logger *log.Logger) func(*wiresocket.Conn) {
 			if err != nil {
 				return
 			}
-			logEvent(logger, conn.RemoteAddr(), e)
+			logEvent(logger, conn.RemoteAddr(), appChannel, e)
 			if err := ch.Send(context.Background(), e); err != nil {
 				logger.Printf("[%s] echo error: %v", conn.RemoteAddr(), err)
 				return
@@ -97,15 +96,15 @@ func makeHandler(logger *log.Logger) func(*wiresocket.Conn) {
 	}
 }
 
-func logEvent(logger *log.Logger, remote string, e *proto.Event) {
+func logEvent(logger *log.Logger, remote string, ch uint8, e *wiresocket.Event) {
 	switch {
 	case len(e.Payload) == 0:
-		logger.Printf("[%s] ch=%-3d type=%d", remote, e.ChannelId, e.Type)
+		logger.Printf("[%s] ch=%-3d type=%d", remote, ch, e.Type)
 	case isPrintable(e.Payload) && len(e.Payload) <= 120:
-		logger.Printf("[%s] ch=%-3d type=%d payload=%q", remote, e.ChannelId, e.Type, e.Payload)
+		logger.Printf("[%s] ch=%-3d type=%d payload=%q", remote, ch, e.Type, e.Payload)
 	default:
 		logger.Printf("[%s] ch=%-3d type=%d payload=<%d bytes> hex=%s",
-			remote, e.ChannelId, e.Type, len(e.Payload),
+			remote, ch, e.Type, len(e.Payload),
 			hex.EncodeToString(e.Payload[:min(len(e.Payload), 16)])+"…")
 	}
 }

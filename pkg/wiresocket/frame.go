@@ -1,12 +1,11 @@
-// Package proto defines the application-layer event types exchanged over an
-// encrypted wiresocket session.
-//
+package wiresocket
+
 // Wire encoding is custom:
-//   - Each Event body begins with two raw bytes: [type][channel_id].
-//   - Any remaining bytes are the payload.
-//   - A Frame is a sequence of length-prefixed Event bodies (proto field 1,
+//   - A Frame begins with one raw byte: [channel_id].
+//   - Followed by a sequence of length-prefixed Event bodies (proto field 1,
 //     wire type LEN).
-package proto
+//   - Each Event body begins with one raw byte: [type].
+//   - Any remaining bytes are the payload.
 
 import (
 	"encoding/binary"
@@ -15,19 +14,20 @@ import (
 
 // Event is a single application-level event.
 type Event struct {
-	Type      uint8  // event type (0–254 application-defined; 255 internal)
-	ChannelId uint8  // logical channel (0 = default)
-	Payload   []byte // opaque binary payload
+	Type    uint8  // event type (0–254 application-defined; 255 internal)
+	Payload []byte // opaque binary payload
 }
 
-// Frame batches one or more Events into a single encrypted UDP payload.
+// Frame batches one or more Events for a single channel into one encrypted UDP
+// payload.  All events in a frame share the same ChannelId.
 type Frame struct {
-	Events []*Event
+	ChannelId uint8
+	Events    []*Event
 }
 
-// Marshal serialises f into wire format.
+// Marshal serialises f into wire format: [channel_id][LEN-field events...].
 func (f *Frame) Marshal() []byte {
-	var b []byte
+	b := []byte{f.ChannelId}
 	for _, e := range f.Events {
 		b = appendLenField(b, 1, e.marshal())
 	}
@@ -36,7 +36,11 @@ func (f *Frame) Marshal() []byte {
 
 // UnmarshalFrame parses a Frame from wire bytes.
 func UnmarshalFrame(b []byte) (*Frame, error) {
-	f := &Frame{}
+	if len(b) == 0 {
+		return &Frame{}, nil
+	}
+	f := &Frame{ChannelId: b[0]}
+	b = b[1:]
 	for len(b) > 0 {
 		field, wt, _, lv, rest, err := consumeField(b)
 		if err != nil {
@@ -54,21 +58,19 @@ func UnmarshalFrame(b []byte) (*Frame, error) {
 	return f, nil
 }
 
-// marshal serialises e: [type byte][channel_id byte][payload...].
+// marshal serialises e: [type byte][payload...].
 func (e *Event) marshal() []byte {
-	b := []byte{e.Type, e.ChannelId}
-	return append(b, e.Payload...)
+	return append([]byte{e.Type}, e.Payload...)
 }
 
 // unmarshal parses e from wire bytes.
 func (e *Event) unmarshal(b []byte) error {
-	if len(b) < 2 {
-		return errors.New("proto: event body too short")
+	if len(b) < 1 {
+		return errors.New("wiresocket: event body too short")
 	}
 	e.Type = b[0]
-	e.ChannelId = b[1]
-	if len(b) > 2 {
-		e.Payload = append([]byte(nil), b[2:]...)
+	if len(b) > 1 {
+		e.Payload = append([]byte(nil), b[1:]...)
 	}
 	return nil
 }
@@ -93,14 +95,14 @@ func consumeVarint(b []byte) (uint64, []byte, error) {
 	var v uint64
 	for i, by := range b {
 		if i == 10 {
-			return 0, nil, errors.New("proto: varint overflow")
+			return 0, nil, errors.New("wiresocket: varint overflow")
 		}
 		v |= uint64(by&0x7f) << (7 * uint(i))
 		if by < 0x80 {
 			return v, b[i+1:], nil
 		}
 	}
-	return 0, nil, errors.New("proto: truncated varint")
+	return 0, nil, errors.New("wiresocket: truncated varint")
 }
 
 func consumeField(b []byte) (field, wt int, val uint64, lv, rest []byte, err error) {
@@ -116,7 +118,7 @@ func consumeField(b []byte) (field, wt int, val uint64, lv, rest []byte, err err
 		val, rest, err = consumeVarint(b)
 	case 1: // I64
 		if len(b) < 8 {
-			err = errors.New("proto: truncated I64")
+			err = errors.New("wiresocket: truncated I64")
 			return
 		}
 		val = binary.LittleEndian.Uint64(b[:8])
@@ -128,20 +130,20 @@ func consumeField(b []byte) (field, wt int, val uint64, lv, rest []byte, err err
 			return
 		}
 		if uint64(len(b)) < l {
-			err = errors.New("proto: truncated LEN value")
+			err = errors.New("wiresocket: truncated LEN value")
 			return
 		}
 		lv = b[:l]
 		rest = b[l:]
 	case 5: // I32
 		if len(b) < 4 {
-			err = errors.New("proto: truncated I32")
+			err = errors.New("wiresocket: truncated I32")
 			return
 		}
 		val = uint64(binary.LittleEndian.Uint32(b[:4]))
 		rest = b[4:]
 	default:
-		err = errors.New("proto: unknown wire type")
+		err = errors.New("wiresocket: unknown wire type")
 	}
 	return
 }
