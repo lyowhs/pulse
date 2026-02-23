@@ -22,6 +22,9 @@ const channelCloseType = uint8(255)
 // uint8 ID.  Channel 0 is the default channel, shared with Conn.Send and
 // Conn.Recv.  All other IDs are free for the application to use.
 //
+// For persistent Conns, Send and Recv block transparently while the underlying
+// connection is being re-established.
+//
 // A Channel may safely be used from multiple goroutines simultaneously.
 type Channel struct {
 	id        uint8
@@ -46,30 +49,44 @@ func (ch *Channel) ID() uint8 { return ch.id }
 
 // Send sends an event on this channel to the remote peer.
 //
-// The event's ChannelId is set to this channel's ID before sending.
-// If ctx is cancelled before the send completes, ctx.Err() is returned.
+// For persistent conns, if the connection is currently down, Send blocks until
+// it is restored.  If ctx is cancelled before the send completes, ctx.Err()
+// is returned.
 func (ch *Channel) Send(ctx context.Context, e *proto.Event) error {
-	select {
-	case <-ch.done:
-		return ErrChannelClosed
-	case <-ch.conn.sess.done:
-		return ErrConnClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
+	for {
+		select {
+		case <-ch.done:
+			return ErrChannelClosed
+		case <-ch.conn.done:
+			return ErrConnClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		sess, err := ch.conn.currentSession(ctx)
+		if err != nil {
+			return err
+		}
+		e.ChannelId = ch.id
+		dbg("channel send", "channel_id", ch.id, "event_type", e.Type)
+		err = sess.send(&proto.Frame{Events: []*proto.Event{e}})
+		if err == ErrConnClosed && ch.conn.isPersistent() {
+			dbg("channel send: connection lost, waiting for reconnect", "channel_id", ch.id)
+			continue
+		}
+		return err
 	}
-	e.ChannelId = ch.id
-	dbg("channel send", "channel_id", ch.id, "event_type", e.Type)
-	return ch.conn.sess.send(&proto.Frame{Events: []*proto.Event{e}})
 }
 
 // Recv blocks until an event arrives on this channel, ctx is cancelled, or
 // the channel or underlying connection is closed.
+//
+// For persistent conns, Recv blocks transparently during reconnection.
 func (ch *Channel) Recv(ctx context.Context) (*proto.Event, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-ch.conn.sess.done:
+	case <-ch.conn.done:
 		return nil, ErrConnClosed
 	case <-ch.done:
 		return nil, ErrChannelClosed
@@ -98,12 +115,14 @@ func (ch *Channel) Close() error {
 	}
 	dbg("channel close (local)", "channel_id", ch.id)
 	// Notify the peer (best-effort; ignore send errors).
-	_ = ch.conn.sess.send(&proto.Frame{
-		Events: []*proto.Event{{
-			ChannelId: ch.id,
-			Type:      channelCloseType,
-		}},
-	})
+	if sess := ch.conn.sessionFast(); sess != nil {
+		_ = sess.send(&proto.Frame{
+			Events: []*proto.Event{{
+				ChannelId: ch.id,
+				Type:      channelCloseType,
+			}},
+		})
+	}
 	ch.closeLocal()
 	return nil
 }

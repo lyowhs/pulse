@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
 	"github.com/spf13/cobra"
 
 	"example.com/pulse/pulse/pkg/wiresocket"
@@ -51,9 +53,10 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	logger := log.New(os.Stdout, "", 0)
 
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
-		Addr:       addr,
-		PrivateKey: privKey,
-		OnConnect:  makeHandler(logger),
+		Addr:              addr,
+		PrivateKey:        privKey,
+		OnConnect:         makeHandler(logger),
+		KeepaliveInterval: 3 * time.Second,
 	})
 	if err != nil {
 		return err

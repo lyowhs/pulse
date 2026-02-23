@@ -65,6 +65,15 @@ type session struct {
 	// Closed to signal teardown.
 	done chan struct{}
 
+	// How long without any received packet before declaring the peer dead.
+	timeout time.Duration
+
+	// How often to send keepalive probes when data is idle.
+	keepalive time.Duration
+
+	// Maximum number of partially-reassembled fragmented frames buffered.
+	maxFragBufs int
+
 	// Activity tracking.
 	lastRecv     atomic.Value // stores time.Time — updated on every received packet (any type)
 	lastDataRecv atomic.Value // stores time.Time — updated only on received data packets
@@ -83,6 +92,9 @@ func newSession(
 	addr *net.UDPAddr,
 	conn *net.UDPConn,
 	eventBuf int,
+	timeout time.Duration,
+	keepalive time.Duration,
+	maxFragBufs int,
 ) *session {
 	s := &session{
 		sendKey:     sendKey,
@@ -94,6 +106,9 @@ func newSession(
 		events:      make(chan *proto.Event, eventBuf),
 		done:        make(chan struct{}),
 		created:     time.Now(),
+		timeout:     timeout,
+		keepalive:   keepalive,
+		maxFragBufs: maxFragBufs,
 	}
 	now := time.Now()
 	s.lastRecv.Store(now)
@@ -103,6 +118,8 @@ func newSession(
 		"local_index", localIndex,
 		"remote_index", remoteIndex,
 		"remote_addr", addr.String(),
+		"timeout", timeout,
+		"keepalive", keepalive,
 	)
 	return s
 }
@@ -438,7 +455,7 @@ func (s *session) receiveFragment(b []byte) bool {
 	}
 	buf, ok := s.fragBufs[frameID]
 	if !ok {
-		if len(s.fragBufs) >= maxReassemblyBufs {
+		if len(s.fragBufs) >= s.maxFragBufs {
 			s.fragMu.Unlock()
 			dbg("recv: reassembly buffer full, dropping fragment",
 				"local_index", s.localIndex,
@@ -467,6 +484,12 @@ func (s *session) receiveFragment(b []byte) bool {
 		buf.frags[fragIndex] = append([]byte(nil), data...)
 		buf.received++
 		buf.lastSeen = time.Now()
+	} else {
+		dbg("recv: duplicate fragment ignored",
+			"local_index", s.localIndex,
+			"frame_id", frameID,
+			"frag_index", fragIndex,
+		)
 	}
 
 	complete := buf.received == buf.total
@@ -555,7 +578,7 @@ func (s *session) gcFragBufs(maxAge time.Duration) {
 // a peer sending keepalives is not incorrectly declared dead.
 func (s *session) isExpired() bool {
 	lastRecv := s.lastRecv.Load().(time.Time)
-	return time.Since(lastRecv) > sessionTimeout
+	return time.Since(lastRecv) > s.timeout
 }
 
 // needsRekey reports whether the session has exceeded the recommended key
@@ -569,5 +592,5 @@ func (s *session) needsRekey() bool {
 // keepalive probe.  Keepalive receipt does not reset this timer, so a received
 // keepalive will still result in one being sent in response.
 func (s *session) needsKeepalive() bool {
-	return time.Since(s.dataActivity()) > keepaliveInterval
+	return time.Since(s.dataActivity()) > s.keepalive
 }

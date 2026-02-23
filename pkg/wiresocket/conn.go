@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
@@ -18,41 +19,181 @@ var ErrConnClosed = errors.New("wiresocket: connection closed")
 // Channel 0 is the default, used by Send and Recv.  All channel IDs are
 // created on demand and persist until explicitly closed or the connection ends.
 //
+// If Conn was created with a non-zero ReconnectMin in DialConfig it reconnects
+// automatically after a connection loss.  Channel Send and Recv calls block
+// transparently while reconnecting.
+//
 // A Conn may safely be used from multiple goroutines simultaneously.
 type Conn struct {
-	sess     *session
 	channels sync.Map // uint8 → *Channel
-	ch0      *Channel // channel 0 — default channel for Send/Recv
+	ch0      *Channel
+
+	// mu protects sess and ready for persistent conns; unused for non-persistent.
+	mu   sync.RWMutex
+	sess *session // current session; immutable for non-persistent
+
+	// Persistent-only fields (zero/nil for non-persistent).
+	addr    string
+	dialCfg DialConfig
+	ready   chan struct{} // closed when sess is valid; replaced on each disconnect
+	ctx     context.Context
+	cancel  context.CancelFunc
+
+	// done is closed when the Conn is permanently finished:
+	//  - non-persistent: aliased to sess.done (closed when the session ends)
+	//  - persistent: closed when reconnectLoop exits after Close()
+	done chan struct{}
 }
 
-// newConn creates a Conn over an already-established session and starts the
-// internal channel-mux goroutine.
+// newConn creates a non-persistent Conn over an already-established session
+// and starts the internal mux goroutine.
 func newConn(s *session) *Conn {
-	c := &Conn{sess: s}
+	c := &Conn{
+		sess: s,
+		done: s.done, // alias: done when the session closes
+	}
 	c.ch0 = newChannel(0, c, cap(s.events))
 	c.channels.Store(uint8(0), c.ch0)
 	dbg("conn created", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
-	go c.mux()
+	go c.mux(s)
 	return c
 }
 
-// mux reads from the session's raw event stream and routes each event to the
-// appropriate Channel based on its ChannelID.  It runs for the lifetime of the
-// session, and closes all open channels when the session ends.
-func (c *Conn) mux() {
-	dbg("mux started", "local_index", c.sess.localIndex)
+// isPersistent reports whether this Conn reconnects automatically.
+func (c *Conn) isPersistent() bool { return c.cancel != nil }
+
+// sessionFast returns the current session without blocking.
+// For non-persistent conns, always returns the fixed session.
+// For persistent conns, returns nil while disconnected.
+func (c *Conn) sessionFast() *session {
+	if !c.isPersistent() {
+		return c.sess
+	}
+	c.mu.RLock()
+	s := c.sess
+	c.mu.RUnlock()
+	return s
+}
+
+// currentSession returns the active session, blocking for persistent conns
+// until one is available, ctx is cancelled, or the Conn is closed.
+func (c *Conn) currentSession(ctx context.Context) (*session, error) {
+	if !c.isPersistent() {
+		return c.sess, nil
+	}
+	for {
+		c.mu.RLock()
+		sess := c.sess
+		ready := c.ready
+		c.mu.RUnlock()
+
+		if sess != nil {
+			return sess, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.done:
+			return nil, ErrConnClosed
+		case <-ready:
+			// Connection re-established; re-read under lock.
+		}
+	}
+}
+
+// reconnectLoop watches the current session for termination and reconnects.
+// It runs for the lifetime of a persistent Conn.
+func (c *Conn) reconnectLoop() {
 	defer func() {
-		dbg("mux stopped, closing all channels", "local_index", c.sess.localIndex)
+		// Permanently closed: shut down all channels.
 		c.channels.Range(func(k, v any) bool {
 			v.(*Channel).closeLocal()
 			return true
 		})
+		close(c.done)
+	}()
+
+	for {
+		c.mu.RLock()
+		sess := c.sess
+		c.mu.RUnlock()
+
+		select {
+		case <-c.ctx.Done():
+			if sess != nil {
+				_ = sess.sendDisconnect()
+				sess.close()
+			}
+			return
+		case <-sess.done:
+		}
+
+		dbg("persistent: connection lost", "addr", c.addr)
+
+		c.mu.Lock()
+		c.sess = nil
+		c.ready = make(chan struct{})
+		c.mu.Unlock()
+
+		// For reconnect attempts, make a single handshake attempt per
+		// outer iteration — the outer backoff owns all retry spacing.
+		reconnectCfg := c.dialCfg
+		reconnectCfg.MaxRetries = 1
+
+		backoff := c.dialCfg.ReconnectMin
+		for {
+			select {
+			case <-c.ctx.Done():
+				dbg("persistent: reconnect loop stopped", "addr", c.addr)
+				return
+			case <-time.After(backoff):
+			}
+
+			dbg("persistent: attempting reconnect", "addr", c.addr, "backoff", backoff)
+			raddr, udpConn, newSess, err := dialSession(c.ctx, c.addr, reconnectCfg)
+			if err != nil {
+				dbg("persistent: reconnect failed", "addr", c.addr, "err", err)
+				backoff *= 2
+				if backoff > c.dialCfg.ReconnectMax {
+					backoff = c.dialCfg.ReconnectMax
+				}
+				continue
+			}
+
+			dbg("persistent: reconnected", "addr", c.addr)
+			go clientReadLoop(udpConn, newSess, raddr)
+			go clientKeepaliveLoop(newSess)
+			go c.mux(newSess)
+
+			c.mu.Lock()
+			c.sess = newSess
+			close(c.ready)
+			c.mu.Unlock()
+			break
+		}
+	}
+}
+
+// mux reads from sess's event stream and routes each event to the appropriate
+// Channel based on its ChannelID.  For non-persistent Conns it closes all
+// channels when sess ends.  For persistent Conns it simply exits so that
+// reconnectLoop can start a new mux for the next session.
+func (c *Conn) mux(sess *session) {
+	dbg("mux started", "local_index", sess.localIndex)
+	defer func() {
+		dbg("mux stopped", "local_index", sess.localIndex, "persistent", c.isPersistent())
+		if !c.isPersistent() {
+			c.channels.Range(func(k, v any) bool {
+				v.(*Channel).closeLocal()
+				return true
+			})
+		}
 	}()
 	for {
 		select {
-		case <-c.sess.done:
+		case <-sess.done:
 			return
-		case e, ok := <-c.sess.events:
+		case e, ok := <-sess.events:
 			if !ok {
 				return
 			}
@@ -89,7 +230,7 @@ func (c *Conn) getOrOpenChannel(id uint8) *Channel {
 	if v, ok := c.channels.Load(id); ok {
 		return v.(*Channel)
 	}
-	ch := newChannel(id, c, cap(c.sess.events))
+	ch := newChannel(id, c, cap(c.ch0.events))
 	v, loaded := c.channels.LoadOrStore(id, ch)
 	if loaded {
 		dbg("mux: channel already created by racing goroutine", "channel_id", id)
@@ -106,33 +247,50 @@ func (c *Conn) Channel(id uint8) *Channel {
 
 // Send sends one event to the remote peer on channel 0.
 //
-// If ctx is cancelled before the send completes the method returns ctx.Err().
+// For persistent conns, if the connection is currently down, Send blocks until
+// it is restored.  If ctx is cancelled the method returns ctx.Err().
 func (c *Conn) Send(ctx context.Context, e *proto.Event) error {
-	select {
-	case <-c.sess.done:
-		return ErrConnClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
+	e.ChannelId = 0
+	for {
+		select {
+		case <-c.done:
+			return ErrConnClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		sess, err := c.currentSession(ctx)
+		if err != nil {
+			return err
+		}
+		err = sess.send(&proto.Frame{Events: []*proto.Event{e}})
+		if err == ErrConnClosed && c.isPersistent() {
+			continue
+		}
+		return err
 	}
-	e.ChannelId = 0 // enforce default channel
-	return c.sess.send(&proto.Frame{Events: []*proto.Event{e}})
 }
 
 // SendFrame sends all events in frame as a single encrypted datagram.
-// This is more efficient than calling Send once per event when you have
-// multiple events to deliver atomically.  ChannelID on each event is used
-// as-is, allowing events for multiple channels to be coalesced into one
-// datagram.
 func (c *Conn) SendFrame(ctx context.Context, frame *proto.Frame) error {
-	select {
-	case <-c.sess.done:
-		return ErrConnClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
+	for {
+		select {
+		case <-c.done:
+			return ErrConnClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		sess, err := c.currentSession(ctx)
+		if err != nil {
+			return err
+		}
+		err = sess.send(frame)
+		if err == ErrConnClosed && c.isPersistent() {
+			continue
+		}
+		return err
 	}
-	return c.sess.send(frame)
 }
 
 // Recv blocks until an event arrives on channel 0, ctx is cancelled, or the
@@ -141,7 +299,7 @@ func (c *Conn) Recv(ctx context.Context) (*proto.Event, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-c.sess.done:
+	case <-c.done:
 		return nil, ErrConnClosed
 	case <-c.ch0.done:
 		return nil, ErrConnClosed
@@ -152,36 +310,47 @@ func (c *Conn) Recv(ctx context.Context) (*proto.Event, error) {
 
 // Events returns the underlying read-only channel of incoming events on
 // channel 0.
-//
-// Prefer Recv for most use-cases; Events is provided for select-loop
-// integration where the caller drives its own multiplex logic.
 func (c *Conn) Events() <-chan *proto.Event {
 	return c.ch0.events
 }
 
-// Done returns a channel that is closed when the connection terminates.
+// Done returns a channel that is closed when the Conn is permanently finished.
+// For persistent connections this only fires after Close() is called and the
+// reconnect loop has exited.
 func (c *Conn) Done() <-chan struct{} {
-	return c.sess.done
+	return c.done
 }
 
-// Close closes the connection.  A disconnect notification is sent to the
-// remote peer so it can evict the session immediately.  Subsequent Send and
-// Recv calls will return ErrConnClosed.  Close is idempotent.
+// Close closes the connection.  For persistent connections it stops the
+// reconnect loop and waits for it to exit.  Close is idempotent.
 func (c *Conn) Close() error {
+	if c.isPersistent() {
+		dbg("persistent conn close", "addr", c.addr)
+		c.cancel()
+		<-c.done
+		return nil
+	}
 	dbg("conn close", "local_index", c.sess.localIndex, "remote_addr", c.sess.remoteAddr.String())
-	// Best-effort: ignore send errors (peer may already be gone).
 	_ = c.sess.sendDisconnect()
 	c.sess.close()
 	return nil
 }
 
 // RemoteAddr returns the UDP address of the remote peer.
+// For persistent connections, returns the configured server address.
 func (c *Conn) RemoteAddr() string {
+	if c.isPersistent() {
+		return c.addr
+	}
 	return c.sess.remoteAddr.String()
 }
 
-// LocalIndex returns this side's session index (the remote peer uses this as
-// ReceiverIndex in data packets directed at us).
+// LocalIndex returns this side's current session index.
+// Returns 0 if a persistent connection is currently disconnected.
 func (c *Conn) LocalIndex() uint32 {
-	return c.sess.localIndex
+	sess := c.sessionFast()
+	if sess == nil {
+		return 0
+	}
+	return sess.localIndex
 }

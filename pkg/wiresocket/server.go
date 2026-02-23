@@ -41,11 +41,43 @@ type ServerConfig struct {
 	// UnderLoad, if set, returns true when the server is under DoS stress and
 	// should respond with CookieReply instead of processing handshakes.
 	UnderLoad func() bool
+
+	// SessionTimeout is how long a session may be idle before the server
+	// tears it down.  Defaults to 180 s.  Each side enforces its own
+	// timeout independently, so clients and servers may use different values.
+	SessionTimeout time.Duration
+
+	// KeepaliveInterval is how often to send keepalive probes when data is
+	// idle.  Defaults to 10 s.  Must be less than the client's SessionTimeout.
+	KeepaliveInterval time.Duration
+
+	// SessionGCInterval is how often the server scans for expired sessions
+	// and sends keepalives.  Defaults to 5 s.  Smaller values evict dead
+	// sessions faster and send keepalives more promptly; larger values reduce
+	// CPU overhead on servers with many sessions.
+	SessionGCInterval time.Duration
+
+	// MaxIncompleteFrames is the maximum number of partially-reassembled
+	// fragmented frames buffered per session.  Excess fragments are dropped.
+	// Defaults to 64.
+	MaxIncompleteFrames int
 }
 
 func (cfg *ServerConfig) defaults() {
 	if cfg.EventBufSize == 0 {
 		cfg.EventBufSize = 256
+	}
+	if cfg.SessionTimeout == 0 {
+		cfg.SessionTimeout = sessionTimeout
+	}
+	if cfg.KeepaliveInterval == 0 {
+		cfg.KeepaliveInterval = keepaliveInterval
+	}
+	if cfg.SessionGCInterval == 0 {
+		cfg.SessionGCInterval = 5 * time.Second
+	}
+	if cfg.MaxIncompleteFrames == 0 {
+		cfg.MaxIncompleteFrames = maxReassemblyBufs
 	}
 	if cfg.WorkerCount == 0 {
 		cfg.WorkerCount = runtime.GOMAXPROCS(0)
@@ -196,6 +228,8 @@ func (s *Server) handlePacket(ctx context.Context, pkt incomingPacket) {
 		s.handleKeepalive(pkt)
 	case typeCookieReply:
 		// Servers don't receive cookie replies.
+	default:
+		dbg("server: unknown packet type, dropping", "type", pkt.data[0], "remote_addr", pkt.addr.String())
 	}
 }
 
@@ -256,7 +290,7 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	}
 
 	sendKey, recvKey := hs.TransportKeys(false) // false = responder
-	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize)
+	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize, s.cfg.SessionTimeout, s.cfg.KeepaliveInterval, s.cfg.MaxIncompleteFrames)
 
 	s.sessions.Store(localIdx, sess)
 	s.totalSessions.Add(1)
@@ -384,7 +418,7 @@ func (s *Server) handleDisconnect(pkt incomingPacket) {
 
 // gc periodically removes expired sessions and sends keepalives.
 func (s *Server) gc(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(s.cfg.SessionGCInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -407,7 +441,7 @@ func (s *Server) gc(ctx context.Context) {
 				if sess.needsKeepalive() {
 					sess.sendKeepalive()
 				}
-				sess.gcFragBufs(5 * time.Second)
+				sess.gcFragBufs(s.cfg.SessionGCInterval)
 				return true
 			})
 		}

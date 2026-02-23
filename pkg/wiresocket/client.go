@@ -31,6 +31,28 @@ type DialConfig struct {
 	// MaxRetries is the number of times to retransmit HandshakeInit before
 	// giving up.  Defaults to 5.
 	MaxRetries int
+
+	// ReconnectMin, if non-zero, enables automatic reconnection on connection
+	// loss.  It is the minimum backoff between reconnect attempts.
+	ReconnectMin time.Duration
+
+	// ReconnectMax is the maximum backoff between reconnect attempts.
+	// Defaults to 30 s when ReconnectMin is non-zero.
+	ReconnectMax time.Duration
+
+	// SessionTimeout is how long a session may be idle before the client
+	// tears it down.  Defaults to 180 s.  Each side enforces its own
+	// timeout independently, so clients and servers may use different values.
+	SessionTimeout time.Duration
+
+	// KeepaliveInterval is how often to send keepalive probes when data is
+	// idle.  Defaults to 10 s.  Must be less than the server's SessionTimeout.
+	KeepaliveInterval time.Duration
+
+	// MaxIncompleteFrames is the maximum number of partially-reassembled
+	// fragmented frames buffered per session.  Excess fragments are dropped.
+	// Defaults to 64.
+	MaxIncompleteFrames int
 }
 
 func (cfg *DialConfig) defaults() {
@@ -43,60 +65,108 @@ func (cfg *DialConfig) defaults() {
 	if cfg.MaxRetries == 0 {
 		cfg.MaxRetries = 5
 	}
+	if cfg.ReconnectMin > 0 && cfg.ReconnectMax == 0 {
+		cfg.ReconnectMax = 30 * time.Second
+	}
+	if cfg.SessionTimeout == 0 {
+		cfg.SessionTimeout = sessionTimeout
+	}
+	if cfg.KeepaliveInterval == 0 {
+		cfg.KeepaliveInterval = keepaliveInterval
+	}
+	if cfg.MaxIncompleteFrames == 0 {
+		cfg.MaxIncompleteFrames = maxReassemblyBufs
+	}
 }
 
 // Dial connects to a wiresocket server at addr, completes the Noise IK
 // handshake, and returns a bidirectional Conn.
 //
 // addr must be a host:port string resolvable as UDP (e.g. "server.example.com:9000").
+//
+// If cfg.ReconnectMin is non-zero, the returned Conn automatically reconnects
+// after connection loss.  Channel Send and Recv calls block transparently
+// while reconnecting.
 func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 	cfg.defaults()
 
-	// Resolve remote address.
-	raddr, err := net.ResolveUDPAddr("udp", addr)
+	raddr, udpConn, sess, err := dialSession(ctx, addr, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("wiresocket: resolve %q: %w", addr, err)
+		return nil, err
 	}
 
-	// Bind a local UDP port (OS-assigned).
+	go clientReadLoop(udpConn, sess, raddr)
+	go clientKeepaliveLoop(sess)
+
+	if cfg.ReconnectMin > 0 {
+		pctx, cancel := context.WithCancel(context.Background())
+		ready := make(chan struct{})
+		close(ready) // initially connected
+
+		c := &Conn{
+			addr:    addr,
+			dialCfg: cfg,
+			ctx:     pctx,
+			cancel:  cancel,
+			done:    make(chan struct{}),
+			ready:   ready,
+			sess:    sess,
+		}
+		c.ch0 = newChannel(0, c, cfg.EventBufSize)
+		c.channels.Store(uint8(0), c.ch0)
+		dbg("persistent conn created", "addr", addr, "local_index", sess.localIndex)
+		go c.mux(sess)
+		go c.reconnectLoop()
+		return c, nil
+	}
+
+	return newConn(sess), nil
+}
+
+// dialSession performs a single full handshake and returns the established
+// UDP connection, resolved remote address, and new session.  It is called by
+// Dial for the initial connection and by reconnectLoop for each reconnect.
+func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr, *net.UDPConn, *session, error) {
+	raddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("wiresocket: resolve %q: %w", addr, err)
+	}
+
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 	if err != nil {
-		return nil, fmt.Errorf("wiresocket: listen UDP: %w", err)
+		return nil, nil, nil, fmt.Errorf("wiresocket: listen UDP: %w", err)
 	}
 
 	kp, err := resolveClientKeypair(cfg.PrivateKey)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, nil, err
 	}
 
-	// Pick a random sender index.
 	localIdx, err := randUint32()
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	hs, err := newInitiatorState(kp, cfg.ServerPublicKey)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	initMsg, err := hs.CreateInit(localIdx)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, nil, err
 	}
 	initBytes := initMsg.marshal()
 
-	// Retry loop: send HandshakeInit and wait for HandshakeResp or CookieReply.
 	retryDelay := 250 * time.Millisecond
 	var cookie [16]byte
 	hasCookie := false
 
 	for attempt := 0; attempt < cfg.MaxRetries; attempt++ {
-		// Stamp MAC2 if we have a cookie from a previous CookieReply.
 		if hasCookie {
 			mac2 := computeMAC2(cookie, initMsg.mac1Body())
 			copy(initBytes[132:148], mac2[:])
@@ -111,7 +181,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 		)
 		if _, err := conn.WriteToUDP(initBytes, raddr); err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("wiresocket: send HandshakeInit: %w", err)
+			return nil, nil, nil, fmt.Errorf("wiresocket: send HandshakeInit: %w", err)
 		}
 
 		deadline := time.Now().Add(cfg.HandshakeTimeout)
@@ -128,10 +198,9 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 			select {
 			case <-ctx.Done():
 				conn.Close()
-				return nil, ctx.Err()
+				return nil, nil, nil, ctx.Err()
 			default:
 			}
-			// Timeout — retry.
 			dbg("client: HandshakeInit timed out, retrying",
 				"attempt", attempt+1,
 				"retry_delay", retryDelay,
@@ -158,24 +227,19 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 					"got", resp.ReceiverIndex,
 					"want", localIdx,
 				)
-				continue // not for us
+				continue
 			}
 			if err := hs.ConsumeResp(resp); err != nil {
 				conn.Close()
-				return nil, fmt.Errorf("wiresocket: handshake failed: %w", err)
+				return nil, nil, nil, fmt.Errorf("wiresocket: handshake failed: %w", err)
 			}
 			dbg("client: handshake complete",
 				"local_index", localIdx,
 				"remote_index", resp.SenderIndex,
 			)
-			sendKey, recvKey := hs.TransportKeys(true) // true = initiator
-			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize)
-
-			// Start background goroutines for the client conn.
-			go clientReadLoop(conn, sess, raddr)
-			go clientKeepaliveLoop(sess)
-
-			return newConn(sess), nil
+			sendKey, recvKey := hs.TransportKeys(true)
+			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize, cfg.SessionTimeout, cfg.KeepaliveInterval, cfg.MaxIncompleteFrames)
+			return raddr, conn, sess, nil
 
 		case typeCookieReply:
 			dbg("client: recv CookieReply, will retry with MAC2")
@@ -191,13 +255,12 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 				continue
 			}
 			hasCookie = true
-			// Retry immediately with mac2 set.
 			continue
 		}
 	}
 
 	conn.Close()
-	return nil, errors.New("wiresocket: handshake timed out after retries")
+	return nil, nil, nil, errors.New("wiresocket: handshake timed out after retries")
 }
 
 // clientReadLoop runs in a background goroutine, reading incoming UDP packets
@@ -218,13 +281,11 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(keepaliveInterval * 2))
+		conn.SetReadDeadline(time.Now().Add(sess.timeout))
 		n, src, err := conn.ReadFromUDP(buf)
 		conn.SetReadDeadline(time.Time{})
 
 		if err != nil {
-			// A read timeout just means no packet arrived in the window —
-			// the session may still be healthy.  Check expiry and loop back.
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				if !sess.isExpired() {
@@ -232,11 +293,9 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 					continue
 				}
 				dbg("client: session expired after read timeout", "local_index", sess.localIndex)
-				// Session has timed out — fall through to close.
 			} else {
 				dbg("client: read error", "local_index", sess.localIndex, "err", err)
 			}
-			// Real network error or expired session — terminate.
 			return
 		}
 		if n == 0 || src.String() != raddr.String() {
@@ -252,6 +311,8 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 		case typeDisconnect:
 			dbg("client: recv disconnect from server", "local_index", sess.localIndex)
 			return
+		default:
+			dbg("client: unknown packet type, dropping", "type", buf[0], "len", n)
 		}
 	}
 }
@@ -259,7 +320,7 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 // clientKeepaliveLoop sends keepalives and enforces the session timeout.
 func clientKeepaliveLoop(sess *session) {
 	dbg("client: keepalive loop started", "local_index", sess.localIndex)
-	ticker := time.NewTicker(keepaliveInterval)
+	ticker := time.NewTicker(sess.keepalive)
 	defer ticker.Stop()
 	for {
 		select {
@@ -275,7 +336,7 @@ func clientKeepaliveLoop(sess *session) {
 			if sess.needsKeepalive() {
 				sess.sendKeepalive()
 			}
-			sess.gcFragBufs(keepaliveInterval * 2)
+			sess.gcFragBufs(sess.keepalive * 2)
 		}
 	}
 }

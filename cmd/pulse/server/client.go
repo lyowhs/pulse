@@ -65,15 +65,18 @@ func runClient(cmd *cobra.Command, args []string) error {
 	logger.Printf("connecting to %s …", serverAddr)
 
 	conn, err := wiresocket.Dial(ctx, serverAddr, wiresocket.DialConfig{
-		ServerPublicKey: serverPub,
-		PrivateKey:      privKey,
+		ServerPublicKey:   serverPub,
+		PrivateKey:        privKey,
+		ReconnectMin:      250 * time.Millisecond,
+		KeepaliveInterval: 2 * time.Second,
+		SessionTimeout:    10 * time.Second,
 	})
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
 
-	logger.Printf("connected (local session index %d)", conn.LocalIndex())
+	logger.Printf("connected to %s", serverAddr)
 
 	ch := conn.Channel(appChannel)
 
@@ -117,9 +120,6 @@ func runClient(cmd *cobra.Command, args []string) error {
 		case <-ctx.Done():
 			<-recvDone
 			return nil
-		case <-conn.Done():
-			<-recvDone
-			return fmt.Errorf("connection closed by server")
 		case <-recvDone:
 			return fmt.Errorf("receive loop ended unexpectedly")
 		case <-ticker.C:
