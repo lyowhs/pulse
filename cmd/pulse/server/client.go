@@ -17,23 +17,23 @@ import (
 	"example.com/pulse/pulse/pkg/wiresocket/proto"
 )
 
-func pingCommand() *cobra.Command {
+func clientCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "ping <server-addr>",
+		Use:   "client <server-addr>",
 		Short: "Connect to a wiresocket server and send periodic test events",
 		Args:  cobra.ExactArgs(1),
-		RunE:  runPing,
+		RunE:  runClient,
 	}
 
 	cmd.Flags().String("pubkey", "", "hex-encoded server public key (required)")
 	cmd.MarkFlagRequired("pubkey")
-	cmd.Flags().Duration("interval", 3*time.Second, "how often to send a ping event")
+	cmd.Flags().Duration("interval", 3*time.Second, "how often to send a test event")
 	cmd.Flags().String("key", "", "hex-encoded client private key (generated if omitted)")
 
 	return cmd
 }
 
-func runPing(cmd *cobra.Command, args []string) error {
+func runClient(cmd *cobra.Command, args []string) error {
 	serverAddr := args[0]
 
 	pubkeyHex, _ := cmd.Flags().GetString("pubkey")
@@ -89,7 +89,7 @@ func runPing(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Send loop: fire a ping every interval.
+	// Send loop: fire a test event every interval.
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -108,8 +108,8 @@ func runPing(cmd *cobra.Command, args []string) error {
 			e := &proto.Event{
 				Sequence:    s,
 				TimestampUs: t.UnixMicro(),
-				Type:        "ping",
-				Payload:     []byte(fmt.Sprintf("ping #%d from pulse", s)),
+				Type:        "test",
+				Payload:     []byte(fmt.Sprintf("event #%d from pulse client", s)),
 			}
 			if err := conn.Send(ctx, e); err != nil {
 				return fmt.Errorf("send: %w", err)

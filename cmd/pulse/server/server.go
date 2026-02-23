@@ -25,6 +25,6 @@ func Command() *cobra.Command {
 	}
 	cmd.PersistentFlags().Bool("debug", false, "Enable verbose wiresocket protocol debug logging")
 	cmd.AddCommand(serveCommand())
-	cmd.AddCommand(pingCommand())
+	cmd.AddCommand(clientCommand())
 	return cmd
 }
