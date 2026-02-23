@@ -242,8 +242,12 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 		if n == 0 || src.String() != raddr.String() {
 			continue
 		}
-		if buf[0] == typeData {
+		switch buf[0] {
+		case typeData:
 			sess.receive(buf[:n])
+		case typeDisconnect:
+			dbg("client: recv disconnect from server", "local_index", sess.localIndex)
+			return
 		}
 	}
 }

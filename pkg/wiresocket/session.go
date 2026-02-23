@@ -141,6 +141,37 @@ func (s *session) sendKeepalive() error {
 	return s.send(&proto.Frame{})
 }
 
+// sendDisconnect sends an authenticated disconnect notification to the remote
+// peer.  The packet has the same AEAD-over-empty-payload layout as a keepalive
+// but uses typeDisconnect (5) so the peer can immediately evict the session.
+func (s *session) sendDisconnect() error {
+	counter := atomic.AddUint64(&s.sendCounter, 1) - 1
+
+	// Build a data-style header with typeDisconnect instead of typeData.
+	hdr := make([]byte, sizeDataHeader)
+	hdr[0] = typeDisconnect
+	hdr[4] = byte(s.remoteIndex)
+	hdr[5] = byte(s.remoteIndex >> 8)
+	hdr[6] = byte(s.remoteIndex >> 16)
+	hdr[7] = byte(s.remoteIndex >> 24)
+	hdr[8] = byte(counter)
+	hdr[9] = byte(counter >> 8)
+	hdr[10] = byte(counter >> 16)
+	hdr[11] = byte(counter >> 24)
+	hdr[12] = byte(counter >> 32)
+	hdr[13] = byte(counter >> 40)
+	hdr[14] = byte(counter >> 48)
+	hdr[15] = byte(counter >> 56)
+
+	ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, nil)
+	dbg("send disconnect",
+		"local_index", s.localIndex,
+		"remote_addr", s.remoteAddr.String(),
+	)
+	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
+	return err
+}
+
 // receive decrypts an incoming data packet and delivers its events.
 // b is the full UDP payload including the 16-byte DataHeader.
 // Returns false if the packet should be silently dropped (replay, bad tag, etc.).

@@ -188,6 +188,8 @@ func (s *Server) handlePacket(ctx context.Context, pkt incomingPacket) {
 		s.handleHandshakeInit(ctx, pkt)
 	case typeData:
 		s.handleData(pkt)
+	case typeDisconnect:
+		s.handleDisconnect(pkt)
 	case typeCookieReply:
 		// Servers don't receive cookie replies.
 	}
@@ -299,6 +301,40 @@ func (s *Server) handleData(pkt incomingPacket) {
 		return
 	}
 	sess.receive(pkt.data)
+}
+
+func (s *Server) handleDisconnect(pkt incomingPacket) {
+	if len(pkt.data) < sizeDisconnect {
+		return
+	}
+	idx := parseReceiverIndex(pkt.data)
+	val, ok := s.sessions.Load(idx)
+	if !ok {
+		return
+	}
+	sess := val.(*session)
+
+	// Authenticate: decrypt the AEAD tag using the session's recv key.
+	counter := uint64(pkt.data[8]) |
+		uint64(pkt.data[9])<<8 |
+		uint64(pkt.data[10])<<16 |
+		uint64(pkt.data[11])<<24 |
+		uint64(pkt.data[12])<<32 |
+		uint64(pkt.data[13])<<40 |
+		uint64(pkt.data[14])<<48 |
+		uint64(pkt.data[15])<<56
+	if _, err := decryptAEAD(sess.recvKey, counter, nil, pkt.data[sizeDataHeader:]); err != nil {
+		dbg("server: disconnect auth failed", "receiver_index", idx, "err", err)
+		return
+	}
+
+	dbg("server: recv disconnect",
+		"local_index", idx,
+		"remote_addr", pkt.addr.String(),
+	)
+	sess.close()
+	s.sessions.Delete(idx)
+	s.totalSessions.Add(-1)
 }
 
 // gc periodically removes expired sessions and sends keepalives.

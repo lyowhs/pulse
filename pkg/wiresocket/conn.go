@@ -87,9 +87,12 @@ func (c *Conn) Done() <-chan struct{} {
 	return c.sess.done
 }
 
-// Close closes the connection.  Subsequent Send and Recv calls will return
-// ErrConnClosed.  Close is idempotent.
+// Close closes the connection.  A disconnect notification is sent to the remote
+// peer so it can evict the session immediately.  Subsequent Send and Recv calls
+// will return ErrConnClosed.  Close is idempotent.
 func (c *Conn) Close() error {
+	// Best-effort: ignore send errors (peer may already be gone).
+	_ = c.sess.sendDisconnect()
 	c.sess.close()
 	return nil
 }
