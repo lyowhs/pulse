@@ -61,6 +61,15 @@ type ServerConfig struct {
 	// fragmented frames buffered per session.  Excess fragments are dropped.
 	// Defaults to 64.
 	MaxIncompleteFrames int
+
+	// MaxPacketSize is the maximum UDP payload size in bytes used when
+	// fragmenting outgoing frames.  Larger values reduce the number of
+	// fragments (and therefore syscalls) per large frame, improving
+	// throughput on links that support bigger datagrams.
+	// Defaults to 1232 (safe for IPv6 minimum path MTU).
+	// Set up to 65000 for loopback or LAN benchmarks (IPv4 hard limit is
+	// 65507; leave headroom for safety).
+	MaxPacketSize int
 }
 
 func (cfg *ServerConfig) defaults() {
@@ -81,6 +90,9 @@ func (cfg *ServerConfig) defaults() {
 	}
 	if cfg.WorkerCount == 0 {
 		cfg.WorkerCount = runtime.GOMAXPROCS(0)
+	}
+	if cfg.MaxPacketSize == 0 {
+		cfg.MaxPacketSize = defaultMaxPacketSize
 	}
 }
 
@@ -103,13 +115,23 @@ type Server struct {
 
 	work chan incomingPacket
 
+	// maxFragPayload is the per-session fragment size computed from MaxPacketSize.
+	maxFragPayload int
+
 	// totalSessions counts active sessions for monitoring.
 	totalSessions atomic.Int64
 }
 
 type incomingPacket struct {
-	data []byte
-	addr *net.UDPAddr
+	data   []byte
+	addr   *net.UDPAddr
+	rawBuf []byte // pool-borrowed buffer; returned after handlePacket returns
+}
+
+// pktBufPool recycles 65535-byte buffers used by the server read loop,
+// eliminating one allocation per incoming packet.
+var pktBufPool = sync.Pool{
+	New: func() any { return make([]byte, 65535) },
 }
 
 // NewServer creates a Server from cfg.  Call Serve to start it.
@@ -122,11 +144,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	kp := Keypair{Private: cfg.PrivateKey, Public: pub}
 
+	maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
 	s := &Server{
-		cfg:     cfg,
-		keypair: kp,
-		cookies: newCookieManager(kp.Public),
-		work:    make(chan incomingPacket, cfg.WorkerCount*64),
+		cfg:            cfg,
+		keypair:        kp,
+		cookies:        newCookieManager(kp.Public),
+		work:           make(chan incomingPacket, cfg.WorkerCount*64),
+		maxFragPayload: maxFrag,
 	}
 	return s, nil
 }
@@ -148,6 +172,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Larger kernel socket buffers reduce packet loss under bursts.
+	const socketBufSize = 4 << 20 // 4 MiB
+	conn.SetReadBuffer(socketBufSize)
+	conn.SetWriteBuffer(socketBufSize)
 	s.conn = conn
 
 	// Worker goroutines for packet processing.
@@ -165,10 +193,11 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	// UDP read loop (single goroutine, lock-free dispatch).
 	go func() {
-		buf := make([]byte, 65535)
 		for {
-			n, addr, err := conn.ReadFromUDP(buf)
+			rawBuf := pktBufPool.Get().([]byte)
+			n, addr, err := conn.ReadFromUDP(rawBuf)
 			if err != nil {
+				pktBufPool.Put(rawBuf)
 				select {
 				case <-ctx.Done():
 				default:
@@ -177,13 +206,15 @@ func (s *Server) Serve(ctx context.Context) error {
 				return
 			}
 			pkt := incomingPacket{
-				data: append([]byte(nil), buf[:n]...),
-				addr: addr,
+				data:   rawBuf[:n],
+				addr:   addr,
+				rawBuf: rawBuf,
 			}
 			select {
 			case s.work <- pkt:
 			default:
 				// Worker queue full — drop packet (caller will retransmit).
+				pktBufPool.Put(rawBuf)
 				dbg("server: worker queue full, dropping packet", "remote_addr", addr.String())
 			}
 		}
@@ -205,6 +236,9 @@ func (s *Server) worker(ctx context.Context) {
 				return
 			}
 			s.handlePacket(ctx, pkt)
+			if pkt.rawBuf != nil {
+				pktBufPool.Put(pkt.rawBuf)
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -290,7 +324,7 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	}
 
 	sendKey, recvKey := hs.TransportKeys(false) // false = responder
-	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize, s.cfg.SessionTimeout, s.cfg.KeepaliveInterval, s.cfg.MaxIncompleteFrames)
+	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize, s.cfg.SessionTimeout, s.cfg.KeepaliveInterval, s.cfg.MaxIncompleteFrames, s.maxFragPayload)
 
 	s.sessions.Store(localIdx, sess)
 	s.totalSessions.Add(1)

@@ -27,11 +27,15 @@ const (
 	sizeDisconnect     = sizeDataHeader + sizeAEADTag // type=5, same layout as keepalive
 	sizeFragmentHeader = 6                            // frame_id(4) + frag_index(1) + frag_count(1)
 
-	// maxFragmentPayload is the maximum plaintext data bytes per fragment.
+	// defaultMaxFragPayload is the maximum plaintext data bytes per fragment
+	// when MaxPacketSize is not configured.
 	// Sized to keep the UDP datagram under 1232 bytes (IPv6 minimum path MTU
 	// of 1280 minus 40-byte IPv6 header minus 8-byte UDP header):
 	//   1232 - sizeDataHeader(16) - sizeFragmentHeader(6) - sizeAEADTag(16) = 1194
-	maxFragmentPayload = 1194
+	defaultMaxFragPayload = 1194
+
+	// defaultMaxPacketSize is the UDP datagram size implied by defaultMaxFragPayload.
+	defaultMaxPacketSize = 1232
 )
 
 // ─── HandshakeInit ───────────────────────────────────────────────────────────
