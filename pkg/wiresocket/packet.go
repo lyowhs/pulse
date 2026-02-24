@@ -25,14 +25,14 @@ const (
 	sizeAEADTag        = 16
 	sizeKeepalive      = sizeDataHeader + sizeAEADTag // type=6, AEAD over empty payload
 	sizeDisconnect     = sizeDataHeader + sizeAEADTag // type=5, same layout as keepalive
-	sizeFragmentHeader = 6                            // frame_id(4) + frag_index(1) + frag_count(1)
+	sizeFragmentHeader = 8                            // frame_id(4) + frag_index(2) + frag_count(2)
 
 	// defaultMaxFragPayload is the maximum plaintext data bytes per fragment
 	// when MaxPacketSize is not configured.
 	// Sized to keep the UDP datagram under 1232 bytes (IPv6 minimum path MTU
 	// of 1280 minus 40-byte IPv6 header minus 8-byte UDP header):
-	//   1232 - sizeDataHeader(16) - sizeFragmentHeader(6) - sizeAEADTag(16) = 1194
-	defaultMaxFragPayload = 1194
+	//   1232 - sizeDataHeader(16) - sizeFragmentHeader(8) - sizeAEADTag(16) = 1192
+	defaultMaxFragPayload = 1192
 
 	// defaultMaxPacketSize is the UDP datagram size implied by defaultMaxFragPayload.
 	defaultMaxPacketSize = 1232

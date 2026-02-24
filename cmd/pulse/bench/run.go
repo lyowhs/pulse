@@ -76,17 +76,17 @@ func runBench(cmd *cobra.Command, _ []string) error {
 }
 
 // maxPayloadForMTU returns the maximum single-frame payload in bytes for the
-// given UDP MTU.  A frame that exceeds this requires more than 255 fragments
+// given UDP MTU.  A frame that exceeds this requires more than 65535 fragments
 // and cannot be sent.
 func maxPayloadForMTU(mtu int) int {
 	const sizeDataHeader = 16
-	const sizeFragmentHeader = 6
+	const sizeFragmentHeader = 8
 	const sizeAEADTag = 16
 	maxFrag := mtu - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
 	if maxFrag <= 0 {
 		return 0
 	}
-	return 255 * maxFrag
+	return 65535 * maxFrag
 }
 
 // runOne starts an in-process echo server + client, drives traffic for dur,

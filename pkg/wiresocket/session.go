@@ -22,8 +22,8 @@ const maxReassemblyBufs = 64
 type reassemblyBuf struct {
 	frags    [][]byte  // indexed by frag_index; nil slot = not yet received; slice views into pool bufs
 	bufs     []*[]byte // pool buffer pointer per fragment; kept alive until reassembly or GC
-	received uint8     // number of fragments received so far
-	total    uint8     // total expected (from frag_count)
+	received uint16    // number of fragments received so far
+	total    uint16    // total expected (from frag_count)
 	lastSeen time.Time // updated on each received fragment; used for GC
 }
 
@@ -288,8 +288,8 @@ func (s *session) send(frame *Frame) error {
 // (sendmmsg on Linux; a sendmsg loop on other platforms).
 func (s *session) sendFragments(plain []byte) error {
 	fragCount := (len(plain) + s.maxFragPayload - 1) / s.maxFragPayload
-	if fragCount > 255 {
-		return errors.New("wiresocket: frame too large to fragment (exceeds 255 fragments)")
+	if fragCount > 65535 {
+		return errors.New("wiresocket: frame too large to fragment (exceeds 65535 fragments)")
 	}
 
 	frameID := s.fragCounter.Add(1)
@@ -337,10 +337,10 @@ func (s *session) sendFragments(plain []byte) error {
 		binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
 		binary.LittleEndian.PutUint64(buf[8:], counter)
 
-		// Fragment header: [frame_id(4)][frag_index(1)][frag_count(1)].
+		// Fragment header: [frame_id(4)][frag_index(2)][frag_count(2)].
 		binary.LittleEndian.PutUint32(buf[sizeDataHeader:], frameID)
-		buf[sizeDataHeader+4] = byte(i)
-		buf[sizeDataHeader+5] = byte(fragCount)
+		binary.LittleEndian.PutUint16(buf[sizeDataHeader+4:], uint16(i))
+		binary.LittleEndian.PutUint16(buf[sizeDataHeader+6:], uint16(fragCount))
 
 		// Copy fragment data (one copy from the caller's plain slice).
 		copy(buf[sizeDataHeader+sizeFragmentHeader:], fragData)
@@ -600,8 +600,8 @@ func (s *session) receiveFragment(b []byte) bool {
 	}
 
 	frameID := binary.LittleEndian.Uint32(plain[0:])
-	fragIndex := plain[4]
-	fragCount := plain[5]
+	fragIndex := binary.LittleEndian.Uint16(plain[4:])
+	fragCount := binary.LittleEndian.Uint16(plain[6:])
 	data := plain[sizeFragmentHeader:] // zero-copy view into pool buffer
 
 	if fragCount == 0 || int(fragIndex) >= int(fragCount) {
