@@ -276,7 +276,14 @@ func (s *session) send(frame *Frame) error {
 		"packet_bytes", len(packet),
 	)
 	_, err := s.udpConn.WriteToUDP(packet, s.remoteAddr)
-	if err == nil {
+	if err != nil {
+		dbg("send packet failed",
+			"local_index", s.localIndex,
+			"remote_index", s.remoteIndex,
+			"counter", counter,
+			"err", err,
+		)
+	} else {
 		s.lastSend.Store(time.Now().UnixNano())
 	}
 	sendBufPool.Put(bp)
@@ -400,6 +407,13 @@ func (s *session) sendFragments(plain []byte) error {
 		sendBufPool.Put(bp)
 	}
 	if sendErr != nil {
+		dbg("send fragments failed",
+			"local_index", s.localIndex,
+			"remote_index", s.remoteIndex,
+			"frame_id", frameID,
+			"frag_count", fragCount,
+			"err", sendErr,
+		)
 		return sendErr
 	}
 	s.lastSend.Store(time.Now().UnixNano())
@@ -427,7 +441,13 @@ func (s *session) sendKeepalive() error {
 		"remote_addr", s.remoteAddr.String(),
 	)
 	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
-	if err == nil {
+	if err != nil {
+		dbg("send keepalive failed",
+			"local_index", s.localIndex,
+			"remote_addr", s.remoteAddr.String(),
+			"err", err,
+		)
+	} else {
 		s.lastSend.Store(time.Now().UnixNano())
 	}
 	return err
@@ -486,6 +506,13 @@ func (s *session) sendDisconnect() error {
 		"remote_addr", s.remoteAddr.String(),
 	)
 	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
+	if err != nil {
+		dbg("send disconnect failed",
+			"local_index", s.localIndex,
+			"remote_addr", s.remoteAddr.String(),
+			"err", err,
+		)
+	}
 	return err
 }
 
@@ -522,6 +549,7 @@ func (s *session) receive(b []byte) bool {
 	s.lastDataRecv.Store(now)
 
 	if len(plain) == 0 {
+		dbg("recv: empty data frame", "local_index", s.localIndex, "counter", hdr.Counter)
 		recvBufPool.Put(bp)
 		return true // empty data frame — nothing to deliver
 	}

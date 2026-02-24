@@ -180,9 +180,17 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 	// Larger kernel socket buffers reduce packet loss under bursts.
+	// On Linux these calls may be silently clamped to net.core.rmem_max /
+	// wmem_max (default ~208 KB); use SO_RCVBUFFORCE or raise the sysctl to
+	// ensure the full 4 MiB is allocated.
 	const socketBufSize = 4 << 20 // 4 MiB
-	conn.SetReadBuffer(socketBufSize)
-	conn.SetWriteBuffer(socketBufSize)
+	if err := conn.SetReadBuffer(socketBufSize); err != nil {
+		dbg("server: SetReadBuffer failed", "requested", socketBufSize, "err", err)
+	}
+	if err := conn.SetWriteBuffer(socketBufSize); err != nil {
+		dbg("server: SetWriteBuffer failed", "requested", socketBufSize, "err", err)
+	}
+	dbg("server: socket buffers configured", "size_bytes", socketBufSize)
 	s.conn = conn
 	s.pc = ipv4.NewPacketConn(conn)
 
@@ -340,6 +348,10 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 		if _, exists := s.sessions.Load(localIdx); !exists {
 			break
 		}
+		dbg("server: session index collision, retrying",
+			"collision_index", localIdx,
+			"attempt", i+1,
+		)
 		localIdx, err = randUint32()
 		if err != nil {
 			return

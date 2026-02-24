@@ -168,9 +168,17 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 		return nil, nil, nil, fmt.Errorf("wiresocket: listen UDP: %w", err)
 	}
 	// Larger kernel socket buffers reduce packet loss under bursts.
+	// On Linux these calls may be silently clamped to net.core.rmem_max /
+	// wmem_max (default ~208 KB); use SO_RCVBUFFORCE or raise the sysctl to
+	// ensure the full 4 MiB is allocated.
 	const socketBufSize = 4 << 20 // 4 MiB
-	conn.SetReadBuffer(socketBufSize)
-	conn.SetWriteBuffer(socketBufSize)
+	if err := conn.SetReadBuffer(socketBufSize); err != nil {
+		dbg("client: SetReadBuffer failed", "requested", socketBufSize, "err", err)
+	}
+	if err := conn.SetWriteBuffer(socketBufSize); err != nil {
+		dbg("client: SetWriteBuffer failed", "requested", socketBufSize, "err", err)
+	}
+	dbg("client: socket buffers configured", "size_bytes", socketBufSize)
 
 	kp, err := resolveClientKeypair(cfg.PrivateKey)
 	if err != nil {
@@ -281,13 +289,19 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 			dbg("client: recv CookieReply, will retry with MAC2")
 			cr, err := parseCookieReply(buf[:n])
 			if err != nil {
+				dbg("client: parse CookieReply failed", "err", err)
 				continue
 			}
 			if cr.ReceiverIndex != localIdx {
+				dbg("client: CookieReply receiver_index mismatch",
+					"got", cr.ReceiverIndex,
+					"want", localIdx,
+				)
 				continue
 			}
 			cookie, err = ConsumeCookieReply(cr, initMsg.MAC1)
 			if err != nil {
+				dbg("client: ConsumeCookieReply failed", "err", err)
 				continue
 			}
 			hasCookie = true
@@ -295,6 +309,11 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 		}
 	}
 
+	dbg("client: handshake timed out after all retries",
+		"local_index", localIdx,
+		"remote_addr", raddr.String(),
+		"max_retries", cfg.MaxRetries,
+	)
 	conn.Close()
 	return nil, nil, nil, errors.New("wiresocket: handshake timed out after retries")
 }

@@ -34,6 +34,7 @@ func (rw *replayWindow) check(counter uint64) bool {
 	}
 	diff := head - counter
 	if diff >= windowSize {
+		dbg("replay: counter too old", "counter", counter, "head", head, "age", diff)
 		return false // fast path — definitely too old, no lock needed
 	}
 
@@ -48,10 +49,14 @@ func (rw *replayWindow) check(counter uint64) bool {
 	}
 	diff = head - counter
 	if diff >= windowSize {
+		dbg("replay: counter too old", "counter", counter, "head", head, "age", diff)
 		rw.mu.Unlock()
 		return false
 	}
 	result := rw.bits&(1<<diff) == 0
+	if !result {
+		dbg("replay: duplicate counter", "counter", counter, "head", head)
+	}
 	rw.mu.Unlock()
 	return result
 }
