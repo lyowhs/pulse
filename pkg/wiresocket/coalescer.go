@@ -139,18 +139,23 @@ func (c *coalescer) run() {
 			fullCh, full := addItem(item)
 			// Drain any immediately-available items without blocking so that
 			// concurrent senders are coalesced into the same flush cycle.
-		drain:
-			for {
-				select {
-				case item := <-c.input:
-					if ch, f := addItem(item); f {
-						// Multiple channels may fill; track the last one —
-						// flushAll below handles all of them.
-						fullCh = ch
-						full = true
+			// Stop as soon as a channel hits maxFrameBytes so that pending
+			// is bounded to at most one packet's worth of data — preventing
+			// the drain loop from accumulating thousands of events into a
+			// single oversized frame that overflows receiver channel buffers.
+			if !full {
+			drain:
+				for {
+					select {
+					case item := <-c.input:
+						if ch, f := addItem(item); f {
+							fullCh = ch
+							full = true
+							break drain
+						}
+					default:
+						break drain
 					}
-				default:
-					break drain
 				}
 			}
 			if full {

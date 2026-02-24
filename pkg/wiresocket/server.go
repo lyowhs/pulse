@@ -179,18 +179,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Larger kernel socket buffers reduce packet loss under bursts.
-	// On Linux these calls may be silently clamped to net.core.rmem_max /
-	// wmem_max (default ~208 KB); use SO_RCVBUFFORCE or raise the sysctl to
-	// ensure the full 4 MiB is allocated.
 	const socketBufSize = 4 << 20 // 4 MiB
-	if err := conn.SetReadBuffer(socketBufSize); err != nil {
-		dbg("server: SetReadBuffer failed", "requested", socketBufSize, "err", err)
-	}
-	if err := conn.SetWriteBuffer(socketBufSize); err != nil {
-		dbg("server: SetWriteBuffer failed", "requested", socketBufSize, "err", err)
-	}
-	dbg("server: socket buffers configured", "size_bytes", socketBufSize)
+	setSocketBuffers(conn, socketBufSize)
 	s.conn = conn
 	s.pc = ipv4.NewPacketConn(conn)
 
@@ -210,7 +200,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	// UDP read loop — reads up to readBatchSz datagrams per syscall using
 	// ipv4.PacketConn.ReadBatch (recvmmsg on Linux; recvmsg loop on Darwin).
 	const readBatchSz = 64
+	readDone := make(chan struct{})
 	go func() {
+		defer close(readDone)
 		msgs := make([]ipv4.Message, readBatchSz)
 		for i := range msgs {
 			msgs[i].Buffers = [][]byte{pktBufPool.Get().([]byte)}
@@ -257,8 +249,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	}()
 
 	<-ctx.Done()
-	conn.Close()
-	close(s.work)
+	conn.Close()  // unblocks ReadBatch so the read loop exits
+	<-readDone    // wait for the read loop to finish its current batch
+	close(s.work) // now safe: no goroutine is sending to s.work
 	wg.Wait()
 	return nil
 }

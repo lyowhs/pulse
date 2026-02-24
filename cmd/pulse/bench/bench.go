@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -32,6 +33,41 @@ func Command() *cobra.Command {
 	cmd.AddCommand(clientCommand())
 	cmd.AddCommand(runCommand())
 	return cmd
+}
+
+// echoConn echoes every event received on benchChannel back to the sender.
+//
+// Receive and send run in separate goroutines (pipelined) so that incoming
+// events can be buffered while a send is in progress.  This prevents a
+// blocking Send (e.g. without coalescing) from stalling the Recv side and
+// leaving the incoming event buffer idle.
+//
+// The pipe is sized to match the channel's event buffer so that the recv
+// goroutine can always drain a full burst without blocking.
+func echoConn(conn *wiresocket.Conn) {
+	ch := conn.Channel(benchChannel)
+	ctx := context.Background()
+
+	pipe := make(chan *wiresocket.Event, cap(ch.Events()))
+
+	// Recv goroutine: pull events off the channel into the pipe.
+	go func() {
+		defer close(pipe)
+		for {
+			e, err := ch.Recv(ctx)
+			if err != nil {
+				return
+			}
+			pipe <- e
+		}
+	}()
+
+	// Send loop: echo every queued event.
+	for e := range pipe {
+		if err := ch.Send(ctx, e); err != nil {
+			return
+		}
+	}
 }
 
 // fmtSize formats a byte count using SI units (1 MB = 10^6 B).

@@ -167,18 +167,8 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("wiresocket: listen UDP: %w", err)
 	}
-	// Larger kernel socket buffers reduce packet loss under bursts.
-	// On Linux these calls may be silently clamped to net.core.rmem_max /
-	// wmem_max (default ~208 KB); use SO_RCVBUFFORCE or raise the sysctl to
-	// ensure the full 4 MiB is allocated.
 	const socketBufSize = 4 << 20 // 4 MiB
-	if err := conn.SetReadBuffer(socketBufSize); err != nil {
-		dbg("client: SetReadBuffer failed", "requested", socketBufSize, "err", err)
-	}
-	if err := conn.SetWriteBuffer(socketBufSize); err != nil {
-		dbg("client: SetWriteBuffer failed", "requested", socketBufSize, "err", err)
-	}
-	dbg("client: socket buffers configured", "size_bytes", socketBufSize)
+	setSocketBuffers(conn, socketBufSize)
 
 	kp, err := resolveClientKeypair(cfg.PrivateKey)
 	if err != nil {

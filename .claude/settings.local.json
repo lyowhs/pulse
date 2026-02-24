@@ -31,7 +31,8 @@
       "Bash(go install:*)",
       "Bash(PATH=\"$PATH:$HOME/go/bin\" protoc:*)",
       "Bash(grep:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(head:*)"
     ]
   }
 }

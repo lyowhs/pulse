@@ -114,20 +114,9 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
-		Addr:       addr,
-		PrivateKey: kp.Private,
-		OnConnect: func(conn *wiresocket.Conn) {
-			ch := conn.Channel(benchChannel)
-			for {
-				e, err := ch.Recv(context.Background())
-				if err != nil {
-					return
-				}
-				if err := ch.Send(context.Background(), e); err != nil {
-					return
-				}
-			}
-		},
+		Addr:             addr,
+		PrivateKey:       kp.Private,
+		OnConnect:        echoConn,
 		MaxPacketSize:    mtu,
 		CoalesceInterval: coalesce,
 	})

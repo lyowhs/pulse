@@ -64,17 +64,3 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	return srv.Serve(ctx)
 }
 
-// echoConn echoes every event it receives back on the same channel.
-func echoConn(conn *wiresocket.Conn) {
-	ch := conn.Channel(benchChannel)
-	ctx := context.Background()
-	for {
-		e, err := ch.Recv(ctx)
-		if err != nil {
-			return
-		}
-		if err := ch.Send(ctx, e); err != nil {
-			return
-		}
-	}
-}
