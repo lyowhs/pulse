@@ -69,6 +69,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 		ReconnectMin:      250 * time.Millisecond,
 		KeepaliveInterval: 2 * time.Second,
 		SessionTimeout:    10 * time.Second,
+		MaxPacketSize:     65000,
 	})
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)

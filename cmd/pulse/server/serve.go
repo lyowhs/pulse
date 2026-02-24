@@ -56,6 +56,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		PrivateKey:        privKey,
 		OnConnect:         makeHandler(logger),
 		KeepaliveInterval: 3 * time.Second,
+		MaxPacketSize:     65000,
 	})
 	if err != nil {
 		return err

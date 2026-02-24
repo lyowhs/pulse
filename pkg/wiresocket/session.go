@@ -1,6 +1,7 @@
 package wiresocket
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // maxReassemblyBufs is the maximum number of incomplete fragmented frames
@@ -42,9 +44,18 @@ const (
 
 // session holds all state for one established peer connection.
 type session struct {
-	// Transport keys.
+	// Transport keys (kept for reference; AEADs are derived from them).
 	sendKey [32]byte
 	recvKey [32]byte
+
+	// Cached AEAD instances derived from transport keys — created once in
+	// newSession and reused for every encrypt/decrypt to avoid per-packet
+	// cipher setup overhead.
+	sendAEAD cipher.AEAD
+	recvAEAD cipher.AEAD
+
+	// Maximum plaintext bytes per outgoing fragment (derived from MaxPacketSize).
+	maxFragPayload int
 
 	// Monotonic send counter — atomically incremented.
 	sendCounter uint64
@@ -81,10 +92,10 @@ type session struct {
 	// Maximum number of partially-reassembled fragmented frames buffered.
 	maxFragBufs int
 
-	// Activity tracking.
-	lastRecv     atomic.Value // stores time.Time — updated on every received packet (any type)
-	lastDataRecv atomic.Value // stores time.Time — updated only on received data packets
-	lastSend     atomic.Value // stores time.Time — updated on every sent packet
+	// Activity tracking (unix nanoseconds; cheaper than atomic.Value+time.Time).
+	lastRecv     atomic.Int64 // updated on every received packet (any type)
+	lastDataRecv atomic.Int64 // updated only on received data packets
+	lastSend     atomic.Int64 // updated on every sent packet
 	created      time.Time
 
 	// Fragment reassembly (receive side) and outgoing frame ID counter (send side).
@@ -102,22 +113,34 @@ func newSession(
 	timeout time.Duration,
 	keepalive time.Duration,
 	maxFragBufs int,
+	maxFragPayload int,
 ) *session {
-	s := &session{
-		sendKey:     sendKey,
-		recvKey:     recvKey,
-		remoteIndex: remoteIndex,
-		localIndex:  localIndex,
-		remoteAddr:  addr,
-		udpConn:     conn,
-		events:      make(chan sessionEvent, eventBuf),
-		done:        make(chan struct{}),
-		created:     time.Now(),
-		timeout:     timeout,
-		keepalive:   keepalive,
-		maxFragBufs: maxFragBufs,
+	sendAEAD, err := chacha20poly1305.New(sendKey[:])
+	if err != nil {
+		panic("wiresocket: newSession sendAEAD: " + err.Error())
 	}
-	now := time.Now()
+	recvAEAD, err := chacha20poly1305.New(recvKey[:])
+	if err != nil {
+		panic("wiresocket: newSession recvAEAD: " + err.Error())
+	}
+	s := &session{
+		sendKey:        sendKey,
+		recvKey:        recvKey,
+		sendAEAD:       sendAEAD,
+		recvAEAD:       recvAEAD,
+		maxFragPayload: maxFragPayload,
+		remoteIndex:    remoteIndex,
+		localIndex:     localIndex,
+		remoteAddr:     addr,
+		udpConn:        conn,
+		events:         make(chan sessionEvent, eventBuf),
+		done:           make(chan struct{}),
+		created:        time.Now(),
+		timeout:        timeout,
+		keepalive:      keepalive,
+		maxFragBufs:    maxFragBufs,
+	}
+	now := time.Now().UnixNano()
 	s.lastRecv.Store(now)
 	s.lastDataRecv.Store(now)
 	s.lastSend.Store(now)
@@ -177,7 +200,7 @@ func (s *session) isDone() bool {
 // packets.  It is safe to call from multiple goroutines simultaneously.
 func (s *session) send(frame *Frame) error {
 	plain := frame.Marshal()
-	if len(plain) > maxFragmentPayload {
+	if len(plain) > s.maxFragPayload {
 		return s.sendFragments(plain)
 	}
 
@@ -187,7 +210,7 @@ func (s *session) send(frame *Frame) error {
 	}
 
 	hdr := marshalDataHeader(s.remoteIndex, counter)
-	ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, plain)
+	ciphertext := s.sendAEAD.Seal(hdr, makeNonce(counter), plain, nil)
 
 	dbg("send packet",
 		"local_index", s.localIndex,
@@ -198,15 +221,15 @@ func (s *session) send(frame *Frame) error {
 	)
 	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
 	if err == nil {
-		s.lastSend.Store(time.Now())
+		s.lastSend.Store(time.Now().UnixNano())
 	}
 	return err
 }
 
-// sendFragments splits plain into maxFragmentPayload-sized chunks and sends
+// sendFragments splits plain into s.maxFragPayload-sized chunks and sends
 // each as an authenticated typeDataFragment packet.
 func (s *session) sendFragments(plain []byte) error {
-	fragCount := (len(plain) + maxFragmentPayload - 1) / maxFragmentPayload
+	fragCount := (len(plain) + s.maxFragPayload - 1) / s.maxFragPayload
 	if fragCount > 255 {
 		return errors.New("wiresocket: frame too large to fragment (exceeds 255 fragments)")
 	}
@@ -221,8 +244,8 @@ func (s *session) sendFragments(plain []byte) error {
 	)
 
 	for i := 0; i < fragCount; i++ {
-		start := i * maxFragmentPayload
-		end := start + maxFragmentPayload
+		start := i * s.maxFragPayload
+		end := start + s.maxFragPayload
 		if end > len(plain) {
 			end = len(plain)
 		}
@@ -247,12 +270,12 @@ func (s *session) sendFragments(plain []byte) error {
 		hdr[7] = byte(s.remoteIndex >> 24)
 		binary.LittleEndian.PutUint64(hdr[8:], counter)
 
-		ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, fragPayload)
+		ciphertext := s.sendAEAD.Seal(hdr, makeNonce(counter), fragPayload, nil)
 		if _, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr); err != nil {
 			return err
 		}
 	}
-	s.lastSend.Store(time.Now())
+	s.lastSend.Store(time.Now().UnixNano())
 	return nil
 }
 
@@ -271,14 +294,14 @@ func (s *session) sendKeepalive() error {
 	hdr[7] = byte(s.remoteIndex >> 24)
 	binary.LittleEndian.PutUint64(hdr[8:], counter)
 
-	ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, nil)
+	ciphertext := s.sendAEAD.Seal(hdr, makeNonce(counter), nil, nil)
 	dbg("send keepalive",
 		"local_index", s.localIndex,
 		"remote_addr", s.remoteAddr.String(),
 	)
 	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
 	if err == nil {
-		s.lastSend.Store(time.Now())
+		s.lastSend.Store(time.Now().UnixNano())
 	}
 	return err
 }
@@ -295,12 +318,12 @@ func (s *session) receiveKeepalive(b []byte) bool {
 		dbg("recv: keepalive replay rejected", "local_index", s.localIndex, "counter", counter)
 		return false
 	}
-	if _, err := decryptAEAD(s.recvKey, counter, nil, b[sizeDataHeader:]); err != nil {
+	if _, err := s.recvAEAD.Open(nil, makeNonce(counter), b[sizeDataHeader:], nil); err != nil {
 		dbg("recv: keepalive decrypt failed", "local_index", s.localIndex, "counter", counter, "err", err)
 		return false
 	}
 	s.replay.update(counter)
-	s.lastRecv.Store(time.Now())
+	s.lastRecv.Store(time.Now().UnixNano())
 	dbg("recv keepalive", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
 	return true
 }
@@ -330,7 +353,7 @@ func (s *session) sendDisconnect() error {
 	hdr[14] = byte(counter >> 48)
 	hdr[15] = byte(counter >> 56)
 
-	ciphertext := encryptAEAD(hdr, s.sendKey, counter, nil, nil)
+	ciphertext := s.sendAEAD.Seal(hdr, makeNonce(counter), nil, nil)
 	dbg("send disconnect",
 		"local_index", s.localIndex,
 		"remote_addr", s.remoteAddr.String(),
@@ -355,13 +378,13 @@ func (s *session) receive(b []byte) bool {
 
 	// Header is used as AAD-free AEAD (we authenticate only the payload);
 	// the counter itself is part of the nonce so no AAD is needed.
-	plain, err := decryptAEAD(s.recvKey, hdr.Counter, nil, b[sizeDataHeader:])
+	plain, err := s.recvAEAD.Open(nil, makeNonce(hdr.Counter), b[sizeDataHeader:], nil)
 	if err != nil {
 		dbg("recv: decrypt failed", "local_index", s.localIndex, "counter", hdr.Counter, "err", err)
 		return false
 	}
 	s.replay.update(hdr.Counter)
-	now := time.Now()
+	now := time.Now().UnixNano()
 	s.lastRecv.Store(now)
 	s.lastDataRecv.Store(now)
 
@@ -406,8 +429,8 @@ func (s *session) receive(b []byte) bool {
 // data packet.  Keepalive receipt is intentionally excluded so that receiving
 // a keepalive does not suppress sending one in response.
 func (s *session) dataActivity() time.Time {
-	lastSend := s.lastSend.Load().(time.Time)
-	lastDataRecv := s.lastDataRecv.Load().(time.Time)
+	lastSend := time.Unix(0, s.lastSend.Load())
+	lastDataRecv := time.Unix(0, s.lastDataRecv.Load())
 	if lastDataRecv.After(lastSend) {
 		return lastDataRecv
 	}
@@ -430,7 +453,7 @@ func (s *session) receiveFragment(b []byte) bool {
 		return false
 	}
 
-	plain, err := decryptAEAD(s.recvKey, counter, nil, b[sizeDataHeader:])
+	plain, err := s.recvAEAD.Open(nil, makeNonce(counter), b[sizeDataHeader:], nil)
 	if err != nil {
 		dbg("recv: fragment decrypt failed", "local_index", s.localIndex, "counter", counter, "err", err)
 		return false
@@ -519,7 +542,7 @@ func (s *session) receiveFragment(b []byte) bool {
 		return true
 	}
 
-	now := time.Now()
+	now := time.Now().UnixNano()
 	s.lastRecv.Store(now)
 	s.lastDataRecv.Store(now)
 
@@ -586,7 +609,7 @@ func (s *session) gcFragBufs(maxAge time.Duration) {
 // down.  Any received packet (including keepalives) counts as activity so that
 // a peer sending keepalives is not incorrectly declared dead.
 func (s *session) isExpired() bool {
-	lastRecv := s.lastRecv.Load().(time.Time)
+	lastRecv := time.Unix(0, s.lastRecv.Load())
 	return time.Since(lastRecv) > s.timeout
 }
 

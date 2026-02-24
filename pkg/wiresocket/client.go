@@ -53,6 +53,15 @@ type DialConfig struct {
 	// fragmented frames buffered per session.  Excess fragments are dropped.
 	// Defaults to 64.
 	MaxIncompleteFrames int
+
+	// MaxPacketSize is the maximum UDP payload size in bytes used when
+	// fragmenting outgoing frames.  Larger values reduce the number of
+	// fragments (and therefore syscalls) per large frame, improving
+	// throughput on links that support bigger datagrams.
+	// Defaults to 1232 (safe for IPv6 minimum path MTU).
+	// Set up to 65000 for loopback or LAN benchmarks (IPv4 hard limit is
+	// 65507; leave headroom for safety).
+	MaxPacketSize int
 }
 
 func (cfg *DialConfig) defaults() {
@@ -76,6 +85,9 @@ func (cfg *DialConfig) defaults() {
 	}
 	if cfg.MaxIncompleteFrames == 0 {
 		cfg.MaxIncompleteFrames = maxReassemblyBufs
+	}
+	if cfg.MaxPacketSize == 0 {
+		cfg.MaxPacketSize = defaultMaxPacketSize
 	}
 }
 
@@ -136,6 +148,10 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("wiresocket: listen UDP: %w", err)
 	}
+	// Larger kernel socket buffers reduce packet loss under bursts.
+	const socketBufSize = 4 << 20 // 4 MiB
+	conn.SetReadBuffer(socketBufSize)
+	conn.SetWriteBuffer(socketBufSize)
 
 	kp, err := resolveClientKeypair(cfg.PrivateKey)
 	if err != nil {
@@ -238,7 +254,8 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 				"remote_index", resp.SenderIndex,
 			)
 			sendKey, recvKey := hs.TransportKeys(true)
-			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize, cfg.SessionTimeout, cfg.KeepaliveInterval, cfg.MaxIncompleteFrames)
+			maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
+			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize, cfg.SessionTimeout, cfg.KeepaliveInterval, cfg.MaxIncompleteFrames, maxFrag)
 			return raddr, conn, sess, nil
 
 		case typeCookieReply:
