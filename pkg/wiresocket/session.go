@@ -10,23 +10,18 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // maxReassemblyBufs is the maximum number of incomplete fragmented frames
 // buffered per session at one time.
 const maxReassemblyBufs = 64
 
-// sessionEvent pairs a decoded event with the channel it belongs to.
-// Used internally to route events from session to mux without storing
-// the channel ID on the Event itself.
-type sessionEvent struct {
-	channelId uint8
-	event     *Event
-}
-
 // reassemblyBuf accumulates fragments for a single fragmented frame.
 type reassemblyBuf struct {
-	frags    [][]byte  // indexed by frag_index; nil slot = not yet received
+	frags    [][]byte  // indexed by frag_index; nil slot = not yet received; slice views into pool bufs
+	bufs     []*[]byte // pool buffer pointer per fragment; kept alive until reassembly or GC
 	received uint8     // number of fragments received so far
 	total    uint8     // total expected (from frag_count)
 	lastSeen time.Time // updated on each received fragment; used for GC
@@ -77,8 +72,25 @@ type session struct {
 	// Shared UDP connection used to write outgoing packets.
 	udpConn *net.UDPConn
 
-	// Buffered channel delivering decrypted events to the mux goroutine.
-	events chan sessionEvent
+	// pc / pc6 wrap udpConn for WriteBatch (sendmmsg on Linux).
+	// Exactly one is set depending on the socket's address family; the other
+	// is nil.  sendFragments dispatches to whichever is non-nil.
+	pc  *ipv4.PacketConn
+	pc6 *ipv6.PacketConn
+
+	// router is called directly from the receive hot-path to deliver decoded
+	// events to their destination channel.  Set once by Conn.wireSession
+	// before the read-loop goroutine starts; never modified after that, so no
+	// synchronisation is needed beyond the goroutine-start happens-before.
+	router func(channelId uint8, e *Event)
+
+	// onClose, if non-nil, is called once by close() to propagate teardown.
+	// Used by non-persistent Conns to close all channels when the session ends.
+	onClose func()
+
+	// eventBuf is the per-channel event buffer depth; stored here so newConn
+	// can read it without needing a separate parameter.
+	eventBuf int
 
 	// Closed to signal teardown.
 	done chan struct{}
@@ -123,6 +135,23 @@ func newSession(
 	if err != nil {
 		panic("wiresocket: newSession recvAEAD: " + err.Error())
 	}
+	// Wrap udpConn with the address-family-appropriate PacketConn so that
+	// sendFragments can use WriteBatch (sendmmsg on Linux).
+	// ipv4.PacketConn requires an IPv4 socket; ipv6.PacketConn requires IPv6.
+	// Mixing them causes EINVAL on macOS (sendmsg with mismatched control msgs).
+	var pc *ipv4.PacketConn
+	var pc6 *ipv6.PacketConn
+	if laddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		if laddr.IP.To4() != nil {
+			pc = ipv4.NewPacketConn(conn)
+		} else if laddr.IP != nil {
+			// newIPv6PacketConn is build-tagged: returns a real *ipv6.PacketConn
+			// on Linux (where sendmmsg exists) and nil elsewhere (macOS/Windows
+			// where ipv6 sendmsg control messages fail on dual-stack sockets).
+			pc6 = newIPv6PacketConn(conn)
+		}
+	}
+
 	s := &session{
 		sendKey:        sendKey,
 		recvKey:        recvKey,
@@ -133,7 +162,9 @@ func newSession(
 		localIndex:     localIndex,
 		remoteAddr:     addr,
 		udpConn:        conn,
-		events:         make(chan sessionEvent, eventBuf),
+		pc:             pc,
+		pc6:            pc6,
+		eventBuf:       eventBuf,
 		done:           make(chan struct{}),
 		created:        time.Now(),
 		timeout:        timeout,
@@ -154,7 +185,7 @@ func newSession(
 	return s
 }
 
-// close signals teardown and drains the event channel.
+// close signals teardown.
 func (s *session) close() {
 	select {
 	case <-s.done:
@@ -165,6 +196,9 @@ func (s *session) close() {
 			"remote_addr", s.remoteAddr.String(),
 		)
 		close(s.done)
+		if s.onClose != nil {
+			s.onClose()
+		}
 	}
 }
 
@@ -196,38 +230,62 @@ func (s *session) isDone() bool {
 }
 
 // send encrypts frame and writes it to the remote peer.  Frames larger than
-// maxFragmentPayload are automatically split across multiple typeDataFragment
+// maxFragPayload are automatically split across multiple typeDataFragment
 // packets.  It is safe to call from multiple goroutines simultaneously.
 func (s *session) send(frame *Frame) error {
-	plain := frame.Marshal()
+	bp := sendBufPool.Get().(*[]byte)
+
+	// Marshal the frame after a sizeDataHeader-byte placeholder for the header.
+	// Using a three-index slice lets us start from len=0 while still giving
+	// AppendMarshal the correct starting length.
+	buf := frame.AppendMarshal((*bp)[0:sizeDataHeader:cap(*bp)])
+	*bp = buf
+	plain := buf[sizeDataHeader:]
+
 	if len(plain) > s.maxFragPayload {
-		return s.sendFragments(plain)
+		err := s.sendFragments(plain) // plain is valid; bp held for the duration
+		sendBufPool.Put(bp)
+		return err
 	}
 
 	counter, ok := s.nextCounter()
 	if !ok {
+		sendBufPool.Put(bp)
 		return ErrConnClosed
 	}
 
-	hdr := marshalDataHeader(s.remoteIndex, counter)
-	ciphertext := s.sendAEAD.Seal(hdr, makeNonce(counter), plain, nil)
+	// Write the data header in-place into the placeholder region.
+	buf[0] = typeData
+	buf[1], buf[2], buf[3] = 0, 0, 0
+	binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
+	binary.LittleEndian.PutUint64(buf[8:], counter)
+
+	// Seal appends ciphertext to buf[:sizeDataHeader].  Because plain is a
+	// sub-slice of the same backing array and ChaCha20 is a stream cipher,
+	// XOR-in-place is safe (src and dst have identical pointer+length so
+	// chacha20.XORKeyStream treats them as equal, not inexactly overlapping).
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	packet := s.sendAEAD.Seal(buf[:sizeDataHeader], nonce[:], plain, nil)
 
 	dbg("send packet",
 		"local_index", s.localIndex,
 		"remote_index", s.remoteIndex,
 		"counter", counter,
 		"plain_bytes", len(plain),
-		"packet_bytes", len(ciphertext),
+		"packet_bytes", len(packet),
 	)
-	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
+	_, err := s.udpConn.WriteToUDP(packet, s.remoteAddr)
 	if err == nil {
 		s.lastSend.Store(time.Now().UnixNano())
 	}
+	sendBufPool.Put(bp)
 	return err
 }
 
-// sendFragments splits plain into s.maxFragPayload-sized chunks and sends
-// each as an authenticated typeDataFragment packet.
+// sendFragments splits plain into s.maxFragPayload-sized chunks, encrypts each
+// into its own pool buffer, and sends all fragments in one WriteBatch syscall
+// (sendmmsg on Linux; a sendmsg loop on other platforms).
 func (s *session) sendFragments(plain []byte) error {
 	fragCount := (len(plain) + s.maxFragPayload - 1) / s.maxFragPayload
 	if fragCount > 255 {
@@ -243,37 +301,106 @@ func (s *session) sendFragments(plain []byte) error {
 		"total_bytes", len(plain),
 	)
 
+	// Encrypt all fragments into separate pool buffers and build the batch.
+	msgs := make([]ipv4.Message, fragCount)
+	bps := make([]*[]byte, fragCount)
+
 	for i := 0; i < fragCount; i++ {
 		start := i * s.maxFragPayload
 		end := start + s.maxFragPayload
 		if end > len(plain) {
 			end = len(plain)
 		}
+		fragData := plain[start:end]
 
-		// Fragment payload: [frame_id(4)][frag_index(1)][frag_count(1)][data]
-		fragPayload := make([]byte, sizeFragmentHeader+end-start)
-		binary.LittleEndian.PutUint32(fragPayload[0:], frameID)
-		fragPayload[4] = byte(i)
-		fragPayload[5] = byte(fragCount)
-		copy(fragPayload[sizeFragmentHeader:], plain[start:end])
+		totalSz := sizeDataHeader + sizeFragmentHeader + len(fragData)
+
+		bp := sendBufPool.Get().(*[]byte)
+		if cap(*bp) < totalSz+sizeAEADTag {
+			*bp = make([]byte, 0, totalSz+sizeAEADTag)
+		}
+		buf := (*bp)[0:totalSz:cap(*bp)]
 
 		counter, ok := s.nextCounter()
 		if !ok {
+			// Return all buffers allocated so far, then the current one.
+			for j := 0; j < i; j++ {
+				sendBufPool.Put(bps[j])
+			}
+			sendBufPool.Put(bp)
 			return ErrConnClosed
 		}
 
-		hdr := make([]byte, sizeDataHeader)
-		hdr[0] = typeDataFragment
-		hdr[4] = byte(s.remoteIndex)
-		hdr[5] = byte(s.remoteIndex >> 8)
-		hdr[6] = byte(s.remoteIndex >> 16)
-		hdr[7] = byte(s.remoteIndex >> 24)
-		binary.LittleEndian.PutUint64(hdr[8:], counter)
+		// Data header.
+		buf[0] = typeDataFragment
+		buf[1], buf[2], buf[3] = 0, 0, 0
+		binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
+		binary.LittleEndian.PutUint64(buf[8:], counter)
 
-		ciphertext := s.sendAEAD.Seal(hdr, makeNonce(counter), fragPayload, nil)
-		if _, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr); err != nil {
-			return err
+		// Fragment header: [frame_id(4)][frag_index(1)][frag_count(1)].
+		binary.LittleEndian.PutUint32(buf[sizeDataHeader:], frameID)
+		buf[sizeDataHeader+4] = byte(i)
+		buf[sizeDataHeader+5] = byte(fragCount)
+
+		// Copy fragment data (one copy from the caller's plain slice).
+		copy(buf[sizeDataHeader+sizeFragmentHeader:], fragData)
+
+		// In-place seal (same backing array; stream cipher XOR is safe).
+		fragPlain := buf[sizeDataHeader:totalSz]
+		var nonce [12]byte
+		binary.LittleEndian.PutUint64(nonce[4:], counter)
+		packet := s.sendAEAD.Seal(buf[:sizeDataHeader], nonce[:], fragPlain, nil)
+
+		// Track the (possibly grown) backing array for pool return.
+		*bp = packet[:cap(*bp)]
+		bps[i] = bp
+
+		msgs[i] = ipv4.Message{
+			Buffers: [][]byte{packet},
+			Addr:    s.remoteAddr,
 		}
+	}
+
+	// Send all fragments — one syscall for the entire frame on Linux
+	// (sendmmsg via PacketConn.WriteBatch), or a plain WriteToUDP loop elsewhere.
+	// ipv4.Message and ipv6.Message are both aliases for socket.Message, so the
+	// same msgs slice is accepted by both WriteBatch overloads without conversion.
+	var sendErr error
+	switch {
+	case s.pc != nil:
+		sent := 0
+		for sent < fragCount {
+			n, err := s.pc.WriteBatch(msgs[sent:], 0)
+			sent += n
+			if err != nil {
+				sendErr = err
+				break
+			}
+		}
+	case s.pc6 != nil:
+		sent := 0
+		for sent < fragCount {
+			n, err := s.pc6.WriteBatch(msgs[sent:], 0)
+			sent += n
+			if err != nil {
+				sendErr = err
+				break
+			}
+		}
+	default:
+		for _, msg := range msgs {
+			if _, err := s.udpConn.WriteToUDP(msg.Buffers[0], s.remoteAddr); err != nil {
+				sendErr = err
+				break
+			}
+		}
+	}
+
+	for _, bp := range bps {
+		sendBufPool.Put(bp)
+	}
+	if sendErr != nil {
+		return sendErr
 	}
 	s.lastSend.Store(time.Now().UnixNano())
 	return nil
@@ -376,23 +503,33 @@ func (s *session) receive(b []byte) bool {
 		return false // replay or too old
 	}
 
-	// Header is used as AAD-free AEAD (we authenticate only the payload);
-	// the counter itself is part of the nonce so no AAD is needed.
-	plain, err := s.recvAEAD.Open(nil, makeNonce(hdr.Counter), b[sizeDataHeader:], nil)
+	// Decrypt into a pool buffer to avoid per-packet heap allocation.
+	bp := recvBufPool.Get().(*[]byte)
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], hdr.Counter)
+	plain, err := s.recvAEAD.Open((*bp)[:0], nonce[:], b[sizeDataHeader:], nil)
 	if err != nil {
+		recvBufPool.Put(bp)
 		dbg("recv: decrypt failed", "local_index", s.localIndex, "counter", hdr.Counter, "err", err)
 		return false
 	}
+	// Track the slice in case Open reallocated (pool buffer was too small).
+	*bp = plain[:cap(plain)]
+
 	s.replay.update(hdr.Counter)
 	now := time.Now().UnixNano()
 	s.lastRecv.Store(now)
 	s.lastDataRecv.Store(now)
 
 	if len(plain) == 0 {
+		recvBufPool.Put(bp)
 		return true // empty data frame — nothing to deliver
 	}
 
 	frame, err := UnmarshalFrame(plain)
+	// Return the pool buffer now: UnmarshalFrame copies Event.Payload (frame.go),
+	// so the pool memory is no longer referenced after this point.
+	recvBufPool.Put(bp)
 	if err != nil {
 		dbg("recv: frame unmarshal failed", "local_index", s.localIndex, "err", err)
 		return false
@@ -403,23 +540,9 @@ func (s *session) receive(b []byte) bool {
 		"plain_bytes", len(plain),
 		"events", len(frame.Events),
 	)
-	for _, e := range frame.Events {
-		se := sessionEvent{channelId: frame.ChannelId, event: e}
-		select {
-		case s.events <- se:
-		case <-s.done:
-			return false
-		default:
-			// Drop oldest if buffer is full rather than blocking.
-			dbg("recv: event buffer full, dropping oldest", "local_index", s.localIndex)
-			select {
-			case <-s.events:
-			default:
-			}
-			select {
-			case s.events <- se:
-			default:
-			}
+	if r := s.router; r != nil {
+		for _, e := range frame.Events {
+			r(frame.ChannelId, e)
 		}
 	}
 	return true
@@ -440,6 +563,10 @@ func (s *session) dataActivity() time.Time {
 // receiveFragment decrypts and buffers an incoming typeDataFragment packet.
 // When all fragments of a frame have arrived it reassembles and delivers them.
 // Returns false if the packet should be silently dropped.
+//
+// Each decrypted fragment is stored as a zero-copy view into a pool buffer.
+// The pool buffer is kept alive inside the reassemblyBuf until the frame is
+// complete or the entry is GC'd, at which point all pool buffers are returned.
 func (s *session) receiveFragment(b []byte) bool {
 	const minLen = sizeDataHeader + sizeFragmentHeader + sizeAEADTag
 	if len(b) < minLen {
@@ -453,14 +580,21 @@ func (s *session) receiveFragment(b []byte) bool {
 		return false
 	}
 
-	plain, err := s.recvAEAD.Open(nil, makeNonce(counter), b[sizeDataHeader:], nil)
+	// Decrypt into a pool buffer.
+	bp := recvBufPool.Get().(*[]byte)
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	plain, err := s.recvAEAD.Open((*bp)[:0], nonce[:], b[sizeDataHeader:], nil)
 	if err != nil {
+		recvBufPool.Put(bp)
 		dbg("recv: fragment decrypt failed", "local_index", s.localIndex, "counter", counter, "err", err)
 		return false
 	}
+	*bp = plain[:cap(plain)] // track any realloc by Open
 	s.replay.update(counter)
 
 	if len(plain) < sizeFragmentHeader {
+		recvBufPool.Put(bp)
 		dbg("recv: fragment payload too short", "local_index", s.localIndex)
 		return false
 	}
@@ -468,9 +602,10 @@ func (s *session) receiveFragment(b []byte) bool {
 	frameID := binary.LittleEndian.Uint32(plain[0:])
 	fragIndex := plain[4]
 	fragCount := plain[5]
-	data := plain[sizeFragmentHeader:]
+	data := plain[sizeFragmentHeader:] // zero-copy view into pool buffer
 
 	if fragCount == 0 || int(fragIndex) >= int(fragCount) {
+		recvBufPool.Put(bp)
 		dbg("recv: invalid fragment header",
 			"local_index", s.localIndex,
 			"frame_id", frameID,
@@ -484,38 +619,45 @@ func (s *session) receiveFragment(b []byte) bool {
 	if s.fragBufs == nil {
 		s.fragBufs = make(map[uint32]*reassemblyBuf)
 	}
-	buf, ok := s.fragBufs[frameID]
+	rbuf, ok := s.fragBufs[frameID]
 	if !ok {
 		if len(s.fragBufs) >= s.maxFragBufs {
 			s.fragMu.Unlock()
+			recvBufPool.Put(bp)
 			dbg("recv: reassembly buffer full, dropping fragment",
 				"local_index", s.localIndex,
 				"frame_id", frameID,
 			)
 			return false
 		}
-		buf = &reassemblyBuf{
+		rbuf = &reassemblyBuf{
 			frags:    make([][]byte, fragCount),
+			bufs:     make([]*[]byte, fragCount),
 			total:    fragCount,
 			lastSeen: time.Now(),
 		}
-		s.fragBufs[frameID] = buf
-	} else if buf.total != fragCount {
+		s.fragBufs[frameID] = rbuf
+	} else if rbuf.total != fragCount {
 		s.fragMu.Unlock()
+		recvBufPool.Put(bp)
 		dbg("recv: fragment count mismatch",
 			"local_index", s.localIndex,
 			"frame_id", frameID,
 			"got", fragCount,
-			"want", buf.total,
+			"want", rbuf.total,
 		)
 		return false
 	}
 
-	if buf.frags[fragIndex] == nil {
-		buf.frags[fragIndex] = append([]byte(nil), data...)
-		buf.received++
-		buf.lastSeen = time.Now()
+	if rbuf.frags[fragIndex] == nil {
+		// Store zero-copy view; keep pool buffer alive via bufs.
+		rbuf.frags[fragIndex] = data
+		rbuf.bufs[fragIndex] = bp // ownership transferred to reassemblyBuf
+		rbuf.received++
+		rbuf.lastSeen = time.Now()
 	} else {
+		// Duplicate fragment — discard the pool buffer we just decrypted into.
+		recvBufPool.Put(bp)
 		dbg("recv: duplicate fragment ignored",
 			"local_index", s.localIndex,
 			"frame_id", frameID,
@@ -523,16 +665,22 @@ func (s *session) receiveFragment(b []byte) bool {
 		)
 	}
 
-	complete := buf.received == buf.total
+	complete := rbuf.received == rbuf.total
 	var assembled []byte
 	if complete {
 		total := 0
-		for _, f := range buf.frags {
+		for _, f := range rbuf.frags {
 			total += len(f)
 		}
 		assembled = make([]byte, 0, total)
-		for _, f := range buf.frags {
+		for _, f := range rbuf.frags {
 			assembled = append(assembled, f...)
+		}
+		// Return all pool buffers now that the data has been copied.
+		for _, fragBp := range rbuf.bufs {
+			if fragBp != nil {
+				recvBufPool.Put(fragBp)
+			}
 		}
 		delete(s.fragBufs, frameID)
 	}
@@ -565,22 +713,9 @@ func (s *session) receiveFragment(b []byte) bool {
 		"total_bytes", len(assembled),
 		"events", len(frame.Events),
 	)
-	for _, e := range frame.Events {
-		se := sessionEvent{channelId: frame.ChannelId, event: e}
-		select {
-		case s.events <- se:
-		case <-s.done:
-			return false
-		default:
-			dbg("recv: event buffer full, dropping oldest", "local_index", s.localIndex)
-			select {
-			case <-s.events:
-			default:
-			}
-			select {
-			case s.events <- se:
-			default:
-			}
+	if r := s.router; r != nil {
+		for _, e := range frame.Events {
+			r(frame.ChannelId, e)
 		}
 	}
 	return true
@@ -588,6 +723,7 @@ func (s *session) receiveFragment(b []byte) bool {
 
 // gcFragBufs removes reassembly buffers that have not received a fragment
 // within maxAge, preventing unbounded memory growth from incomplete frames.
+// Pool buffers held by stale entries are returned before deletion.
 func (s *session) gcFragBufs(maxAge time.Duration) {
 	deadline := time.Now().Add(-maxAge)
 	s.fragMu.Lock()
@@ -599,6 +735,12 @@ func (s *session) gcFragBufs(maxAge time.Duration) {
 				"received", buf.received,
 				"total", buf.total,
 			)
+			// Return pool buffers for any fragments already received.
+			for _, bp := range buf.bufs {
+				if bp != nil {
+					recvBufPool.Put(bp)
+				}
+			}
 			delete(s.fragBufs, id)
 		}
 	}

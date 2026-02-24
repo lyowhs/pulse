@@ -25,14 +25,24 @@ type Frame struct {
 	Events    []*Event
 }
 
-// Marshal serialises f into wire format: [channel_id][LEN-field events...].
-func (f *Frame) Marshal() []byte {
-	b := []byte{f.ChannelId}
+// AppendMarshal appends the frame's wire encoding to dst and returns the
+// extended slice.  It is allocation-free when dst has sufficient capacity.
+// Wire format: [channel_id(1)] [field-1 LEN event-body]...
+// where event-body = [type(1)][payload...].
+func (f *Frame) AppendMarshal(dst []byte) []byte {
+	dst = append(dst, f.ChannelId)
 	for _, e := range f.Events {
-		b = appendLenField(b, 1, e.marshal())
+		body := 1 + len(e.Payload)
+		dst = appendVarint(dst, 0x0A) // field 1, wire type LEN
+		dst = appendVarint(dst, uint64(body))
+		dst = append(dst, e.Type)
+		dst = append(dst, e.Payload...)
 	}
-	return b
+	return dst
 }
+
+// Marshal serialises f into wire format: [channel_id][LEN-field events...].
+func (f *Frame) Marshal() []byte { return f.AppendMarshal(nil) }
 
 // UnmarshalFrame parses a Frame from wire bytes.
 func UnmarshalFrame(b []byte) (*Frame, error) {

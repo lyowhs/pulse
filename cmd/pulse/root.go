@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
+	"example.com/pulse/pulse/cmd/pulse/bench"
 	"example.com/pulse/pulse/cmd/pulse/keys"
 	"example.com/pulse/pulse/cmd/pulse/server"
 )
@@ -29,6 +30,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: $HOME/.pulse.yaml)")
 	rootCmd.AddCommand(keys.Command())
 	rootCmd.AddCommand(server.Command())
+	rootCmd.AddCommand(bench.Command())
 }
 
 func initConfig() {

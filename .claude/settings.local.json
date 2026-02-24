@@ -29,7 +29,9 @@
       "Bash(protoc-gen-go:*)",
       "Bash(brew install:*)",
       "Bash(go install:*)",
-      "Bash(PATH=\"$PATH:$HOME/go/bin\" protoc:*)"
+      "Bash(PATH=\"$PATH:$HOME/go/bin\" protoc:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)"
     ]
   }
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // DialConfig configures Dial.
@@ -62,6 +64,13 @@ type DialConfig struct {
 	// Set up to 65000 for loopback or LAN benchmarks (IPv4 hard limit is
 	// 65507; leave headroom for safety).
 	MaxPacketSize int
+
+	// CoalesceInterval, if non-zero, enables event coalescing: events passed
+	// to Channel.Send are buffered and sent together as a single encrypted
+	// frame after this interval elapses.  This reduces per-event encryption
+	// and syscall overhead at the cost of added latency equal to the interval.
+	// Typical values: 50µs–1ms.  Zero disables coalescing (default).
+	CoalesceInterval time.Duration
 }
 
 func (cfg *DialConfig) defaults() {
@@ -107,9 +116,6 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 		return nil, err
 	}
 
-	go clientReadLoop(udpConn, sess, raddr)
-	go clientKeepaliveLoop(sess)
-
 	if cfg.ReconnectMin > 0 {
 		pctx, cancel := context.WithCancel(context.Background())
 		ready := make(chan struct{})
@@ -126,13 +132,26 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 		}
 		c.ch0 = newChannel(0, c, cfg.EventBufSize)
 		c.channels.Store(uint8(0), c.ch0)
+		if cfg.CoalesceInterval > 0 {
+			maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
+			c.coalescer = newCoalescer(c, cfg.CoalesceInterval, maxFrag)
+		}
+		// Wire the router before starting the read loop so sess.router is
+		// visible inside the goroutine (goroutine-start happens-before).
+		c.wireSession(sess)
 		dbg("persistent conn created", "addr", addr, "local_index", sess.localIndex)
-		go c.mux(sess)
+		go clientReadLoop(udpConn, sess, raddr)
+		go clientKeepaliveLoop(sess)
 		go c.reconnectLoop()
 		return c, nil
 	}
 
-	return newConn(sess), nil
+	// Non-persistent: wire the router (inside newConn) before starting the
+	// read loop so the goroutine-start happens-before makes it visible.
+	conn := newConn(sess, cfg.CoalesceInterval)
+	go clientReadLoop(udpConn, sess, raddr)
+	go clientKeepaliveLoop(sess)
+	return conn, nil
 }
 
 // dialSession performs a single full handshake and returns the established
@@ -281,7 +300,8 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 }
 
 // clientReadLoop runs in a background goroutine, reading incoming UDP packets
-// and delivering them to the session.
+// and delivering them to the session.  Up to readBatchSz datagrams are read
+// per syscall using ipv4.PacketConn.ReadBatch.
 func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 	dbg("client: read loop started", "local_index", sess.localIndex, "remote_addr", raddr.String())
 	defer func() {
@@ -290,7 +310,14 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 		conn.Close()
 	}()
 
-	buf := make([]byte, 65535)
+	const batchSz = 16
+	pc := ipv4.NewPacketConn(conn)
+	msgs := make([]ipv4.Message, batchSz)
+	for i := range msgs {
+		msgs[i].Buffers = [][]byte{make([]byte, 65535)}
+	}
+	raddrStr := raddr.String()
+
 	for {
 		select {
 		case <-sess.done:
@@ -299,7 +326,7 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 		}
 
 		conn.SetReadDeadline(time.Now().Add(sess.timeout))
-		n, src, err := conn.ReadFromUDP(buf)
+		n, err := pc.ReadBatch(msgs, 0)
 		conn.SetReadDeadline(time.Time{})
 
 		if err != nil {
@@ -315,21 +342,29 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 			}
 			return
 		}
-		if n == 0 || src.String() != raddr.String() {
-			continue
-		}
-		switch buf[0] {
-		case typeData:
-			sess.receive(buf[:n])
-		case typeDataFragment:
-			sess.receiveFragment(buf[:n])
-		case typeKeepalive:
-			sess.receiveKeepalive(buf[:n])
-		case typeDisconnect:
-			dbg("client: recv disconnect from server", "local_index", sess.localIndex)
-			return
-		default:
-			dbg("client: unknown packet type, dropping", "type", buf[0], "len", n)
+
+		for i := 0; i < n; i++ {
+			msg := &msgs[i]
+			src, _ := msg.Addr.(*net.UDPAddr)
+			if msg.N == 0 || src == nil || src.String() != raddrStr {
+				msg.N = 0
+				continue
+			}
+			buf := msg.Buffers[0][:msg.N]
+			switch buf[0] {
+			case typeData:
+				sess.receive(buf)
+			case typeDataFragment:
+				sess.receiveFragment(buf)
+			case typeKeepalive:
+				sess.receiveKeepalive(buf)
+			case typeDisconnect:
+				dbg("client: recv disconnect from server", "local_index", sess.localIndex)
+				return
+			default:
+				dbg("client: unknown packet type, dropping", "type", buf[0], "len", msg.N)
+			}
+			msg.N = 0
 		}
 	}
 }

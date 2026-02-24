@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // ServerConfig configures a UDP stream server.
@@ -70,6 +72,10 @@ type ServerConfig struct {
 	// Set up to 65000 for loopback or LAN benchmarks (IPv4 hard limit is
 	// 65507; leave headroom for safety).
 	MaxPacketSize int
+
+	// CoalesceInterval, if non-zero, enables event coalescing on server-side
+	// connections.  See DialConfig.CoalesceInterval for details.
+	CoalesceInterval time.Duration
 }
 
 func (cfg *ServerConfig) defaults() {
@@ -103,6 +109,7 @@ type Server struct {
 	cookies *cookieManager
 
 	conn *net.UDPConn
+	pc   *ipv4.PacketConn // wraps conn for batch reads
 
 	// sessions maps a server-assigned local index → *session for routing data
 	// packets.  Key type: uint32, value type: *session.
@@ -177,6 +184,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	conn.SetReadBuffer(socketBufSize)
 	conn.SetWriteBuffer(socketBufSize)
 	s.conn = conn
+	s.pc = ipv4.NewPacketConn(conn)
 
 	// Worker goroutines for packet processing.
 	var wg sync.WaitGroup
@@ -191,13 +199,23 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Session GC goroutine.
 	go s.gc(ctx)
 
-	// UDP read loop (single goroutine, lock-free dispatch).
+	// UDP read loop — reads up to readBatchSz datagrams per syscall using
+	// ipv4.PacketConn.ReadBatch (recvmmsg on Linux; recvmsg loop on Darwin).
+	const readBatchSz = 64
 	go func() {
+		msgs := make([]ipv4.Message, readBatchSz)
+		for i := range msgs {
+			msgs[i].Buffers = [][]byte{pktBufPool.Get().([]byte)}
+		}
+		defer func() {
+			for i := range msgs {
+				pktBufPool.Put(msgs[i].Buffers[0])
+			}
+		}()
+
 		for {
-			rawBuf := pktBufPool.Get().([]byte)
-			n, addr, err := conn.ReadFromUDP(rawBuf)
+			n, err := s.pc.ReadBatch(msgs, 0)
 			if err != nil {
-				pktBufPool.Put(rawBuf)
 				select {
 				case <-ctx.Done():
 				default:
@@ -205,17 +223,27 @@ func (s *Server) Serve(ctx context.Context) error {
 				}
 				return
 			}
-			pkt := incomingPacket{
-				data:   rawBuf[:n],
-				addr:   addr,
-				rawBuf: rawBuf,
-			}
-			select {
-			case s.work <- pkt:
-			default:
-				// Worker queue full — drop packet (caller will retransmit).
-				pktBufPool.Put(rawBuf)
-				dbg("server: worker queue full, dropping packet", "remote_addr", addr.String())
+			for i := 0; i < n; i++ {
+				msg := &msgs[i]
+				rawBuf := msg.Buffers[0]
+				addr, _ := msg.Addr.(*net.UDPAddr)
+				pkt := incomingPacket{
+					data:   rawBuf[:msg.N],
+					addr:   addr,
+					rawBuf: rawBuf,
+				}
+				select {
+				case s.work <- pkt:
+				default:
+					// Worker queue full — drop packet (caller will retransmit).
+					pktBufPool.Put(rawBuf)
+					if addr != nil {
+						dbg("server: worker queue full, dropping packet", "remote_addr", addr.String())
+					}
+				}
+				// Replenish the slot for the next batch.
+				msgs[i].Buffers[0] = pktBufPool.Get().([]byte)
+				msg.N = 0
 			}
 		}
 	}()
@@ -326,6 +354,15 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	sendKey, recvKey := hs.TransportKeys(false) // false = responder
 	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize, s.cfg.SessionTimeout, s.cfg.KeepaliveInterval, s.cfg.MaxIncompleteFrames, s.maxFragPayload)
 
+	// Wire the router before storing the session or sending the response.
+	// Once the session is visible to other workers (via sessions.Store) and
+	// the client has the response, data packets can arrive immediately.
+	// Having sess.router set first ensures no events are silently dropped.
+	var conn *Conn
+	if s.cfg.OnConnect != nil {
+		conn = newConn(sess, s.cfg.CoalesceInterval)
+	}
+
 	s.sessions.Store(localIdx, sess)
 	s.totalSessions.Add(1)
 
@@ -338,8 +375,7 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	)
 
 	// Hand the conn to the application.
-	if s.cfg.OnConnect != nil {
-		conn := newConn(sess)
+	if conn != nil {
 		go func() {
 			defer func() {
 				dbg("server: session ended",

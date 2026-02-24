@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 	"time"
-
 )
 
 // ErrConnClosed is returned when an operation is performed on a closed Conn.
@@ -27,6 +26,9 @@ type Conn struct {
 	channels sync.Map // uint8 → *Channel
 	ch0      *Channel
 
+	// coalescer batches outgoing events; nil when coalescing is disabled.
+	coalescer *coalescer
+
 	// mu protects sess and ready for persistent conns; unused for non-persistent.
 	mu   sync.RWMutex
 	sess *session // current session; immutable for non-persistent
@@ -44,17 +46,22 @@ type Conn struct {
 	done chan struct{}
 }
 
-// newConn creates a non-persistent Conn over an already-established session
-// and starts the internal mux goroutine.
-func newConn(s *session) *Conn {
+// newConn creates a non-persistent Conn over an already-established session.
+// coalesceInterval > 0 enables the event coalescer.
+// wireSession is called here so the router is in place before the caller
+// starts the read-loop goroutine.
+func newConn(s *session, coalesceInterval time.Duration) *Conn {
 	c := &Conn{
 		sess: s,
 		done: s.done, // alias: done when the session closes
 	}
-	c.ch0 = newChannel(0, c, cap(s.events))
+	c.ch0 = newChannel(0, c, s.eventBuf)
 	c.channels.Store(uint8(0), c.ch0)
+	if coalesceInterval > 0 {
+		c.coalescer = newCoalescer(c, coalesceInterval, s.maxFragPayload)
+	}
+	c.wireSession(s)
 	dbg("conn created", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
-	go c.mux(s)
 	return c
 }
 
@@ -96,6 +103,47 @@ func (c *Conn) currentSession(ctx context.Context) (*session, error) {
 			return nil, ErrConnClosed
 		case <-ready:
 			// Connection re-established; re-read under lock.
+		}
+	}
+}
+
+// wireSession installs the event router and optional teardown callback on sess.
+// It must be called before the goroutine that drives sess (clientReadLoop or
+// a server worker) is started; goroutine-start is a happens-before boundary
+// in the Go memory model, so no extra synchronisation is needed for visibility
+// of sess.router inside the read-loop goroutine.
+func (c *Conn) wireSession(sess *session) {
+	sess.router = func(channelId uint8, e *Event) {
+		if e.Type == channelCloseType {
+			dbg("conn: channel close from peer", "channel_id", channelId)
+			if v, ok := c.channels.LoadAndDelete(channelId); ok {
+				v.(*Channel).closeLocal()
+			}
+			return
+		}
+		ch := c.getOrOpenChannel(channelId)
+		// Deliver to the channel's buffer; drop oldest on overflow.
+		select {
+		case ch.events <- e:
+		default:
+			dbg("conn: channel buffer full, dropping oldest", "channel_id", channelId)
+			select {
+			case <-ch.events:
+			default:
+			}
+			select {
+			case ch.events <- e:
+			default:
+			}
+		}
+	}
+	// For non-persistent conns, close all channels when the session tears down.
+	if !c.isPersistent() {
+		sess.onClose = func() {
+			c.channels.Range(func(k, v any) bool {
+				v.(*Channel).closeLocal()
+				return true
+			})
 		}
 	}
 }
@@ -160,65 +208,17 @@ func (c *Conn) reconnectLoop() {
 			}
 
 			dbg("persistent: reconnected", "addr", c.addr)
+			// Wire the router before starting the read loop so the happens-before
+			// boundary ensures sess.router is visible inside the goroutine.
+			c.wireSession(newSess)
 			go clientReadLoop(udpConn, newSess, raddr)
 			go clientKeepaliveLoop(newSess)
-			go c.mux(newSess)
 
 			c.mu.Lock()
 			c.sess = newSess
 			close(c.ready)
 			c.mu.Unlock()
 			break
-		}
-	}
-}
-
-// mux reads from sess's event stream and routes each event to the appropriate
-// Channel based on its ChannelID.  For non-persistent Conns it closes all
-// channels when sess ends.  For persistent Conns it simply exits so that
-// reconnectLoop can start a new mux for the next session.
-func (c *Conn) mux(sess *session) {
-	dbg("mux started", "local_index", sess.localIndex)
-	defer func() {
-		dbg("mux stopped", "local_index", sess.localIndex, "persistent", c.isPersistent())
-		if !c.isPersistent() {
-			c.channels.Range(func(k, v any) bool {
-				v.(*Channel).closeLocal()
-				return true
-			})
-		}
-	}()
-	for {
-		select {
-		case <-sess.done:
-			return
-		case se, ok := <-sess.events:
-			if !ok {
-				return
-			}
-			// Intercept channel-close control events — never deliver to app.
-			if se.event.Type == channelCloseType {
-				dbg("mux: channel close from peer", "channel_id", se.channelId)
-				if v, ok := c.channels.LoadAndDelete(se.channelId); ok {
-					v.(*Channel).closeLocal()
-				}
-				continue
-			}
-			ch := c.getOrOpenChannel(se.channelId)
-			// Deliver to the channel's buffer; drop oldest on overflow.
-			select {
-			case ch.events <- se.event:
-			default:
-				dbg("mux: channel buffer full, dropping oldest", "channel_id", se.channelId)
-				select {
-				case <-ch.events:
-				default:
-				}
-				select {
-				case ch.events <- se.event:
-				default:
-				}
-			}
 		}
 	}
 }
@@ -248,25 +248,9 @@ func (c *Conn) Channel(id uint8) *Channel {
 //
 // For persistent conns, if the connection is currently down, Send blocks until
 // it is restored.  If ctx is cancelled the method returns ctx.Err().
+// When coalescing is enabled, Send returns as soon as the event is queued.
 func (c *Conn) Send(ctx context.Context, e *Event) error {
-	for {
-		select {
-		case <-c.done:
-			return ErrConnClosed
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		sess, err := c.currentSession(ctx)
-		if err != nil {
-			return err
-		}
-		err = sess.send(&Frame{Events: []*Event{e}})
-		if err == ErrConnClosed && c.isPersistent() {
-			continue
-		}
-		return err
-	}
+	return c.ch0.Send(ctx, e)
 }
 
 // SendFrame sends all events in frame as a single encrypted datagram.

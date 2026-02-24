@@ -51,7 +51,23 @@ func (ch *Channel) ID() uint8 { return ch.id }
 // For persistent conns, if the connection is currently down, Send blocks until
 // it is restored.  If ctx is cancelled before the send completes, ctx.Err()
 // is returned.
+//
+// When coalescing is enabled, Send enqueues the event and returns immediately;
+// the coalescer goroutine batches it with other pending events before sending.
 func (ch *Channel) Send(ctx context.Context, e *Event) error {
+	if c := ch.conn.coalescer; c != nil {
+		select {
+		case <-ch.done:
+			return ErrChannelClosed
+		case <-ch.conn.done:
+			return ErrConnClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		dbg("channel send (coalesced)", "channel_id", ch.id, "event_type", e.Type)
+		return c.push(ctx, ch.id, e)
+	}
 	for {
 		select {
 		case <-ch.done:
