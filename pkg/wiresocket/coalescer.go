@@ -29,6 +29,10 @@ type coalescer struct {
 	// fits in one fragment and avoids triggering excessive fragmentation.
 	// 0 means unbounded (flush on timer only).
 	maxFrameBytes int
+	// stopC carries a response channel from Close() to the run loop.
+	// Sending to stopC requests a synchronous flush-and-stop; the run loop
+	// closes the response channel when the flush is complete.
+	stopC chan chan struct{}
 }
 
 type coalesceItem struct {
@@ -42,9 +46,32 @@ func newCoalescer(conn *Conn, interval time.Duration, maxFrameBytes int) *coales
 		interval:      interval,
 		input:         make(chan coalesceItem, coalesceInputBuf),
 		maxFrameBytes: maxFrameBytes,
+		stopC:         make(chan chan struct{}, 1),
 	}
 	go c.run()
 	return c
+}
+
+// stop requests a synchronous flush of all pending events and waits until
+// the coalescer goroutine has finished sending them.  After stop returns,
+// the coalescer goroutine has exited and no further events will be sent.
+//
+// stop is safe to call multiple times; subsequent calls are no-ops.
+// If ctx expires before the flush completes, stop returns early (the
+// coalescer goroutine continues running until conn.done closes it).
+func (c *coalescer) stop(ctx context.Context) {
+	resp := make(chan struct{})
+	select {
+	case c.stopC <- resp:
+		// Sent; wait for acknowledgement.
+		select {
+		case <-resp:
+		case <-ctx.Done():
+		}
+	case <-ctx.Done():
+	case <-c.conn.done:
+		// The connection is already down; the run loop flushed on conn.done.
+	}
 }
 
 // push enqueues an event for coalesced delivery.  It blocks only when the
@@ -138,6 +165,20 @@ func (c *coalescer) run() {
 
 	for {
 		select {
+		case resp := <-c.stopC:
+			// Graceful-drain request from Close(): flush all pending events,
+			// including any items that arrived in the input buffer since the
+			// last flush cycle, then signal completion.
+			stopTimer()
+			for len(c.input) > 0 {
+				addItem(<-c.input)
+			}
+			if sess := getSession(); sess != nil {
+				flushAll(sess)
+			}
+			close(resp)
+			return
+
 		case <-c.conn.done:
 			if sess := getSession(); sess != nil {
 				stopTimer()

@@ -29,7 +29,8 @@ func clientCommand() *cobra.Command {
 	cmd.Flags().Int("size", 32*1024, "event payload size in bytes")
 	cmd.Flags().Int("parallel", 1, "number of concurrent sender goroutines")
 	cmd.Flags().Int("mtu", 1472, "UDP payload MTU in bytes")
-	cmd.Flags().Duration("coalesce", 100*time.Microsecond, "coalesce interval; 0 disables coalescing")
+	cmd.Flags().Duration("coalesce", 200*time.Microsecond, "coalesce interval; 0 disables coalescing")
+	cmd.Flags().Bool("reliable", false, "enable reliable delivery with default window/RTO settings")
 	return cmd
 }
 
@@ -41,6 +42,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 	parallel, _ := cmd.Flags().GetInt("parallel")
 	mtu, _ := cmd.Flags().GetInt("mtu")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
+	reliable, _ := cmd.Flags().GetBool("reliable")
 
 	var serverPub [32]byte
 	b, err := hex.DecodeString(pubkeyHex)
@@ -66,21 +68,31 @@ func runClient(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	defer conn.Close()
 
 	fmt.Fprintf(os.Stderr, "connected\n\n")
 
 	ch := conn.Channel(benchChannel)
+	if reliable {
+		ch.SetReliable(wiresocket.ReliableCfg{})
+	}
 
 	var txMsgs, txBytes, rxMsgs, rxBytes atomic.Int64
 
 	benchCtx, benchCancel := context.WithCancel(ctx)
 	defer benchCancel()
 
-	// Receiver goroutine — counts echoed bytes.
+	// drainCtx outlives benchCtx so the receiver can collect echoes that
+	// were already in-flight when the benchmark window closed.
+	drainCtx, drainCancel := context.WithCancel(context.Background())
+	defer drainCancel()
+
+	// Receiver goroutine — uses drainCtx so it outlives benchCtx.
+	var rxDone sync.WaitGroup
+	rxDone.Add(1)
 	go func() {
+		defer rxDone.Done()
 		for {
-			e, err := ch.Recv(benchCtx)
+			e, err := ch.Recv(drainCtx)
 			if err != nil {
 				return
 			}
@@ -107,8 +119,12 @@ func runClient(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print header.
-	fmt.Fprintf(os.Stdout, "  payload %-10s  duration %-8s  senders %d  mtu %d  coalesce %s\n\n",
-		fmtSize(int64(size)), dur, parallel, mtu, coalesce)
+	reliableStr := "no"
+	if reliable {
+		reliableStr = "yes"
+	}
+	fmt.Fprintf(os.Stdout, "  payload %-10s  duration %-8s  senders %d  mtu %d  coalesce %s  reliable %s\n\n",
+		fmtSize(int64(size)), dur, parallel, mtu, coalesce, reliableStr)
 	fmt.Fprintf(os.Stdout, "  %7s   %10s   %10s   %10s   %10s\n",
 		"elapsed", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s")
 
@@ -120,11 +136,23 @@ func runClient(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 	var prevTXM, prevTXB, prevRXM, prevRXB int64
 
+	// drain stops senders, flushes the coalescer and any reliable in-flight
+	// frames, then waits for the receiver goroutine to exit.
+	drain := func() {
+		drainStart := time.Now()
+		conn.Close()
+		drainElapsed := time.Since(drainStart)
+		drainCancel()
+		rxDone.Wait()
+		fmt.Fprintf(os.Stderr, "  drain: %s\n", drainElapsed.Round(time.Millisecond))
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			benchCancel()
 			wg.Wait()
+			drain()
 			return nil
 
 		case <-ticker.C:
@@ -169,6 +197,8 @@ func runClient(cmd *cobra.Command, args []string) error {
 					fmt.Fprintf(os.Stdout, "\n")
 				}
 			}
+
+			drain()
 			return nil
 		}
 	}

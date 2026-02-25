@@ -25,7 +25,7 @@ throughput for each combination of --size and --mtu.  No second terminal needed.
 	cmd.Flags().Duration("duration", 5*time.Second, "how long to run each sub-benchmark")
 	cmd.Flags().IntSlice("mtu", []int{1472}, "UDP payload MTU(s) to sweep (comma-separated or repeated)")
 	cmd.Flags().IntSlice("size", []int{1024, 64 * 1024, 512 * 1024}, "payload size(s) in bytes to sweep")
-	cmd.Flags().Duration("coalesce", 0, "coalesce interval (e.g. 200µs); 0 disables coalescing")
+	cmd.Flags().Duration("coalesce", 200*time.Microsecond, "coalesce interval; 0 disables")
 	return cmd
 }
 
@@ -188,7 +188,6 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	if err != nil {
 		return [4]float64{}, fmt.Errorf("dial: %w", err)
 	}
-	defer conn.Close()
 
 	ch := conn.Channel(benchChannel)
 	payload := make([]byte, payloadSize)
@@ -255,11 +254,21 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 
 	<-benchCtx.Done()
 	txDone.Wait()
-	// Allow the receiver to drain echoes that were already in-flight when
-	// the benchmark window closed.
-	time.Sleep(500 * time.Millisecond)
+
+	// Graceful drain: Close flushes the coalescer and waits for the echo
+	// server to ACK any in-flight events before sending the disconnect.
+	// This replaces the old fixed 500 ms sleep and makes the drain time
+	// observable rather than a hidden implementation detail.
+	drainStart := time.Now()
+	conn.Close()
+	drainElapsed := time.Since(drainStart)
+
+	// Cancel the drain context now that the connection is closed; the
+	// receiver will exit on the next Recv error.
 	drainCancel()
 	rxDone.Wait()
+
+	fmt.Fprintf(os.Stderr, "  drain: %s\n", drainElapsed.Round(time.Millisecond))
 
 	secs := dur.Seconds()
 	tx := txBytes.Load()

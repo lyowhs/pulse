@@ -351,19 +351,61 @@ func (c *Conn) Done() <-chan struct{} {
 	return c.done
 }
 
-// Close closes the connection.  For persistent connections it stops the
-// reconnect loop and waits for it to exit.  Close is idempotent.
+// defaultDrainTimeout is the maximum time Close spends flushing coalesced
+// events and waiting for reliable-channel ACKs before tearing down the session.
+const defaultDrainTimeout = 5 * time.Second
+
+// Close closes the connection.  Before tearing down the session it performs a
+// graceful drain:
+//
+//  1. The coalescer (if enabled) is flushed synchronously so that any events
+//     queued but not yet sent are transmitted.
+//
+//  2. For each reliable channel, Close waits until all outstanding sent frames
+//     have been ACKed by the remote peer.
+//
+// The drain phase is bounded by a 5-second timeout; any data that cannot be
+// delivered within that window is abandoned before the disconnect packet is
+// sent.
+//
+// For persistent connections the drain runs against the currently active
+// session, then the reconnect loop is stopped.  Close is idempotent.
 func (c *Conn) Close() error {
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), defaultDrainTimeout)
+	defer drainCancel()
+
 	if c.isPersistent() {
 		dbg("persistent conn close", "addr", c.addr)
+		c.drainBeforeClose(drainCtx)
 		c.cancel()
 		<-c.done
 		return nil
 	}
+
 	dbg("conn close", "local_index", c.sess.localIndex, "remote_addr", c.sess.remoteAddr.String())
+	c.drainBeforeClose(drainCtx)
 	_ = c.sess.sendDisconnect()
 	c.sess.close()
 	return nil
+}
+
+// drainBeforeClose flushes pending coalesced events and waits for reliable
+// channels to receive ACKs, all bounded by ctx.
+func (c *Conn) drainBeforeClose(ctx context.Context) {
+	// Step 1: flush the coalescer so buffered events reach the wire.
+	if c.coalescer != nil {
+		c.coalescer.stop(ctx)
+	}
+	// Step 2: wait for every reliable channel's send window to empty.
+	for i := range c.channels {
+		if ctx.Err() != nil {
+			return
+		}
+		ch := c.channels[i].Load()
+		if ch != nil && ch.reliable != nil {
+			_ = ch.reliable.waitEmpty(ctx)
+		}
+	}
 }
 
 // RemoteAddr returns the UDP address of the remote peer.

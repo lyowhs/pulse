@@ -1,6 +1,7 @@
 package wiresocket
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -447,6 +448,33 @@ func (rs *reliableState) consumePendingACK() (cumAck uint32, bitmap uint64, wind
 		rs.ackTimer = nil
 	}
 	return cumAck, bitmap, window, true
+}
+
+// waitEmpty blocks until all sent frames have been ACKed by the remote peer,
+// or until ctx is cancelled (e.g. a drain timeout).  It is used by Conn.Close
+// to ensure reliable data is delivered before the disconnect packet is sent.
+func (rs *reliableState) waitEmpty(ctx context.Context) error {
+	// A goroutine watches ctx and broadcasts on the cond so that cond.Wait
+	// returns when the context expires, not only when frames are ACKed.
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			rs.cond.Broadcast()
+		case <-watchDone:
+		}
+	}()
+
+	rs.sendMu.Lock()
+	defer rs.sendMu.Unlock()
+	for rs.numPending > 0 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		rs.cond.Wait()
+	}
+	return nil
 }
 
 // reset clears all pending send-side state and wakes blocked senders.
