@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -229,6 +231,20 @@ func (s *session) isDone() bool {
 	}
 }
 
+// writeRetry calls WriteToUDP and retries on ENOBUFS.
+// On macOS the kernel UDP send buffer returns ENOBUFS (errno 55) under load
+// rather than blocking.  A brief goroutine yield and retry drains backpressure
+// without propagating a spurious error to the caller.
+func (s *session) writeRetry(data []byte) error {
+	for {
+		_, err := s.udpConn.WriteToUDP(data, s.remoteAddr)
+		if !errors.Is(err, syscall.ENOBUFS) {
+			return err
+		}
+		runtime.Gosched()
+	}
+}
+
 // send encrypts frame and writes it to the remote peer.  Frames larger than
 // maxFragPayload are automatically split across multiple typeDataFragment
 // packets.  It is safe to call from multiple goroutines simultaneously.
@@ -275,7 +291,7 @@ func (s *session) send(frame *Frame) error {
 		"plain_bytes", len(plain),
 		"packet_bytes", len(packet),
 	)
-	_, err := s.udpConn.WriteToUDP(packet, s.remoteAddr)
+	err := s.writeRetry(packet)
 	if err != nil {
 		dbg("send packet failed",
 			"local_index", s.localIndex,
@@ -380,6 +396,10 @@ func (s *session) sendFragments(plain []byte) error {
 			n, err := s.pc.WriteBatch(msgs[sent:], 0)
 			sent += n
 			if err != nil {
+				if errors.Is(err, syscall.ENOBUFS) {
+					runtime.Gosched()
+					continue
+				}
 				sendErr = err
 				break
 			}
@@ -390,13 +410,17 @@ func (s *session) sendFragments(plain []byte) error {
 			n, err := s.pc6.WriteBatch(msgs[sent:], 0)
 			sent += n
 			if err != nil {
+				if errors.Is(err, syscall.ENOBUFS) {
+					runtime.Gosched()
+					continue
+				}
 				sendErr = err
 				break
 			}
 		}
 	default:
 		for _, msg := range msgs {
-			if _, err := s.udpConn.WriteToUDP(msg.Buffers[0], s.remoteAddr); err != nil {
+			if err := s.writeRetry(msg.Buffers[0]); err != nil {
 				sendErr = err
 				break
 			}
@@ -440,7 +464,7 @@ func (s *session) sendKeepalive() error {
 		"local_index", s.localIndex,
 		"remote_addr", s.remoteAddr.String(),
 	)
-	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
+	err := s.writeRetry(ciphertext)
 	if err != nil {
 		dbg("send keepalive failed",
 			"local_index", s.localIndex,
@@ -505,7 +529,7 @@ func (s *session) sendDisconnect() error {
 		"local_index", s.localIndex,
 		"remote_addr", s.remoteAddr.String(),
 	)
-	_, err := s.udpConn.WriteToUDP(ciphertext, s.remoteAddr)
+	err := s.writeRetry(ciphertext)
 	if err != nil {
 		dbg("send disconnect failed",
 			"local_index", s.localIndex,

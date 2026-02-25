@@ -32,7 +32,12 @@
       "Bash(PATH=\"$PATH:$HOME/go/bin\" protoc:*)",
       "Bash(grep:*)",
       "Bash(find:*)",
-      "Bash(head:*)"
+      "Bash(head:*)",
+      "Bash(ping -c 2 -W 2 truenas 2>&1 && ssh truenas 'pgrep -a pulse; echo \"---\"; ss -ulnp | grep 55900' 2>&1)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(netstat:*)",
+      "Bash(tee:*)"
     ]
   }
 }

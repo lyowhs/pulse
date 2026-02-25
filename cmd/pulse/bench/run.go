@@ -36,13 +36,13 @@ func runBench(cmd *cobra.Command, _ []string) error {
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
 
 	type result struct {
-		mtu     int
-		size    int
-		skipped bool
-		txMsgS  float64
-		txMBS   float64
-		rxMsgS  float64
-		rxMBS   float64
+		mtu      int
+		size     int
+		skipped  bool
+		txMsgS   float64
+		txGbps   float64
+		rxMsgS   float64
+		rxGbps   float64
 	}
 	var results []result
 
@@ -54,23 +54,23 @@ func runBench(cmd *cobra.Command, _ []string) error {
 				return fmt.Errorf("bench mtu=%d size=%d: %w", mtu, size, err)
 			}
 			results = append(results, result{mtu: mtu, size: size, skipped: skipped,
-				txMsgS: r[0], txMBS: r[1], rxMsgS: r[2], rxMBS: r[3]})
+				txMsgS: r[0], txGbps: r[1], rxMsgS: r[2], rxGbps: r[3]})
 		}
 	}
 
 	// Summary table.
-	fmt.Fprintf(os.Stdout, "\n  ─── summary ────────────────────────────────────────────────────\n")
-	fmt.Fprintf(os.Stdout, "  %6s  %8s  %10s  %8s  %10s  %8s\n",
-		"MTU", "payload", "tx msg/s", "tx MB/s", "rx msg/s", "rx MB/s")
+	fmt.Fprintf(os.Stdout, "\n  ─── summary ──────────────────────────────────────────────────────────\n")
+	fmt.Fprintf(os.Stdout, "  %6s  %8s  %10s  %10s  %10s  %10s\n",
+		"MTU", "payload", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s")
 	for _, r := range results {
 		if r.skipped {
-			fmt.Fprintf(os.Stdout, "  %6d  %8s  %10s  %8s  %10s  %8s\n",
+			fmt.Fprintf(os.Stdout, "  %6d  %8s  %10s  %10s  %10s  %10s\n",
 				r.mtu, fmtSize(int64(r.size)), "N/A", "N/A", "N/A", "N/A")
 			continue
 		}
-		fmt.Fprintf(os.Stdout, "  %6d  %8s  %10.0f  %8.2f  %10.0f  %8.2f\n",
+		fmt.Fprintf(os.Stdout, "  %6d  %8s  %10.0f  %10.3f  %10.0f  %10.3f\n",
 			r.mtu, fmtSize(int64(r.size)),
-			r.txMsgS, r.txMBS, r.rxMsgS, r.rxMBS)
+			r.txMsgS, r.txGbps, r.rxMsgS, r.rxGbps)
 	}
 	return nil
 }
@@ -90,7 +90,7 @@ func maxPayloadForMTU(mtu int) int {
 }
 
 // runOne starts an in-process echo server + client, drives traffic for dur,
-// and returns [txMsgS, txMBS, rxMsgS, rxMBS].
+// and returns [txMsgS, txGbps, rxMsgS, rxGbps].
 // Returns an all-zero result (not an error) when the payload cannot be sent
 // at the given MTU.
 func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4]float64, error) {
@@ -198,9 +198,9 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	rx := rxBytes.Load()
 	return [4]float64{
 		float64(txMsgs.Load()) / secs,
-		float64(tx) / 1e6 / secs,
+		float64(tx) * 8 / 1e9 / secs,
 		float64(rxMsgs.Load()) / secs,
-		float64(rx) / 1e6 / secs,
+		float64(rx) * 8 / 1e9 / secs,
 	}, nil
 }
 

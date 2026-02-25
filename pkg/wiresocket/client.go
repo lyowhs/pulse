@@ -313,6 +313,7 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 // per syscall using ipv4.PacketConn.ReadBatch.
 func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 	dbg("client: read loop started", "local_index", sess.localIndex, "remote_addr", raddr.String())
+
 	defer func() {
 		dbg("client: read loop stopped", "local_index", sess.localIndex)
 		sess.close()

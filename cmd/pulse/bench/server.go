@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -21,12 +22,16 @@ func serverCommand() *cobra.Command {
 	}
 	cmd.Flags().String("addr", ":9001", "UDP address to listen on")
 	cmd.Flags().String("key", "", "hex-encoded server private key (generated if omitted)")
+	cmd.Flags().Int("mtu", 1472, "UDP payload MTU in bytes")
+	cmd.Flags().Duration("coalesce", 100*time.Microsecond, "coalesce interval; 0 disables coalescing")
 	return cmd
 }
 
 func runServer(cmd *cobra.Command, _ []string) error {
 	addr, _ := cmd.Flags().GetString("addr")
 	keyHex, _ := cmd.Flags().GetString("key")
+	mtu, _ := cmd.Flags().GetInt("mtu")
+	coalesce, _ := cmd.Flags().GetDuration("coalesce")
 
 	var privKey [32]byte
 	if keyHex == "" {
@@ -46,9 +51,11 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	}
 
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
-		Addr:      addr,
-		PrivateKey: privKey,
-		OnConnect: echoConn,
+		Addr:             addr,
+		PrivateKey:       privKey,
+		OnConnect:        echoConn,
+		MaxPacketSize:    mtu,
+		CoalesceInterval: coalesce,
 	})
 	if err != nil {
 		return err
