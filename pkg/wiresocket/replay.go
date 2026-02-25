@@ -75,8 +75,9 @@ func (rw *replayWindow) update(counter uint64) {
 			rw.bits <<= shift
 		}
 		rw.head.Store(counter)
+		head = counter // no need to re-load; we just stored it and hold the lock
 	}
-	diff := rw.head.Load() - counter
+	diff := head - counter
 	if diff < windowSize {
 		rw.bits |= 1 << diff
 	}

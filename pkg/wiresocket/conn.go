@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,7 +24,13 @@ var ErrConnClosed = errors.New("wiresocket: connection closed")
 //
 // A Conn may safely be used from multiple goroutines simultaneously.
 type Conn struct {
-	channels sync.Map // uint8 → *Channel
+	// channels is a fixed 256-entry array of atomic channel pointers, one slot
+	// per possible uint8 channel ID.  Each slot is nil until the channel is
+	// first opened.  Using atomic.Pointer[Channel] instead of sync.Map
+	// eliminates a map lookup, a type assertion, and internal sync.Map
+	// bookkeeping on every received event — the hot-path load reduces to a
+	// single atomic pointer read.
+	channels [256]atomic.Pointer[Channel]
 	ch0      *Channel
 
 	// coalescer batches outgoing events; nil when coalescing is disabled.
@@ -56,7 +63,7 @@ func newConn(s *session, coalesceInterval time.Duration) *Conn {
 		done: s.done, // alias: done when the session closes
 	}
 	c.ch0 = newChannel(0, c, s.eventBuf)
-	c.channels.Store(uint8(0), c.ch0)
+	c.channels[0].Store(c.ch0)
 	if coalesceInterval > 0 {
 		c.coalescer = newCoalescer(c, coalesceInterval, s.maxFragPayload)
 	}
@@ -116,8 +123,8 @@ func (c *Conn) wireSession(sess *session) {
 	sess.router = func(channelId uint8, e *Event) {
 		if e.Type == channelCloseType {
 			dbg("conn: channel close from peer", "channel_id", channelId)
-			if v, ok := c.channels.LoadAndDelete(channelId); ok {
-				v.(*Channel).closeLocal()
+			if ch := c.channels[channelId].Swap(nil); ch != nil {
+				ch.closeLocal()
 			}
 			return
 		}
@@ -140,10 +147,11 @@ func (c *Conn) wireSession(sess *session) {
 	// For non-persistent conns, close all channels when the session tears down.
 	if !c.isPersistent() {
 		sess.onClose = func() {
-			c.channels.Range(func(k, v any) bool {
-				v.(*Channel).closeLocal()
-				return true
-			})
+			for i := range c.channels {
+				if ch := c.channels[i].Load(); ch != nil {
+					ch.closeLocal()
+				}
+			}
 		}
 	}
 }
@@ -153,10 +161,11 @@ func (c *Conn) wireSession(sess *session) {
 func (c *Conn) reconnectLoop() {
 	defer func() {
 		// Permanently closed: shut down all channels.
-		c.channels.Range(func(k, v any) bool {
-			v.(*Channel).closeLocal()
-			return true
-		})
+		for i := range c.channels {
+			if ch := c.channels[i].Load(); ch != nil {
+				ch.closeLocal()
+			}
+		}
 		close(c.done)
 	}()
 
@@ -224,17 +233,22 @@ func (c *Conn) reconnectLoop() {
 }
 
 // getOrOpenChannel returns the Channel for id, creating it if it does not
-// already exist.
+// already exist.  The common case (channel already open) is a single atomic
+// pointer Load with no lock or type-assertion overhead.
 func (c *Conn) getOrOpenChannel(id uint8) *Channel {
-	if v, ok := c.channels.Load(id); ok {
-		return v.(*Channel)
+	if ch := c.channels[id].Load(); ch != nil {
+		return ch
 	}
 	ch := newChannel(id, c, cap(c.ch0.events))
-	v, loaded := c.channels.LoadOrStore(id, ch)
-	if loaded {
-		dbg("mux: channel already created by racing goroutine", "channel_id", id)
+	if c.channels[id].CompareAndSwap(nil, ch) {
+		return ch // we won the race
 	}
-	return v.(*Channel)
+	// Another goroutine stored a channel for this id concurrently.
+	dbg("mux: channel already created by racing goroutine", "channel_id", id)
+	if existing := c.channels[id].Load(); existing != nil {
+		return existing
+	}
+	return ch // slot nil again (e.g. closed between CAS and Load); use ours
 }
 
 // Channel returns the logical channel with the given id, creating it if it

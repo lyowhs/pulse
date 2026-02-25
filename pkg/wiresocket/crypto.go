@@ -118,7 +118,9 @@ func encryptAEAD(dst []byte, key [32]byte, counter uint64, aad, plain []byte) []
 	if err != nil {
 		panic("wiresocket: chacha20poly1305.New: " + err.Error())
 	}
-	return aead.Seal(dst, makeNonce(counter), plain, aad)
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	return aead.Seal(dst, nonce[:], plain, aad)
 }
 
 // decryptAEAD decrypts and authenticates a ChaCha20-Poly1305 ciphertext.
@@ -127,14 +129,9 @@ func decryptAEAD(key [32]byte, counter uint64, aad, cipher []byte) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	return aead.Open(nil, makeNonce(counter), cipher, aad)
-}
-
-// makeNonce builds a 12-byte nonce: [0 0 0 0 | counter little-endian].
-func makeNonce(counter uint64) []byte {
-	var n [12]byte
-	binary.LittleEndian.PutUint64(n[4:], counter)
-	return n[:]
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	return aead.Open(nil, nonce[:], cipher, aad)
 }
 
 // randUint32 generates a cryptographically random 32-bit value.

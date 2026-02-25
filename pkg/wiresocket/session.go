@@ -95,8 +95,9 @@ type session struct {
 	eventBuf int
 
 	// Closed to signal teardown.
-	done   chan struct{}
-	closed atomic.Bool // set to true before done is closed; enables a lock-free isDone fast-path
+	done      chan struct{}
+	closed    atomic.Bool // set to true before done is closed; enables a lock-free isDone fast-path
+	closeOnce sync.Once   // ensures close() is idempotent without a TOCTOU race
 
 	// How long without any received packet before declaring the peer dead.
 	timeout time.Duration
@@ -188,11 +189,12 @@ func newSession(
 	return s
 }
 
-// close signals teardown.
+// close signals teardown.  It is safe to call from multiple goroutines
+// simultaneously; only the first call takes effect (sync.Once guarantees
+// that the channel is never closed twice, eliminating the channel-select
+// TOCTOU race that was present in the previous select-based implementation).
 func (s *session) close() {
-	select {
-	case <-s.done:
-	default:
+	s.closeOnce.Do(func() {
 		dbg("session closed",
 			"local_index", s.localIndex,
 			"remote_index", s.remoteIndex,
@@ -203,7 +205,7 @@ func (s *session) close() {
 		if s.onClose != nil {
 			s.onClose()
 		}
-	}
+	})
 }
 
 // nextCounter atomically allocates the next send counter value.
@@ -484,20 +486,25 @@ func (s *session) sendKeepalive() error {
 		return ErrConnClosed
 	}
 
-	hdr := make([]byte, sizeDataHeader)
-	hdr[0] = typeKeepalive
-	hdr[4] = byte(s.remoteIndex)
-	hdr[5] = byte(s.remoteIndex >> 8)
-	hdr[6] = byte(s.remoteIndex >> 16)
-	hdr[7] = byte(s.remoteIndex >> 24)
-	binary.LittleEndian.PutUint64(hdr[8:], counter)
+	// Borrow a pool buffer so the header + AEAD tag don't heap-allocate.
+	// sizeKeepalive = sizeDataHeader(16) + sizeAEADTag(16) = 32 bytes.
+	bp := sendBufPool.Get().(*[]byte)
+	buf := (*bp)[:sizeDataHeader]
+	buf[0] = typeKeepalive
+	buf[1], buf[2], buf[3] = 0, 0, 0
+	binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
+	binary.LittleEndian.PutUint64(buf[8:], counter)
 
-	ciphertext := s.sendAEAD.Seal(hdr, makeNonce(counter), nil, nil)
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	ciphertext := s.sendAEAD.Seal(buf, nonce[:], nil, nil)
+
 	dbg("send keepalive",
 		"local_index", s.localIndex,
 		"remote_addr", s.remoteAddr.String(),
 	)
 	err := s.writeRetry(ciphertext)
+	sendBufPool.Put(bp)
 	if err != nil {
 		dbg("send keepalive failed",
 			"local_index", s.localIndex,
@@ -522,7 +529,9 @@ func (s *session) receiveKeepalive(b []byte) bool {
 		dbg("recv: keepalive replay rejected", "local_index", s.localIndex, "counter", counter)
 		return false
 	}
-	if _, err := s.recvAEAD.Open(nil, makeNonce(counter), b[sizeDataHeader:], nil); err != nil {
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	if _, err := s.recvAEAD.Open(nil, nonce[:], b[sizeDataHeader:], nil); err != nil {
 		dbg("recv: keepalive decrypt failed", "local_index", s.localIndex, "counter", counter, "err", err)
 		return false
 	}
@@ -542,27 +551,23 @@ func (s *session) sendDisconnect() error {
 	}
 
 	// Build a data-style header with typeDisconnect instead of typeData.
-	hdr := make([]byte, sizeDataHeader)
-	hdr[0] = typeDisconnect
-	hdr[4] = byte(s.remoteIndex)
-	hdr[5] = byte(s.remoteIndex >> 8)
-	hdr[6] = byte(s.remoteIndex >> 16)
-	hdr[7] = byte(s.remoteIndex >> 24)
-	hdr[8] = byte(counter)
-	hdr[9] = byte(counter >> 8)
-	hdr[10] = byte(counter >> 16)
-	hdr[11] = byte(counter >> 24)
-	hdr[12] = byte(counter >> 32)
-	hdr[13] = byte(counter >> 40)
-	hdr[14] = byte(counter >> 48)
-	hdr[15] = byte(counter >> 56)
+	// Borrow a pool buffer so the header + AEAD tag don't heap-allocate.
+	bp := sendBufPool.Get().(*[]byte)
+	buf := (*bp)[:sizeDataHeader]
+	buf[0] = typeDisconnect
+	buf[1], buf[2], buf[3] = 0, 0, 0
+	binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
+	binary.LittleEndian.PutUint64(buf[8:], counter)
 
-	ciphertext := s.sendAEAD.Seal(hdr, makeNonce(counter), nil, nil)
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	ciphertext := s.sendAEAD.Seal(buf, nonce[:], nil, nil)
 	dbg("send disconnect",
 		"local_index", s.localIndex,
 		"remote_addr", s.remoteAddr.String(),
 	)
 	err := s.writeRetry(ciphertext)
+	sendBufPool.Put(bp)
 	if err != nil {
 		dbg("send disconnect failed",
 			"local_index", s.localIndex,
