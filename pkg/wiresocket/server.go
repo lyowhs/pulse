@@ -102,6 +102,86 @@ func (cfg *ServerConfig) defaults() {
 	}
 }
 
+// ─── sharded session map ──────────────────────────────────────────────────────
+
+// sessionShards is the number of independent lock stripes in sessionMap.
+// Must be a power of two so the shard selector can use a bitmask.
+const sessionShards = 256
+
+// sessionShard is one stripe of the session routing table.
+type sessionShard struct {
+	mu sync.RWMutex
+	m  map[uint32]*session
+}
+
+// sessionMap is a sharded, type-safe replacement for sync.Map in the session
+// routing table.  Spreading Load/Store/Delete across 256 independent RWMutex
+// shards reduces contention on servers with many concurrent sessions, and
+// eliminates the type assertions that sync.Map requires at every callsite.
+type sessionMap struct {
+	shards [sessionShards]sessionShard
+}
+
+func (sm *sessionMap) shard(idx uint32) *sessionShard {
+	return &sm.shards[idx&(sessionShards-1)]
+}
+
+func (sm *sessionMap) Load(idx uint32) (*session, bool) {
+	sh := sm.shard(idx)
+	sh.mu.RLock()
+	s, ok := sh.m[idx]
+	sh.mu.RUnlock()
+	return s, ok
+}
+
+func (sm *sessionMap) Store(idx uint32, s *session) {
+	sh := sm.shard(idx)
+	sh.mu.Lock()
+	if sh.m == nil {
+		sh.m = make(map[uint32]*session)
+	}
+	sh.m[idx] = s
+	sh.mu.Unlock()
+}
+
+func (sm *sessionMap) Delete(idx uint32) {
+	sh := sm.shard(idx)
+	sh.mu.Lock()
+	delete(sh.m, idx)
+	sh.mu.Unlock()
+}
+
+// Range calls f for every session currently in the map.  Each shard is
+// snapshotted under its read lock before f is invoked, so f may safely call
+// Delete without risking a deadlock or concurrent-map-write panic.  Sessions
+// added after Range begins may or may not be visited.
+func (sm *sessionMap) Range(f func(uint32, *session) bool) {
+	type entry struct {
+		k uint32
+		v *session
+	}
+	for i := range sm.shards {
+		sh := &sm.shards[i]
+		sh.mu.RLock()
+		if len(sh.m) == 0 {
+			sh.mu.RUnlock()
+			continue
+		}
+		snap := make([]entry, 0, len(sh.m))
+		for k, v := range sh.m {
+			snap = append(snap, entry{k, v})
+		}
+		sh.mu.RUnlock()
+		for _, e := range snap {
+			if !f(e.k, e.v) {
+				return
+			}
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Server is a UDP stream server.  Create one with NewServer and call Serve.
 type Server struct {
 	cfg     ServerConfig
@@ -112,8 +192,8 @@ type Server struct {
 	pc   *ipv4.PacketConn // wraps conn for batch reads
 
 	// sessions maps a server-assigned local index → *session for routing data
-	// packets.  Key type: uint32, value type: *session.
-	sessions sync.Map
+	// packets.
+	sessions sessionMap
 
 	// pendingHandshakes maps a client's sender_index (uint32) → *noiseState
 	// during the brief window between receiving a HandshakeInit and sending
@@ -402,12 +482,11 @@ func (s *Server) handleData(pkt incomingPacket) {
 		return
 	}
 	idx := parseReceiverIndex(pkt.data)
-	val, ok := s.sessions.Load(idx)
+	sess, ok := s.sessions.Load(idx)
 	if !ok {
 		dbg("server: data packet for unknown session", "receiver_index", idx)
 		return
 	}
-	sess := val.(*session)
 	if sess.isDone() {
 		dbg("server: data packet for closed session", "receiver_index", idx)
 		s.sessions.Delete(idx)
@@ -423,12 +502,11 @@ func (s *Server) handleDataFragment(pkt incomingPacket) {
 		return
 	}
 	idx := parseReceiverIndex(pkt.data)
-	val, ok := s.sessions.Load(idx)
+	sess, ok := s.sessions.Load(idx)
 	if !ok {
 		dbg("server: data fragment for unknown session", "receiver_index", idx)
 		return
 	}
-	sess := val.(*session)
 	if sess.isDone() {
 		dbg("server: data fragment for closed session", "receiver_index", idx)
 		s.sessions.Delete(idx)
@@ -443,12 +521,11 @@ func (s *Server) handleKeepalive(pkt incomingPacket) {
 		return
 	}
 	idx := parseReceiverIndex(pkt.data)
-	val, ok := s.sessions.Load(idx)
+	sess, ok := s.sessions.Load(idx)
 	if !ok {
 		dbg("server: keepalive for unknown session", "receiver_index", idx)
 		return
 	}
-	sess := val.(*session)
 	if sess.isDone() {
 		dbg("server: keepalive for closed session", "receiver_index", idx)
 		s.sessions.Delete(idx)
@@ -462,11 +539,10 @@ func (s *Server) handleDisconnect(pkt incomingPacket) {
 		return
 	}
 	idx := parseReceiverIndex(pkt.data)
-	val, ok := s.sessions.Load(idx)
+	sess, ok := s.sessions.Load(idx)
 	if !ok {
 		return
 	}
-	sess := val.(*session)
 
 	// Authenticate: decrypt the AEAD tag using the session's recv key.
 	counter := uint64(pkt.data[8]) |
@@ -500,8 +576,7 @@ func (s *Server) gc(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.sessions.Range(func(k, v any) bool {
-				sess := v.(*session)
+			s.sessions.Range(func(k uint32, sess *session) bool {
 				if sess.isDone() || sess.isExpired() {
 					dbg("server: gc evicting session",
 						"local_index", sess.localIndex,

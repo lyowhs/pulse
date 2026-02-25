@@ -41,7 +41,11 @@
       "Bash(go version:*)",
       "Bash(curl:*)",
       "Bash(PATH=$PATH:/usr/local/go/bin go build:*)",
-      "Bash(PATH=$PATH:/usr/local/go/bin go run:*)"
+      "Bash(PATH=$PATH:/usr/local/go/bin go run:*)",
+      "Bash(export PATH=$PATH:/usr/local/go/bin && go build ./pkg/wiresocket/... 2>&1)",
+      "Bash(export PATH=$PATH:/usr/local/go/bin && go test ./pkg/wiresocket/... -timeout 60s 2>&1)",
+      "Bash(export PATH=$PATH:/usr/local/go/bin && go test ./pkg/wiresocket/... -timeout 60s -count=1 2>&1)",
+      "Bash(export PATH=$PATH:/usr/local/go/bin && go vet ./pkg/wiresocket/... 2>&1)"
     ]
   }
 }

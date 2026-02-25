@@ -45,44 +45,92 @@ func (f *Frame) AppendMarshal(dst []byte) []byte {
 func (f *Frame) Marshal() []byte { return f.AppendMarshal(nil) }
 
 // UnmarshalFrame parses a Frame from wire bytes.
+//
+// It does a fast pre-pass over the body to count events and compute total
+// payload bytes, then allocates all Event structs in one batch slice and all
+// payloads in one backing buffer.  This replaces the previous approach of one
+// heap allocation per Event and one per payload, reducing GC pressure on
+// high-throughput receive paths from O(2N) to O(3) allocations per frame.
 func UnmarshalFrame(b []byte) (*Frame, error) {
 	if len(b) == 0 {
 		return &Frame{}, nil
 	}
 	f := &Frame{ChannelId: b[0]}
-	b = b[1:]
-	for len(b) > 0 {
-		field, wt, _, lv, rest, err := consumeField(b)
+	body := b[1:]
+	if len(body) == 0 {
+		return f, nil
+	}
+
+	// Pre-pass: count events and sum payload bytes so we can batch-allocate.
+	nEvents, payloadBytes := scanEvents(body)
+	if nEvents == 0 {
+		return f, nil
+	}
+
+	// One allocation for all Event structs.  Each &batch[i] escapes to the
+	// caller via f.Events; the backing array lives as long as any *Event from
+	// this frame is reachable.
+	batch := make([]Event, nEvents)
+
+	// One allocation for all payload bytes.  Skipped when all payloads are empty.
+	var payloadBuf []byte
+	if payloadBytes > 0 {
+		payloadBuf = make([]byte, payloadBytes)
+	}
+	payloadOff := 0
+
+	f.Events = make([]*Event, 0, nEvents)
+	i := 0
+	for len(body) > 0 {
+		field, wt, _, lv, rest, err := consumeField(body)
 		if err != nil {
 			return nil, err
 		}
-		b = rest
+		body = rest
 		if field == 1 && wt == 2 {
-			e := &Event{}
-			if err := e.unmarshal(lv); err != nil {
-				return nil, err
+			if len(lv) < 1 {
+				return nil, errors.New("wiresocket: event body too short")
+			}
+			e := &batch[i]
+			e.Type = lv[0]
+			if len(lv) > 1 {
+				n := len(lv) - 1
+				// Three-index slice caps e.Payload so no append can spill into
+				// a subsequent event's region within payloadBuf.
+				e.Payload = payloadBuf[payloadOff : payloadOff+n : payloadOff+n]
+				copy(e.Payload, lv[1:])
+				payloadOff += n
 			}
 			f.Events = append(f.Events, e)
+			i++
 		}
 	}
 	return f, nil
 }
 
+// scanEvents does a single fast pre-pass over frame body bytes (after the
+// channel-ID byte) to count LEN-encoded field-1 entries and sum their payload
+// sizes.  Both values are used by UnmarshalFrame for batch allocation.
+func scanEvents(b []byte) (count, payloadBytes int) {
+	for len(b) > 0 {
+		field, wt, _, lv, rest, err := consumeField(b)
+		if err != nil {
+			break
+		}
+		b = rest
+		if field == 1 && wt == 2 {
+			count++
+			if len(lv) > 1 { // lv = [type(1)][payload...]; subtract type byte
+				payloadBytes += len(lv) - 1
+			}
+		}
+	}
+	return
+}
+
 // marshal serialises e: [type byte][payload...].
 func (e *Event) marshal() []byte {
 	return append([]byte{e.Type}, e.Payload...)
-}
-
-// unmarshal parses e from wire bytes.
-func (e *Event) unmarshal(b []byte) error {
-	if len(b) < 1 {
-		return errors.New("wiresocket: event body too short")
-	}
-	e.Type = b[0]
-	if len(b) > 1 {
-		e.Payload = append([]byte(nil), b[1:]...)
-	}
-	return nil
 }
 
 // ─── wire helpers ─────────────────────────────────────────────────────────────

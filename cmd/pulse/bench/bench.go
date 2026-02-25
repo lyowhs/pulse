@@ -36,34 +36,17 @@ func Command() *cobra.Command {
 }
 
 // echoConn echoes every event received on benchChannel back to the sender.
-//
-// Receive and send run in separate goroutines (pipelined) so that incoming
-// events can be buffered while a send is in progress.  This prevents a
-// blocking Send (e.g. without coalescing) from stalling the Recv side and
-// leaving the incoming event buffer idle.
-//
-// The pipe is sized to match the channel's event buffer so that the recv
-// goroutine can always drain a full burst without blocking.
+// With server-side coalescing enabled, ch.Send is non-blocking (pushes into
+// the coalescer's input buffer and returns immediately), so a simple
+// sequential recv→send loop is sufficient.
 func echoConn(conn *wiresocket.Conn) {
 	ch := conn.Channel(benchChannel)
 	ctx := context.Background()
-
-	pipe := make(chan *wiresocket.Event, cap(ch.Events()))
-
-	// Recv goroutine: pull events off the channel into the pipe.
-	go func() {
-		defer close(pipe)
-		for {
-			e, err := ch.Recv(ctx)
-			if err != nil {
-				return
-			}
-			pipe <- e
+	for {
+		e, err := ch.Recv(ctx)
+		if err != nil {
+			return
 		}
-	}()
-
-	// Send loop: echo every queued event.
-	for e := range pipe {
 		if err := ch.Send(ctx, e); err != nil {
 			return
 		}

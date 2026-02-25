@@ -95,7 +95,8 @@ type session struct {
 	eventBuf int
 
 	// Closed to signal teardown.
-	done chan struct{}
+	done   chan struct{}
+	closed atomic.Bool // set to true before done is closed; enables a lock-free isDone fast-path
 
 	// How long without any received packet before declaring the peer dead.
 	timeout time.Duration
@@ -197,6 +198,7 @@ func (s *session) close() {
 			"remote_index", s.remoteIndex,
 			"remote_addr", s.remoteAddr.String(),
 		)
+		s.closed.Store(true)
 		close(s.done)
 		if s.onClose != nil {
 			s.onClose()
@@ -222,14 +224,8 @@ func (s *session) nextCounter() (uint64, bool) {
 }
 
 // isDone reports whether the session has been closed.
-func (s *session) isDone() bool {
-	select {
-	case <-s.done:
-		return true
-	default:
-		return false
-	}
-}
+// Uses an atomic flag rather than a channel-select for a cheaper hot-path read.
+func (s *session) isDone() bool { return s.closed.Load() }
 
 // writeRetry calls WriteToUDP and retries on ENOBUFS.
 // On macOS the kernel UDP send buffer returns ENOBUFS (errno 55) under load
@@ -306,6 +302,17 @@ func (s *session) send(frame *Frame) error {
 	return err
 }
 
+// fragSendBatch holds the per-call slices used by sendFragments.
+// Pooling them eliminates two heap allocations per fragmented-frame send
+// (msgs and bps) plus one [][]byte allocation per fragment (Buffers).
+type fragSendBatch struct {
+	msgs []ipv4.Message // passed directly to WriteBatch
+	bps  []*[]byte      // pool-buffer handles; returned to sendBufPool after send
+	bufs [][]byte       // backing for msgs[i].Buffers; avoids a [][]byte{} alloc per fragment
+}
+
+var fragSendPool = sync.Pool{New: func() any { return &fragSendBatch{} }}
+
 // sendFragments splits plain into s.maxFragPayload-sized chunks, encrypts each
 // into its own pool buffer, and sends all fragments in one WriteBatch syscall
 // (sendmmsg on Linux; a sendmsg loop on other platforms).
@@ -324,9 +331,27 @@ func (s *session) sendFragments(plain []byte) error {
 		"total_bytes", len(plain),
 	)
 
-	// Encrypt all fragments into separate pool buffers and build the batch.
-	msgs := make([]ipv4.Message, fragCount)
-	bps := make([]*[]byte, fragCount)
+	// Borrow a batch struct; grow its slices if the pooled copy is too small.
+	fb := fragSendPool.Get().(*fragSendBatch)
+	if cap(fb.msgs) < fragCount {
+		fb.msgs = make([]ipv4.Message, fragCount)
+		fb.bps = make([]*[]byte, fragCount)
+		fb.bufs = make([][]byte, fragCount)
+	} else {
+		fb.msgs = fb.msgs[:fragCount]
+		fb.bps = fb.bps[:fragCount]
+		fb.bufs = fb.bufs[:fragCount]
+	}
+	// Clear pointers and return fb to the pool on all exit paths.
+	defer func() {
+		clear(fb.msgs)
+		clear(fb.bps)
+		clear(fb.bufs)
+		fb.msgs = fb.msgs[:0]
+		fb.bps = fb.bps[:0]
+		fb.bufs = fb.bufs[:0]
+		fragSendPool.Put(fb)
+	}()
 
 	for i := 0; i < fragCount; i++ {
 		start := i * s.maxFragPayload
@@ -340,18 +365,23 @@ func (s *session) sendFragments(plain []byte) error {
 
 		bp := sendBufPool.Get().(*[]byte)
 		if cap(*bp) < totalSz+sizeAEADTag {
-			*bp = make([]byte, 0, totalSz+sizeAEADTag)
+			// Undersized buffer in pool (contamination from a previous bug).
+			// Replace with a correctly-sized one so the pool stays healthy.
+			// In practice totalSz+sizeAEADTag ≤ MaxPacketSize ≤ 65535 <
+			// pool-buffer capacity, so this branch is unreachable under normal
+			// conditions.
+			*bp = make([]byte, 0, 65535+sizeAEADTag)
 		}
 		buf := (*bp)[0:totalSz:cap(*bp)]
 
 		counter, ok := s.nextCounter()
 		if !ok {
-			// Return all buffers allocated so far, then the current one.
+			// Return buffers for already-built fragments plus the current one.
 			for j := 0; j < i; j++ {
-				sendBufPool.Put(bps[j])
+				sendBufPool.Put(fb.bps[j])
 			}
 			sendBufPool.Put(bp)
-			return ErrConnClosed
+			return ErrConnClosed // defer cleans up fb
 		}
 
 		// Data header.
@@ -376,10 +406,13 @@ func (s *session) sendFragments(plain []byte) error {
 
 		// Track the (possibly grown) backing array for pool return.
 		*bp = packet[:cap(*bp)]
-		bps[i] = bp
+		fb.bps[i] = bp
 
-		msgs[i] = ipv4.Message{
-			Buffers: [][]byte{packet},
+		// Store the packet ref in fb.bufs so msgs[i].Buffers can be a
+		// sub-slice of fb.bufs instead of a freshly-allocated [][]byte{packet}.
+		fb.bufs[i] = packet
+		fb.msgs[i] = ipv4.Message{
+			Buffers: fb.bufs[i : i+1 : i+1],
 			Addr:    s.remoteAddr,
 		}
 	}
@@ -393,7 +426,7 @@ func (s *session) sendFragments(plain []byte) error {
 	case s.pc != nil:
 		sent := 0
 		for sent < fragCount {
-			n, err := s.pc.WriteBatch(msgs[sent:], 0)
+			n, err := s.pc.WriteBatch(fb.msgs[sent:], 0)
 			sent += n
 			if err != nil {
 				if errors.Is(err, syscall.ENOBUFS) {
@@ -407,7 +440,7 @@ func (s *session) sendFragments(plain []byte) error {
 	case s.pc6 != nil:
 		sent := 0
 		for sent < fragCount {
-			n, err := s.pc6.WriteBatch(msgs[sent:], 0)
+			n, err := s.pc6.WriteBatch(fb.msgs[sent:], 0)
 			sent += n
 			if err != nil {
 				if errors.Is(err, syscall.ENOBUFS) {
@@ -419,7 +452,7 @@ func (s *session) sendFragments(plain []byte) error {
 			}
 		}
 	default:
-		for _, msg := range msgs {
+		for _, msg := range fb.msgs {
 			if err := s.writeRetry(msg.Buffers[0]); err != nil {
 				sendErr = err
 				break
@@ -427,7 +460,7 @@ func (s *session) sendFragments(plain []byte) error {
 		}
 	}
 
-	for _, bp := range bps {
+	for _, bp := range fb.bps {
 		sendBufPool.Put(bp)
 	}
 	if sendErr != nil {
@@ -718,28 +751,32 @@ func (s *session) receiveFragment(b []byte) bool {
 	}
 
 	complete := rbuf.received == rbuf.total
-	var assembled []byte
 	if complete {
-		total := 0
-		for _, f := range rbuf.frags {
-			total += len(f)
-		}
-		assembled = make([]byte, 0, total)
-		for _, f := range rbuf.frags {
-			assembled = append(assembled, f...)
-		}
-		// Return all pool buffers now that the data has been copied.
-		for _, fragBp := range rbuf.bufs {
-			if fragBp != nil {
-				recvBufPool.Put(fragBp)
-			}
-		}
+		// Remove from the map under the lock so no other worker can reach rbuf.
+		// The O(N) copy and pool returns happen outside the lock below.
 		delete(s.fragBufs, frameID)
 	}
 	s.fragMu.Unlock()
 
 	if !complete {
 		return true
+	}
+
+	// rbuf is exclusively ours: deleted from fragBufs while holding the lock,
+	// so no other goroutine can reach it.  Assemble the frame and return pool
+	// buffers outside the lock to avoid blocking concurrent fragment workers.
+	total := 0
+	for _, f := range rbuf.frags {
+		total += len(f)
+	}
+	assembled := make([]byte, 0, total)
+	for _, f := range rbuf.frags {
+		assembled = append(assembled, f...)
+	}
+	for _, fragBp := range rbuf.bufs {
+		if fragBp != nil {
+			recvBufPool.Put(fragBp)
+		}
 	}
 
 	now := time.Now().UnixNano()

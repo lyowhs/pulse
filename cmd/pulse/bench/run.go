@@ -114,11 +114,12 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
-		Addr:             addr,
-		PrivateKey:       kp.Private,
-		OnConnect:        echoConn,
-		MaxPacketSize:    mtu,
-		CoalesceInterval: coalesce,
+		Addr:                addr,
+		PrivateKey:          kp.Private,
+		OnConnect:           echoConn,
+		MaxPacketSize:       mtu,
+		CoalesceInterval:    coalesce,
+		MaxIncompleteFrames: 512,
 	})
 	if err != nil {
 		return [4]float64{}, err
@@ -173,17 +174,17 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	//
 	// inflightCap is chosen so that the number of frames simultaneously in
 	// the server's reassembly buffer stays within its MaxIncompleteFrames
-	// limit (64 by default).  Each coalescer flush produces one frame; the
+	// limit (512, set above).  Each coalescer flush produces one frame; the
 	// coalescer flushes after accumulating maxFrag bytes of payload, so
-	// eventsPerFrame = max(1, maxFrag/payloadSize).  Capping at 64 frames
-	// in flight (= 64 * eventsPerFrame events) keeps the reassembly buffer
+	// eventsPerFrame = max(1, maxFrag/payloadSize).  Capping at 512 frames
+	// in flight (= 512 * eventsPerFrame events) keeps the reassembly buffer
 	// from overflowing and silently dropping frames, which would cause the
 	// sender to block indefinitely waiting for echoes that never arrive.
 	const (
-		sizeDataHdr    = 16
-		sizeFragHdr    = 8
-		sizeAEAD       = 16
-		maxReassembly  = 64 // mirrors wiresocket.maxReassemblyBufs default
+		sizeDataHdr   = 16
+		sizeFragHdr   = 8
+		sizeAEAD      = 16
+		maxReassembly = 512 // matches MaxIncompleteFrames set on the benchmark server
 	)
 	maxFrag := mtu - sizeDataHdr - sizeFragHdr - sizeAEAD
 	eventsPerFrame := 1
