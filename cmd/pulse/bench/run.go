@@ -159,18 +159,60 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	benchCtx, benchCancel := context.WithTimeout(context.Background(), dur)
 	defer benchCancel()
 
-	// Receiver goroutine.
+	// drainCtx outlives benchCtx so the receiver can collect echoes that
+	// were already in-flight when the benchmark window closed.
+	drainCtx, drainCancel := context.WithCancel(context.Background())
+	defer drainCancel()
+
+	// tokens is a sliding-window semaphore: the sender must hold a token
+	// for each event it has sent but not yet received an echo for.  This
+	// prevents the sender from racing so far ahead of the echo path that
+	// it starves the server goroutines, the client read-loop, and the
+	// receiver goroutine of CPU time — which would make rx appear near-zero
+	// even when the echo path is working correctly.
+	//
+	// inflightCap is chosen so that the number of frames simultaneously in
+	// the server's reassembly buffer stays within its MaxIncompleteFrames
+	// limit (64 by default).  Each coalescer flush produces one frame; the
+	// coalescer flushes after accumulating maxFrag bytes of payload, so
+	// eventsPerFrame = max(1, maxFrag/payloadSize).  Capping at 64 frames
+	// in flight (= 64 * eventsPerFrame events) keeps the reassembly buffer
+	// from overflowing and silently dropping frames, which would cause the
+	// sender to block indefinitely waiting for echoes that never arrive.
+	const (
+		sizeDataHdr    = 16
+		sizeFragHdr    = 8
+		sizeAEAD       = 16
+		maxReassembly  = 64 // mirrors wiresocket.maxReassemblyBufs default
+	)
+	maxFrag := mtu - sizeDataHdr - sizeFragHdr - sizeAEAD
+	eventsPerFrame := 1
+	if maxFrag > 0 && payloadSize < maxFrag {
+		eventsPerFrame = maxFrag / payloadSize
+	}
+	inflightCap := maxReassembly * eventsPerFrame
+	tokens := make(chan struct{}, inflightCap)
+	for i := 0; i < inflightCap; i++ {
+		tokens <- struct{}{}
+	}
+
+	// Receiver goroutine — uses drainCtx so it outlives benchCtx.
 	var rxDone sync.WaitGroup
 	rxDone.Add(1)
 	go func() {
 		defer rxDone.Done()
 		for {
-			e, err := ch.Recv(benchCtx)
+			e, err := ch.Recv(drainCtx)
 			if err != nil {
 				return
 			}
 			rxMsgs.Add(1)
 			rxBytes.Add(int64(len(e.Payload)))
+			// Return the token so the sender can issue another event.
+			select {
+			case tokens <- struct{}{}:
+			default: // sender already stopped; discard
+			}
 		}
 	}()
 
@@ -181,6 +223,14 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 		defer txDone.Done()
 		e := &wiresocket.Event{Type: 1, Payload: payload}
 		for {
+			// Acquire a token before sending; block here when the echo
+			// path falls behind, naturally yielding CPU to server and
+			// receiver goroutines.
+			select {
+			case <-benchCtx.Done():
+				return
+			case <-tokens:
+			}
 			if err := ch.Send(benchCtx, e); err != nil {
 				return
 			}
@@ -191,6 +241,10 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 
 	<-benchCtx.Done()
 	txDone.Wait()
+	// Allow the receiver to drain echoes that were already in-flight when
+	// the benchmark window closed.
+	time.Sleep(500 * time.Millisecond)
+	drainCancel()
 	rxDone.Wait()
 
 	secs := dur.Seconds()

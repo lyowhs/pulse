@@ -37,7 +37,11 @@
       "Bash(ssh:*)",
       "Bash(scp:*)",
       "Bash(netstat:*)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "Bash(go version:*)",
+      "Bash(curl:*)",
+      "Bash(PATH=$PATH:/usr/local/go/bin go build:*)",
+      "Bash(PATH=$PATH:/usr/local/go/bin go run:*)"
     ]
   }
 }
