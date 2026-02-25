@@ -20,15 +20,45 @@ type Event struct {
 
 // Frame batches one or more Events for a single channel into one encrypted UDP
 // payload.  All events in a frame share the same ChannelId.
+//
+// The reliability fields (Seq, AckSeq, AckBitmap, WindowSize) are optional:
+// zero values are omitted from the wire encoding and ignored on receipt,
+// preserving backward compatibility with peers that do not implement reliable
+// delivery.
 type Frame struct {
 	ChannelId uint8
 	Events    []*Event
+
+	// Seq is the sender's frame sequence number for reliable channels.
+	// 0 means the frame is unreliable (no ACK expected).
+	// Reliable senders assign values starting at 1.
+	Seq uint32
+
+	// AckSeq is a cumulative ACK: the sender has received all reliable frames
+	// with sequence numbers 1..AckSeq in order.  0 means nothing received yet.
+	AckSeq uint32
+
+	// AckBitmap is a selective-ACK (SACK) bitmap.  Bit i (LSB = bit 0) is set
+	// when the sender has received the frame with sequence number AckSeq+i+1
+	// out of order.
+	AckBitmap uint64
+
+	// WindowSize is the number of additional reliable frames the sender of this
+	// frame can accept.  Carried in ACK frames to implement flow control.
+	WindowSize uint32
 }
 
 // AppendMarshal appends the frame's wire encoding to dst and returns the
 // extended slice.  It is allocation-free when dst has sufficient capacity.
-// Wire format: [channel_id(1)] [field-1 LEN event-body]...
-// where event-body = [type(1)][payload...].
+//
+// Wire format:
+//
+//	[channel_id(1)]
+//	[field-1 LEN event-body]...       where event-body = [type(1)][payload...]
+//	[field-2 varint Seq]              omitted when Seq == 0
+//	[field-3 varint AckSeq]           omitted when AckSeq == 0
+//	[field-4 I64 AckBitmap]           omitted when AckBitmap == 0
+//	[field-5 varint WindowSize]       omitted when WindowSize == 0
 func (f *Frame) AppendMarshal(dst []byte) []byte {
 	dst = append(dst, f.ChannelId)
 	for _, e := range f.Events {
@@ -37,6 +67,31 @@ func (f *Frame) AppendMarshal(dst []byte) []byte {
 		dst = appendVarint(dst, uint64(body))
 		dst = append(dst, e.Type)
 		dst = append(dst, e.Payload...)
+	}
+	if f.Seq != 0 {
+		dst = appendVarint(dst, 0x10) // field 2, wire type 0 (varint)
+		dst = appendVarint(dst, uint64(f.Seq))
+	}
+	if f.AckSeq != 0 {
+		dst = appendVarint(dst, 0x18) // field 3, wire type 0 (varint)
+		dst = appendVarint(dst, uint64(f.AckSeq))
+	}
+	if f.AckBitmap != 0 {
+		dst = appendVarint(dst, 0x21) // field 4, wire type 1 (I64)
+		dst = append(dst,
+			byte(f.AckBitmap),
+			byte(f.AckBitmap>>8),
+			byte(f.AckBitmap>>16),
+			byte(f.AckBitmap>>24),
+			byte(f.AckBitmap>>32),
+			byte(f.AckBitmap>>40),
+			byte(f.AckBitmap>>48),
+			byte(f.AckBitmap>>56),
+		)
+	}
+	if f.WindowSize != 0 {
+		dst = appendVarint(dst, 0x28) // field 5, wire type 0 (varint)
+		dst = appendVarint(dst, uint64(f.WindowSize))
 	}
 	return dst
 }
@@ -82,12 +137,13 @@ func UnmarshalFrame(b []byte) (*Frame, error) {
 	f.Events = make([]*Event, 0, nEvents)
 	i := 0
 	for len(body) > 0 {
-		field, wt, _, lv, rest, err := consumeField(body)
+		field, wt, val, lv, rest, err := consumeField(body)
 		if err != nil {
 			return nil, err
 		}
 		body = rest
-		if field == 1 && wt == 2 {
+		switch {
+		case field == 1 && wt == 2:
 			if len(lv) < 1 {
 				return nil, errors.New("wiresocket: event body too short")
 			}
@@ -103,6 +159,14 @@ func UnmarshalFrame(b []byte) (*Frame, error) {
 			}
 			f.Events = append(f.Events, e)
 			i++
+		case field == 2 && wt == 0:
+			f.Seq = uint32(val)
+		case field == 3 && wt == 0:
+			f.AckSeq = uint32(val)
+		case field == 4 && wt == 1:
+			f.AckBitmap = val
+		case field == 5 && wt == 0:
+			f.WindowSize = uint32(val)
 		}
 	}
 	return f, nil

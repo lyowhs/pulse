@@ -80,11 +80,16 @@ type session struct {
 	pc  *ipv4.PacketConn
 	pc6 *ipv6.PacketConn
 
-	// router is called directly from the receive hot-path to deliver decoded
-	// events to their destination channel.  Set once by Conn.wireSession
-	// before the read-loop goroutine starts; never modified after that, so no
-	// synchronisation is needed beyond the goroutine-start happens-before.
-	router func(channelId uint8, e *Event)
+	// router is called directly from the receive hot-path to deliver a decoded
+	// Frame (with all reliability fields intact) to the Conn-level dispatcher.
+	// Set once by Conn.wireSession before the read-loop goroutine starts;
+	// never modified after that, so no synchronisation is needed beyond the
+	// goroutine-start happens-before.
+	router func(frame *Frame)
+
+	// rateLimiter, when non-nil, throttles outgoing bytes to a configured
+	// rate.  nil means unlimited (zero overhead on the send hot-path).
+	rateLimiter *tokenBucket
 
 	// onClose, if non-nil, is called once by close() to propagate teardown.
 	// Used by non-persistent Conns to close all channels when the session ends.
@@ -130,6 +135,7 @@ func newSession(
 	keepalive time.Duration,
 	maxFragBufs int,
 	maxFragPayload int,
+	sendRateLimitBPS int64,
 ) *session {
 	sendAEAD, err := chacha20poly1305.New(sendKey[:])
 	if err != nil {
@@ -156,6 +162,11 @@ func newSession(
 		}
 	}
 
+	var rl *tokenBucket
+	if sendRateLimitBPS > 0 {
+		rl = newTokenBucket(sendRateLimitBPS)
+	}
+
 	s := &session{
 		sendKey:        sendKey,
 		recvKey:        recvKey,
@@ -174,6 +185,7 @@ func newSession(
 		timeout:        timeout,
 		keepalive:      keepalive,
 		maxFragBufs:    maxFragBufs,
+		rateLimiter:    rl,
 	}
 	now := time.Now().UnixNano()
 	s.lastRecv.Store(now)
@@ -262,6 +274,15 @@ func (s *session) send(frame *Frame) error {
 		return err
 	}
 
+	// Rate limit: account for header + ciphertext + AEAD tag.
+	if s.rateLimiter != nil {
+		n := len(plain) + sizeDataHeader + sizeAEADTag
+		if err := s.rateLimiter.wait(s.done, n); err != nil {
+			sendBufPool.Put(bp)
+			return err
+		}
+	}
+
 	counter, ok := s.nextCounter()
 	if !ok {
 		sendBufPool.Put(bp)
@@ -322,6 +343,14 @@ func (s *session) sendFragments(plain []byte) error {
 	fragCount := (len(plain) + s.maxFragPayload - 1) / s.maxFragPayload
 	if fragCount > 65535 {
 		return errors.New("wiresocket: frame too large to fragment (exceeds 65535 fragments)")
+	}
+
+	// Rate limit the entire frame up front: total on-wire bytes for all fragments.
+	if s.rateLimiter != nil {
+		n := len(plain) + fragCount*(sizeDataHeader+sizeFragmentHeader+sizeAEADTag)
+		if err := s.rateLimiter.wait(s.done, n); err != nil {
+			return err
+		}
 	}
 
 	frameID := s.fragCounter.Add(1)
@@ -631,9 +660,7 @@ func (s *session) receive(b []byte) bool {
 		"events", len(frame.Events),
 	)
 	if r := s.router; r != nil {
-		for _, e := range frame.Events {
-			r(frame.ChannelId, e)
-		}
+		r(frame)
 	}
 	return true
 }
@@ -808,9 +835,7 @@ func (s *session) receiveFragment(b []byte) bool {
 		"events", len(frame.Events),
 	)
 	if r := s.router; r != nil {
-		for _, e := range frame.Events {
-			r(frame.ChannelId, e)
-		}
+		r(frame)
 	}
 	return true
 }

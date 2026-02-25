@@ -31,6 +31,10 @@ type Channel struct {
 	events    chan *Event
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// reliable is non-nil when reliable delivery is enabled on this channel.
+	// nil means fire-and-forget (zero overhead on the send/receive hot-paths).
+	reliable *reliableState
 }
 
 func newChannel(id uint8, conn *Conn, bufSize int) *Channel {
@@ -46,6 +50,23 @@ func newChannel(id uint8, conn *Conn, bufSize int) *Channel {
 // ID returns this channel's identifier.
 func (ch *Channel) ID() uint8 { return ch.id }
 
+// SetReliable enables reliable delivery and window-based flow control on this
+// channel.  It must be called before the first Send or Recv.
+//
+// When reliable mode is active:
+//   - Each sent frame is assigned a sequence number and buffered until ACKed.
+//   - The sender blocks when the peer's receive window is exhausted (flow control).
+//   - Lost frames are retransmitted automatically with exponential backoff.
+//   - Received frames are delivered in order; out-of-order arrivals are buffered.
+//   - ACKs are piggybacked on outgoing data frames; standalone ACK packets are
+//     sent after at most cfg.ACKDelay when no data is flowing.
+//
+// Both sides of a channel must coordinate: the sender calls SetReliable to opt
+// in; the receiver detects reliable frames automatically (via the Seq field).
+func (ch *Channel) SetReliable(cfg ReliableCfg) {
+	ch.reliable = newReliableState(ch, cfg)
+}
+
 // Send sends an event on this channel to the remote peer.
 //
 // For persistent conns, if the connection is currently down, Send blocks until
@@ -54,6 +75,9 @@ func (ch *Channel) ID() uint8 { return ch.id }
 //
 // When coalescing is enabled, Send enqueues the event and returns immediately;
 // the coalescer goroutine batches it with other pending events before sending.
+//
+// When reliable mode is active (SetReliable was called), Send may block until
+// the remote peer's receive window has space.
 func (ch *Channel) Send(ctx context.Context, e *Event) error {
 	if c := ch.conn.coalescer; c != nil {
 		select {
@@ -82,8 +106,19 @@ func (ch *Channel) Send(ctx context.Context, e *Event) error {
 		if err != nil {
 			return err
 		}
-		dbg("channel send", "channel_id", ch.id, "event_type", e.Type)
-		err = sess.send(&Frame{ChannelId: ch.id, Events: []*Event{e}})
+		frame := &Frame{ChannelId: ch.id, Events: []*Event{e}}
+		if ch.reliable != nil {
+			dbg("channel send (reliable)", "channel_id", ch.id, "event_type", e.Type)
+			if err := ch.reliable.preSend(frame); err != nil {
+				if err == ErrConnClosed && ch.conn.isPersistent() {
+					continue
+				}
+				return err
+			}
+		} else {
+			dbg("channel send", "channel_id", ch.id, "event_type", e.Type)
+		}
+		err = sess.send(frame)
 		if err == ErrConnClosed && ch.conn.isPersistent() {
 			dbg("channel send: connection lost, waiting for reconnect", "channel_id", ch.id)
 			continue

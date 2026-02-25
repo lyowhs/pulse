@@ -120,30 +120,64 @@ func (c *Conn) currentSession(ctx context.Context) (*session, error) {
 // in the Go memory model, so no extra synchronisation is needed for visibility
 // of sess.router inside the read-loop goroutine.
 func (c *Conn) wireSession(sess *session) {
-	sess.router = func(channelId uint8, e *Event) {
-		if e.Type == channelCloseType {
-			dbg("conn: channel close from peer", "channel_id", channelId)
-			if ch := c.channels[channelId].Swap(nil); ch != nil {
-				ch.closeLocal()
+	sess.router = func(f *Frame) {
+		ch := c.getOrOpenChannel(f.ChannelId)
+
+		// Process any piggybacked or standalone ACK.
+		if f.AckSeq != 0 {
+			if rs := ch.reliable; rs != nil {
+				rs.onAck(f.AckSeq, f.AckBitmap, f.WindowSize)
 			}
+		}
+
+		// Reliable data frame.
+		if f.Seq != 0 {
+			rs := ch.reliable
+			if rs == nil {
+				// Auto-create receive-side state for channels that did not
+				// call SetReliable but are receiving reliable frames.
+				rs = newAutoReliable(ch)
+				ch.reliable = rs
+			}
+			rs.onRecv(f.Seq, f)
 			return
 		}
-		ch := c.getOrOpenChannel(channelId)
-		// Deliver to the channel's buffer; drop oldest on overflow.
-		select {
-		case ch.events <- e:
-		default:
-			dbg("conn: channel buffer full, dropping oldest", "channel_id", channelId)
-			select {
-			case <-ch.events:
-			default:
+
+		// Unreliable frame: deliver events directly.
+		for _, e := range f.Events {
+			if e.Type == channelCloseType {
+				dbg("conn: channel close from peer", "channel_id", f.ChannelId)
+				if existing := c.channels[f.ChannelId].Swap(nil); existing != nil {
+					existing.closeLocal()
+				}
+				return
 			}
+			// Deliver to the channel's buffer; drop oldest on overflow.
 			select {
 			case ch.events <- e:
 			default:
+				dbg("conn: channel buffer full, dropping oldest", "channel_id", f.ChannelId)
+				select {
+				case <-ch.events:
+				default:
+				}
+				select {
+				case ch.events <- e:
+				default:
+				}
 			}
 		}
 	}
+
+	// Reset reliable state on all open channels when a new session is wired.
+	// For persistent conns this fires on every reconnect, purging unACKed frames
+	// from the old session (which is now dead) and waking blocked senders.
+	for i := range c.channels {
+		if ch := c.channels[i].Load(); ch != nil && ch.reliable != nil {
+			ch.reliable.reset()
+		}
+	}
+
 	// For non-persistent conns, close all channels when the session tears down.
 	if !c.isPersistent() {
 		sess.onClose = func() {

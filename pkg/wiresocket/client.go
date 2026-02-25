@@ -71,6 +71,11 @@ type DialConfig struct {
 	// and syscall overhead at the cost of added latency equal to the interval.
 	// Typical values: 50µs–1ms.  Zero disables coalescing (default).
 	CoalesceInterval time.Duration
+
+	// SendRateLimitBPS, if non-zero, limits the outgoing byte rate to
+	// approximately this many bytes per second.  A burst of up to 2× the
+	// per-second rate is allowed before throttling begins.  0 means unlimited.
+	SendRateLimitBPS int64
 }
 
 func (cfg *DialConfig) defaults() {
@@ -272,7 +277,7 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 			)
 			sendKey, recvKey := hs.TransportKeys(true)
 			maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
-			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize, cfg.SessionTimeout, cfg.KeepaliveInterval, cfg.MaxIncompleteFrames, maxFrag)
+			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize, cfg.SessionTimeout, cfg.KeepaliveInterval, cfg.MaxIncompleteFrames, maxFrag, cfg.SendRateLimitBPS)
 			return raddr, conn, sess, nil
 
 		case typeCookieReply:

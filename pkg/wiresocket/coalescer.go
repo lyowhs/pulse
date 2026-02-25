@@ -76,13 +76,26 @@ func (c *coalescer) run() {
 		timerC = nil
 	}
 
+	// sendFrame sends a frame, routing through the reliable path when applicable.
+	sendFrame := func(sess *session, chId uint8, events []*Event) {
+		frame := &Frame{ChannelId: chId, Events: events}
+		if ch := c.conn.channels[chId].Load(); ch != nil && ch.reliable != nil {
+			if err := ch.reliable.preSend(frame); err != nil {
+				dbg("coalescer: reliable preSend failed, dropping events",
+					"channel_id", chId, "count", len(events), "err", err)
+				return
+			}
+		}
+		if err := sess.send(frame); err != nil {
+			dbg("coalescer: send failed, dropping events",
+				"channel_id", chId, "count", len(events), "err", err)
+		}
+	}
+
 	// flushAll sends all pending channels and clears the maps.
 	flushAll := func(sess *session) {
 		for chId, events := range pending {
-			if err := sess.send(&Frame{ChannelId: chId, Events: events}); err != nil {
-				dbg("coalescer: send failed, dropping events",
-					"channel_id", chId, "count", len(events), "err", err)
-			}
+			sendFrame(sess, chId, events)
 			delete(pending, chId)
 			delete(pendingBytes, chId)
 		}
@@ -91,10 +104,7 @@ func (c *coalescer) run() {
 	// flushOne sends and clears a single channel's pending events.
 	flushOne := func(sess *session, chId uint8) {
 		if events := pending[chId]; len(events) > 0 {
-			if err := sess.send(&Frame{ChannelId: chId, Events: events}); err != nil {
-				dbg("coalescer: send failed, dropping events",
-					"channel_id", chId, "count", len(events), "err", err)
-			}
+			sendFrame(sess, chId, events)
 			delete(pending, chId)
 			delete(pendingBytes, chId)
 		}

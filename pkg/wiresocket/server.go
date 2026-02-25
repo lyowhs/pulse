@@ -76,6 +76,11 @@ type ServerConfig struct {
 	// CoalesceInterval, if non-zero, enables event coalescing on server-side
 	// connections.  See DialConfig.CoalesceInterval for details.
 	CoalesceInterval time.Duration
+
+	// SendRateLimitBPS, if non-zero, limits the outgoing byte rate per session
+	// to approximately this many bytes per second.  A burst of up to 2× the
+	// per-second rate is allowed before throttling begins.  0 means unlimited.
+	SendRateLimitBPS int64
 }
 
 func (cfg *ServerConfig) defaults() {
@@ -437,7 +442,7 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	}
 
 	sendKey, recvKey := hs.TransportKeys(false) // false = responder
-	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize, s.cfg.SessionTimeout, s.cfg.KeepaliveInterval, s.cfg.MaxIncompleteFrames, s.maxFragPayload)
+	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize, s.cfg.SessionTimeout, s.cfg.KeepaliveInterval, s.cfg.MaxIncompleteFrames, s.maxFragPayload, s.cfg.SendRateLimitBPS)
 
 	// Wire the router before storing the session or sending the response.
 	// Once the session is visible to other workers (via sessions.Store) and
