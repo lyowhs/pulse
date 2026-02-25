@@ -102,6 +102,42 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	fmt.Fprintf(os.Stderr, "  running mtu=%-5d payload=%-10s duration=%s …\n",
 		mtu, fmtSize(int64(payloadSize)), dur)
 
+	// Compute pipeline parameters before starting the server and client so
+	// both can be configured consistently.
+	//
+	// eventsPerFrame: maximum events in one coalesced UDP packet.  With
+	// coalescing disabled each packet carries exactly one event.
+	//
+	// inflightCap: token-semaphore capacity.  Capping at maxReassembly frames
+	// (= 512 * eventsPerFrame events) keeps the server's reassembly buffer
+	// within its MaxIncompleteFrames limit and prevents the sender from racing
+	// so far ahead that it starves the echo path.
+	//
+	// eventBufSize: ch.events channel depth on both server and client.  The
+	// server read loop calls ipv4.ReadBatch with a window of srvReadBatchSz=64
+	// packets; the router delivers all events from that batch before the
+	// consumer goroutine (echoConn / bench receiver) can run.  If ch.events
+	// overflows the drop-oldest policy discards an event whose token is never
+	// returned, stalling the sender.  Using srvReadBatchSz*eventsPerFrame as
+	// a floor prevents any drops regardless of goroutine scheduling.
+	const (
+		sizeDataHdr    = 16
+		sizeFragHdr    = 8
+		sizeAEAD       = 16
+		maxReassembly  = 512 // matches MaxIncompleteFrames set on the benchmark server
+		srvReadBatchSz = 64  // server.go readBatchSz
+	)
+	maxFrag := mtu - sizeDataHdr - sizeFragHdr - sizeAEAD
+	eventsPerFrame := 1
+	if coalesce > 0 && maxFrag > 0 && payloadSize < maxFrag {
+		eventsPerFrame = maxFrag / payloadSize
+	}
+	inflightCap := maxReassembly * eventsPerFrame
+	eventBufSize := 256
+	if burst := srvReadBatchSz * eventsPerFrame; burst > eventBufSize {
+		eventBufSize = burst
+	}
+
 	kp, err := wiresocket.GenerateKeypair()
 	if err != nil {
 		return [4]float64{}, err
@@ -120,6 +156,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 		MaxPacketSize:       mtu,
 		CoalesceInterval:    coalesce,
 		MaxIncompleteFrames: 512,
+		EventBufSize:        eventBufSize,
 	})
 	if err != nil {
 		return [4]float64{}, err
@@ -146,6 +183,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 		MaxRetries:       10,
 		MaxPacketSize:    mtu,
 		CoalesceInterval: coalesce,
+		EventBufSize:     eventBufSize,
 	})
 	if err != nil {
 		return [4]float64{}, fmt.Errorf("dial: %w", err)
@@ -166,32 +204,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	defer drainCancel()
 
 	// tokens is a sliding-window semaphore: the sender must hold a token
-	// for each event it has sent but not yet received an echo for.  This
-	// prevents the sender from racing so far ahead of the echo path that
-	// it starves the server goroutines, the client read-loop, and the
-	// receiver goroutine of CPU time — which would make rx appear near-zero
-	// even when the echo path is working correctly.
-	//
-	// inflightCap is chosen so that the number of frames simultaneously in
-	// the server's reassembly buffer stays within its MaxIncompleteFrames
-	// limit (512, set above).  Each coalescer flush produces one frame; the
-	// coalescer flushes after accumulating maxFrag bytes of payload, so
-	// eventsPerFrame = max(1, maxFrag/payloadSize).  Capping at 512 frames
-	// in flight (= 512 * eventsPerFrame events) keeps the reassembly buffer
-	// from overflowing and silently dropping frames, which would cause the
-	// sender to block indefinitely waiting for echoes that never arrive.
-	const (
-		sizeDataHdr   = 16
-		sizeFragHdr   = 8
-		sizeAEAD      = 16
-		maxReassembly = 512 // matches MaxIncompleteFrames set on the benchmark server
-	)
-	maxFrag := mtu - sizeDataHdr - sizeFragHdr - sizeAEAD
-	eventsPerFrame := 1
-	if maxFrag > 0 && payloadSize < maxFrag {
-		eventsPerFrame = maxFrag / payloadSize
-	}
-	inflightCap := maxReassembly * eventsPerFrame
+	// for each event it has sent but not yet received an echo for.
 	tokens := make(chan struct{}, inflightCap)
 	for i := 0; i < inflightCap; i++ {
 		tokens <- struct{}{}
