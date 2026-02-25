@@ -43,6 +43,13 @@ func runBench(cmd *cobra.Command, _ []string) error {
 		txGbps   float64
 		rxMsgS   float64
 		rxGbps   float64
+		// drained: echoes received during the post-timer drain window.
+		// These appeared missing when the timer fired but came back before
+		// the connection was torn down — timer-caused apparent loss.
+		drained int64
+		// lost: echoes that never arrived even after the full drain.
+		// These represent genuine packet drops on the loopback path.
+		lost int64
 	}
 	var results []result
 
@@ -53,26 +60,52 @@ func runBench(cmd *cobra.Command, _ []string) error {
 			if err != nil {
 				return fmt.Errorf("bench mtu=%d size=%d: %w", mtu, size, err)
 			}
-			results = append(results, result{mtu: mtu, size: size, skipped: skipped,
-				txMsgS: r[0], txGbps: r[1], rxMsgS: r[2], rxGbps: r[3]})
+			results = append(results, result{
+				mtu:     mtu,
+				size:    size,
+				skipped: skipped,
+				txMsgS:  r.txMsgS,
+				txGbps:  r.txGbps,
+				rxMsgS:  r.rxMsgS,
+				rxGbps:  r.rxGbps,
+				drained: r.drained,
+				lost:    r.lost,
+			})
 		}
 	}
 
 	// Summary table.
-	fmt.Fprintf(os.Stdout, "\n  ─── summary ──────────────────────────────────────────────────────────\n")
-	fmt.Fprintf(os.Stdout, "  %6s  %8s  %10s  %10s  %10s  %10s\n",
-		"MTU", "payload", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s")
+	fmt.Fprintf(os.Stdout, "\n  ─── summary ──────────────────────────────────────────────────────────────────────\n")
+	fmt.Fprintf(os.Stdout, "  %6s  %8s  %10s  %10s  %10s  %10s  %8s  %8s\n",
+		"MTU", "payload", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s", "drained", "lost")
 	for _, r := range results {
 		if r.skipped {
-			fmt.Fprintf(os.Stdout, "  %6d  %8s  %10s  %10s  %10s  %10s\n",
-				r.mtu, fmtSize(int64(r.size)), "N/A", "N/A", "N/A", "N/A")
+			fmt.Fprintf(os.Stdout, "  %6d  %8s  %10s  %10s  %10s  %10s  %8s  %8s\n",
+				r.mtu, fmtSize(int64(r.size)), "N/A", "N/A", "N/A", "N/A", "N/A", "N/A")
 			continue
 		}
-		fmt.Fprintf(os.Stdout, "  %6d  %8s  %10.0f  %10.3f  %10.0f  %10.3f\n",
+		fmt.Fprintf(os.Stdout, "  %6d  %8s  %10.0f  %10.3f  %10.0f  %10.3f  %8d  %8d\n",
 			r.mtu, fmtSize(int64(r.size)),
-			r.txMsgS, r.txGbps, r.rxMsgS, r.rxGbps)
+			r.txMsgS, r.txGbps, r.rxMsgS, r.rxGbps, r.drained, r.lost)
 	}
 	return nil
+}
+
+// oneResult holds the output of a single runOne sub-benchmark.
+type oneResult struct {
+	txMsgS float64
+	txGbps float64
+	// rxMsgS is the receive rate during the benchmark window only (excludes
+	// echoes recovered during the post-timer drain).
+	rxMsgS float64
+	rxGbps float64
+	// drained is the number of echoes received during the post-timer drain
+	// window.  These were in-flight when the benchmark timer fired and are
+	// not genuine losses — they are timer-caused apparent loss.
+	drained int64
+	// lost is the number of sent events whose echo never arrived, even after
+	// the full drain.  These are genuine packet drops.
+	lost int64
 }
 
 // maxPayloadForMTU returns the maximum single-frame payload in bytes for the
@@ -90,14 +123,14 @@ func maxPayloadForMTU(mtu int) int {
 }
 
 // runOne starts an in-process echo server + client, drives traffic for dur,
-// and returns [txMsgS, txGbps, rxMsgS, rxGbps].
-// Returns an all-zero result (not an error) when the payload cannot be sent
-// at the given MTU.
-func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4]float64, error) {
+// and returns throughput metrics plus loss accounting.
+// Returns a zero result (not an error) when the payload cannot be sent at the
+// given MTU.
+func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (oneResult, error) {
 	if payloadSize > maxPayloadForMTU(mtu) {
 		fmt.Fprintf(os.Stderr, "  skipping mtu=%-5d payload=%-10s — exceeds 255-fragment limit\n",
 			mtu, fmtSize(int64(payloadSize)))
-		return [4]float64{}, nil
+		return oneResult{}, nil
 	}
 	fmt.Fprintf(os.Stderr, "  running mtu=%-5d payload=%-10s duration=%s …\n",
 		mtu, fmtSize(int64(payloadSize)), dur)
@@ -140,12 +173,12 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 
 	kp, err := wiresocket.GenerateKeypair()
 	if err != nil {
-		return [4]float64{}, err
+		return oneResult{}, err
 	}
 
 	port, err := freeUDPPort()
 	if err != nil {
-		return [4]float64{}, err
+		return oneResult{}, err
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -159,7 +192,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 		EventBufSize:        eventBufSize,
 	})
 	if err != nil {
-		return [4]float64{}, err
+		return oneResult{}, err
 	}
 
 	srvCtx, srvCancel := context.WithCancel(context.Background())
@@ -186,7 +219,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 		EventBufSize:     eventBufSize,
 	})
 	if err != nil {
-		return [4]float64{}, fmt.Errorf("dial: %w", err)
+		return oneResult{}, fmt.Errorf("dial: %w", err)
 	}
 
 	ch := conn.Channel(benchChannel)
@@ -255,10 +288,15 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 	<-benchCtx.Done()
 	txDone.Wait()
 
+	// Snapshot counts at timer expiry before the drain runs.  The difference
+	// txAtStop - rxAtStop is the number of echoes outstanding at that moment;
+	// some will arrive during drain (timer-caused apparent loss), the rest are
+	// genuine drops.
+	txAtStop := txMsgs.Load()
+	rxAtStop := rxMsgs.Load()
+
 	// Graceful drain: Close flushes the coalescer and waits for the echo
 	// server to ACK any in-flight events before sending the disconnect.
-	// This replaces the old fixed 500 ms sleep and makes the drain time
-	// observable rather than a hidden implementation detail.
 	drainStart := time.Now()
 	conn.Close()
 	drainElapsed := time.Since(drainStart)
@@ -270,14 +308,23 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) ([4
 
 	fmt.Fprintf(os.Stderr, "  drain: %s\n", drainElapsed.Round(time.Millisecond))
 
+	finalRx := rxMsgs.Load()
+	// drained: echoes that arrived during the drain window — in-flight when
+	// the timer fired, not genuine loss.
+	drained := finalRx - rxAtStop
+	// lost: echoes never received even after full drain — genuine drops.
+	lost := txAtStop - finalRx
+
 	secs := dur.Seconds()
 	tx := txBytes.Load()
 	rx := rxBytes.Load()
-	return [4]float64{
-		float64(txMsgs.Load()) / secs,
-		float64(tx) * 8 / 1e9 / secs,
-		float64(rxMsgs.Load()) / secs,
-		float64(rx) * 8 / 1e9 / secs,
+	return oneResult{
+		txMsgS:  float64(txAtStop) / secs,
+		txGbps:  float64(tx) * 8 / 1e9 / secs,
+		rxMsgS:  float64(rxAtStop) / secs,
+		rxGbps:  float64(rx) * 8 / 1e9 / secs,
+		drained: drained,
+		lost:    lost,
 	}, nil
 }
 
