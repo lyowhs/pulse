@@ -3,6 +3,8 @@ package bench
 import (
 	"context"
 	"fmt"
+	"math"
+	"math/bits"
 	"net"
 	"os"
 	"sync"
@@ -26,6 +28,7 @@ throughput for each combination of --size and --mtu.  No second terminal needed.
 	cmd.Flags().IntSlice("mtu", []int{1472}, "UDP payload MTU(s) to sweep (comma-separated or repeated)")
 	cmd.Flags().IntSlice("size", []int{1024, 64 * 1024, 512 * 1024}, "payload size(s) in bytes to sweep")
 	cmd.Flags().Duration("coalesce", 200*time.Microsecond, "coalesce interval; 0 disables")
+	cmd.Flags().Bool("reliable", false, "enable reliable delivery on the bench channel")
 	return cmd
 }
 
@@ -34,6 +37,7 @@ func runBench(cmd *cobra.Command, _ []string) error {
 	mtus, _ := cmd.Flags().GetIntSlice("mtu")
 	sizes, _ := cmd.Flags().GetIntSlice("size")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
+	reliable, _ := cmd.Flags().GetBool("reliable")
 
 	type result struct {
 		mtu      int
@@ -43,50 +47,54 @@ func runBench(cmd *cobra.Command, _ []string) error {
 		txGbps   float64
 		rxMsgS   float64
 		rxGbps   float64
-		// drained: echoes received during the post-timer drain window.
-		// These appeared missing when the timer fired but came back before
-		// the connection was torn down — timer-caused apparent loss.
-		drained int64
-		// lost: echoes that never arrived even after the full drain.
-		// These represent genuine packet drops on the loopback path.
-		lost int64
+		lossRate float64 // lost / tx * 100
+		drained  int64   // echoes recovered during drain (timer-caused apparent loss)
+		lost     int64   // echoes never received (genuine drops)
+		p50      string  // median round-trip time
+		p99      string  // 99th-percentile round-trip time
+		retx     int64   // retransmit events (non-zero only with --reliable)
 	}
 	var results []result
 
 	for _, mtu := range mtus {
 		for _, size := range sizes {
 			skipped := size > maxPayloadForMTU(mtu)
-			r, err := runOne(dur, mtu, size, coalesce)
+			r, err := runOne(dur, mtu, size, coalesce, reliable)
 			if err != nil {
 				return fmt.Errorf("bench mtu=%d size=%d: %w", mtu, size, err)
 			}
 			results = append(results, result{
-				mtu:     mtu,
-				size:    size,
-				skipped: skipped,
-				txMsgS:  r.txMsgS,
-				txGbps:  r.txGbps,
-				rxMsgS:  r.rxMsgS,
-				rxGbps:  r.rxGbps,
-				drained: r.drained,
-				lost:    r.lost,
+				mtu:      mtu,
+				size:     size,
+				skipped:  skipped,
+				txMsgS:   r.txMsgS,
+				txGbps:   r.txGbps,
+				rxMsgS:   r.rxMsgS,
+				rxGbps:   r.rxGbps,
+				lossRate: r.lossRate,
+				drained:  r.drained,
+				lost:     r.lost,
+				p50:      r.p50,
+				p99:      r.p99,
+				retx:     r.retx,
 			})
 		}
 	}
 
 	// Summary table.
-	fmt.Fprintf(os.Stdout, "\n  ─── summary ──────────────────────────────────────────────────────────────────────\n")
-	fmt.Fprintf(os.Stdout, "  %6s  %8s  %10s  %10s  %10s  %10s  %8s  %8s\n",
-		"MTU", "payload", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s", "drained", "lost")
+	fmt.Fprintf(os.Stdout, "\n  ─── summary ──────────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	fmt.Fprintf(os.Stdout, "  %6s  %8s  %10s  %10s  %10s  %10s  %7s  %8s  %7s  %8s  %8s  %6s\n",
+		"MTU", "payload", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s", "loss%", "drained", "lost", "p50", "p99", "retx")
 	for _, r := range results {
 		if r.skipped {
-			fmt.Fprintf(os.Stdout, "  %6d  %8s  %10s  %10s  %10s  %10s  %8s  %8s\n",
-				r.mtu, fmtSize(int64(r.size)), "N/A", "N/A", "N/A", "N/A", "N/A", "N/A")
+			fmt.Fprintf(os.Stdout, "  %6d  %8s  %10s  %10s  %10s  %10s  %7s  %8s  %7s  %8s  %8s  %6s\n",
+				r.mtu, fmtSize(int64(r.size)), "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A")
 			continue
 		}
-		fmt.Fprintf(os.Stdout, "  %6d  %8s  %10.0f  %10.3f  %10.0f  %10.3f  %8d  %8d\n",
+		fmt.Fprintf(os.Stdout, "  %6d  %8s  %10.0f  %10.3f  %10.0f  %10.3f  %7.3f  %8d  %7d  %8s  %8s  %6d\n",
 			r.mtu, fmtSize(int64(r.size)),
-			r.txMsgS, r.txGbps, r.rxMsgS, r.rxGbps, r.drained, r.lost)
+			r.txMsgS, r.txGbps, r.rxMsgS, r.rxGbps,
+			r.lossRate, r.drained, r.lost, r.p50, r.p99, r.retx)
 	}
 	return nil
 }
@@ -97,8 +105,9 @@ type oneResult struct {
 	txGbps float64
 	// rxMsgS is the receive rate during the benchmark window only (excludes
 	// echoes recovered during the post-timer drain).
-	rxMsgS float64
-	rxGbps float64
+	rxMsgS   float64
+	rxGbps   float64
+	lossRate float64 // lost / tx * 100
 	// drained is the number of echoes received during the post-timer drain
 	// window.  These were in-flight when the benchmark timer fired and are
 	// not genuine losses — they are timer-caused apparent loss.
@@ -106,6 +115,69 @@ type oneResult struct {
 	// lost is the number of sent events whose echo never arrived, even after
 	// the full drain.  These are genuine packet drops.
 	lost int64
+	p50  string // median round-trip time
+	p99  string // 99th-percentile round-trip time
+	retx int64  // retransmit events (non-zero only with reliable=true)
+}
+
+// rttHistogram is a power-of-two bucket histogram for round-trip time.
+// Bucket i accumulates samples where 2^(i-1) ≤ nanoseconds < 2^i.
+// Written exclusively by the receiver goroutine; read by the main goroutine
+// after rxDone.Wait() — no locking required.
+type rttHistogram struct {
+	counts [64]int64
+	total  int64
+}
+
+func (h *rttHistogram) record(d time.Duration) {
+	ns := d.Nanoseconds()
+	if ns < 1 {
+		ns = 1
+	}
+	b := bits.Len64(uint64(ns))
+	if b >= 64 {
+		b = 63
+	}
+	h.counts[b]++
+	h.total++
+}
+
+// percentile returns the approximate duration at the given percentile (0–100).
+// Returns the lower bound of the containing bucket, which is a conservative
+// (under) estimate.
+func (h *rttHistogram) percentile(pct float64) time.Duration {
+	if h.total == 0 {
+		return 0
+	}
+	target := int64(math.Ceil(float64(h.total) * pct / 100.0))
+	var cum int64
+	for i, c := range h.counts {
+		cum += c
+		if cum >= target {
+			if i == 0 {
+				return time.Nanosecond
+			}
+			// Lower bound of bucket i: 2^(i-1) nanoseconds.
+			return time.Duration(int64(1) << uint(i-1))
+		}
+	}
+	return time.Duration(int64(1) << 62)
+}
+
+// fmtDuration formats a duration for display in the benchmark table.
+func fmtDuration(d time.Duration) string {
+	switch {
+	case d == 0:
+		return "—"
+	case d < time.Microsecond:
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	case d < time.Millisecond:
+		return fmt.Sprintf("%.1fµs", float64(d.Nanoseconds())/1e3)
+	case d < time.Second:
+		return fmt.Sprintf("%.2fms", float64(d.Nanoseconds())/1e6)
+	default:
+		return fmt.Sprintf("%.2fs", d.Seconds())
+	}
 }
 
 // maxPayloadForMTU returns the maximum single-frame payload in bytes for the
@@ -123,10 +195,10 @@ func maxPayloadForMTU(mtu int) int {
 }
 
 // runOne starts an in-process echo server + client, drives traffic for dur,
-// and returns throughput metrics plus loss accounting.
+// and returns throughput, loss, latency, and retransmit metrics.
 // Returns a zero result (not an error) when the payload cannot be sent at the
 // given MTU.
-func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (oneResult, error) {
+func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, reliable bool) (oneResult, error) {
 	if payloadSize > maxPayloadForMTU(mtu) {
 		fmt.Fprintf(os.Stderr, "  skipping mtu=%-5d payload=%-10s — exceeds 255-fragment limit\n",
 			mtu, fmtSize(int64(payloadSize)))
@@ -166,10 +238,49 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (on
 		eventsPerFrame = maxFrag / payloadSize
 	}
 	inflightCap := maxReassembly * eventsPerFrame
+
+	// fragsPerEvent: how many UDP fragments one event requires on the wire.
+	// 1 for non-fragmented payloads; ceil(payload/maxFrag) otherwise.
+	fragsPerEvent := 1
+	if maxFrag > 0 && payloadSize > maxFrag {
+		fragsPerEvent = (payloadSize + maxFrag - 1) / maxFrag
+	}
+
+	// Cap inflightCap so that the total fragment data in-flight stays within
+	// the socket receive buffer.  dialSession sets SO_RCVBUF to 4 MiB; Linux
+	// doubles the value internally, giving ~8 MiB of actual buffer.  We use
+	// 75 % of that (6 MiB) as a headroom margin to absorb bursty scheduling.
+	if fragsPerEvent > 1 {
+		const socketBuf = 6 << 20 // 75 % of ~8 MiB kernel receive buffer
+		maxByBuf := socketBuf / (fragsPerEvent * mtu)
+		if maxByBuf < 1 {
+			maxByBuf = 1
+		}
+		if inflightCap > maxByBuf {
+			inflightCap = maxByBuf
+		}
+	}
+
 	eventBufSize := 256
 	if burst := srvReadBatchSz * eventsPerFrame; burst > eventBufSize {
 		eventBufSize = burst
 	}
+	// ch.events must hold all in-flight echoes without dropping any, even if
+	// they all arrive in a single burst before the receiver goroutine runs.
+	if inflightCap > eventBufSize {
+		eventBufSize = inflightCap
+	}
+
+	// RTT ring buffer: the sender writes a send-timestamp at index
+	// (txCount & rttMask) before each send; the receiver reads it at
+	// (rxCount & rttMask) on echo receipt.  The ring must be strictly larger
+	// than inflightCap so sender and receiver never alias the same slot.
+	rttRingSize := 1
+	for rttRingSize <= inflightCap {
+		rttRingSize <<= 1
+	}
+	rttMask := rttRingSize - 1
+	sendTimes := make([]atomic.Int64, rttRingSize)
 
 	kp, err := wiresocket.GenerateKeypair()
 	if err != nil {
@@ -182,14 +293,26 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (on
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
+	// srvMaxIncomplete: MaxIncompleteFrames is a FRAME count (one entry per
+	// logical frame being reassembled), not a fragment count.  The server
+	// needs at most inflightCap concurrent reassembly entries — one per
+	// in-flight event.  512 is a safe default minimum.
+	srvMaxIncomplete := inflightCap
+	if srvMaxIncomplete < 512 {
+		srvMaxIncomplete = 512
+	}
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
 		Addr:                addr,
 		PrivateKey:          kp.Private,
 		OnConnect:           echoConn,
 		MaxPacketSize:       mtu,
 		CoalesceInterval:    coalesce,
-		MaxIncompleteFrames: 512,
+		MaxIncompleteFrames: srvMaxIncomplete,
 		EventBufSize:        eventBufSize,
+		// WorkChannelSize must hold all fragments of all in-flight events so
+		// that the UDP reader goroutine never drops a fragment before a worker
+		// can reassemble it.  Add a 64-packet headroom for keepalives.
+		WorkChannelSize: inflightCap*fragsPerEvent + 64,
 	})
 	if err != nil {
 		return oneResult{}, err
@@ -211,18 +334,25 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (on
 	}
 
 	conn, err := wiresocket.Dial(context.Background(), addr, wiresocket.DialConfig{
-		ServerPublicKey:  kp.Public,
-		HandshakeTimeout: 5 * time.Second,
-		MaxRetries:       10,
-		MaxPacketSize:    mtu,
-		CoalesceInterval: coalesce,
-		EventBufSize:     eventBufSize,
+		ServerPublicKey:     kp.Public,
+		HandshakeTimeout:    5 * time.Second,
+		MaxRetries:          10,
+		MaxPacketSize:       mtu,
+		CoalesceInterval:    coalesce,
+		EventBufSize:        eventBufSize,
+		// Double inflightCap so the client has headroom to reassemble the
+		// next batch of frames while echoes from the current batch are still
+		// in-flight back to the sender.
+		MaxIncompleteFrames: inflightCap * 2,
 	})
 	if err != nil {
 		return oneResult{}, fmt.Errorf("dial: %w", err)
 	}
 
 	ch := conn.Channel(benchChannel)
+	if reliable {
+		ch.SetReliable(wiresocket.ReliableCfg{})
+	}
 	payload := make([]byte, payloadSize)
 
 	var txMsgs, txBytes, rxMsgs, rxBytes atomic.Int64
@@ -230,8 +360,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (on
 	benchCtx, benchCancel := context.WithTimeout(context.Background(), dur)
 	defer benchCancel()
 
-	// drainCtx outlives benchCtx so the receiver can collect echoes that
-	// were already in-flight when the benchmark window closed.
+	// drainCtx lives until we have confirmed all echoes are received.
 	drainCtx, drainCancel := context.WithCancel(context.Background())
 	defer drainCancel()
 
@@ -242,22 +371,39 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (on
 		tokens <- struct{}{}
 	}
 
-	// Receiver goroutine — uses drainCtx so it outlives benchCtx.
+	var hist rttHistogram
+
+	// Receiver goroutine — reads from ch.Events() directly rather than
+	// ch.Recv so that closing ch.done (which happens inside conn.Close)
+	// does NOT cause it to exit before draining the buffer.  It runs until
+	// drainCtx is cancelled, which we defer until all echoes are confirmed.
 	var rxDone sync.WaitGroup
 	rxDone.Add(1)
 	go func() {
 		defer rxDone.Done()
+		evCh := ch.Events()
+		var rxCount int
 		for {
-			e, err := ch.Recv(drainCtx)
-			if err != nil {
-				return
-			}
-			rxMsgs.Add(1)
-			rxBytes.Add(int64(len(e.Payload)))
-			// Return the token so the sender can issue another event.
 			select {
-			case tokens <- struct{}{}:
-			default: // sender already stopped; discard
+			case e := <-evCh:
+				// Compute RTT using the timestamp stored by the sender for
+				// this event.  rxCount matches txCount because the echo
+				// server reflects events in order and there is a single
+				// sender goroutine.
+				ts := sendTimes[rxCount&rttMask].Load()
+				if ts > 0 {
+					hist.record(time.Duration(time.Now().UnixNano() - ts))
+				}
+				rxCount++
+				rxMsgs.Add(1)
+				rxBytes.Add(int64(len(e.Payload)))
+				// Return the token so the sender can issue another event.
+				select {
+				case tokens <- struct{}{}:
+				default: // sender already stopped; discard
+				}
+			case <-drainCtx.Done():
+				return
 			}
 		}
 	}()
@@ -268,6 +414,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (on
 	go func() {
 		defer txDone.Done()
 		e := &wiresocket.Event{Type: 1, Payload: payload}
+		var txCount int
 		for {
 			// Acquire a token before sending; block here when the echo
 			// path falls behind, naturally yielding CPU to server and
@@ -277,36 +424,56 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (on
 				return
 			case <-tokens:
 			}
+			// Record send timestamp before the send so the receiver can
+			// compute RTT as soon as the echo arrives.
+			sendTimes[txCount&rttMask].Store(time.Now().UnixNano())
 			if err := ch.Send(benchCtx, e); err != nil {
 				return
 			}
 			txMsgs.Add(1)
 			txBytes.Add(int64(payloadSize))
+			txCount++
 		}
 	}()
 
 	<-benchCtx.Done()
 	txDone.Wait()
 
-	// Snapshot counts at timer expiry before the drain runs.  The difference
-	// txAtStop - rxAtStop is the number of echoes outstanding at that moment;
-	// some will arrive during drain (timer-caused apparent loss), the rest are
-	// genuine drops.
+	// Snapshot counts at timer expiry before the echo drain runs.
 	txAtStop := txMsgs.Load()
 	rxAtStop := rxMsgs.Load()
 
-	// Graceful drain: Close flushes the coalescer and waits for the echo
-	// server to ACK any in-flight events before sending the disconnect.
-	drainStart := time.Now()
-	conn.Close()
-	drainElapsed := time.Since(drainStart)
+	// Flush the coalescer so all events queued since the last timer tick
+	// reach the server.  Flush does not close the connection, so the receiver
+	// goroutine continues running and can receive the echoes.
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	conn.Flush(flushCtx)
+	flushCancel()
 
-	// Cancel the drain context now that the connection is closed; the
-	// receiver will exit on the next Recv error.
+	// Wait a fixed window for in-flight echoes to return.  We use a bounded
+	// sleep rather than waiting for a target count because some echoes may be
+	// genuinely lost (dropped by the server or OS buffers), in which case
+	// waiting for rxMsgs >= txAtStop would hang forever.
+	// drainWait — long enough for the slowest coalesced round-trip to
+	// complete under moderate load.  For fragmented payloads, each event
+	// requires fragsPerEvent UDP packets in each direction; at ~5 µs per
+	// syscall that is roughly fragsPerEvent × 10 µs of serialisation delay.
+	// Use max(10 × coalesce, 100ms, fragsPerEvent × 1ms) to scale
+	// proportionally with payload size.
+	drainWait := 10 * coalesce
+	if drainWait < 100*time.Millisecond {
+		drainWait = 100 * time.Millisecond
+	}
+	if fragDelay := time.Duration(fragsPerEvent) * time.Millisecond; fragDelay > drainWait {
+		drainWait = fragDelay
+	}
+	time.Sleep(drainWait)
+
+	conn.Close()
+
+	// Cancel the drain context so the receiver goroutine exits.
 	drainCancel()
 	rxDone.Wait()
-
-	fmt.Fprintf(os.Stderr, "  drain: %s\n", drainElapsed.Round(time.Millisecond))
 
 	finalRx := rxMsgs.Load()
 	// drained: echoes that arrived during the drain window — in-flight when
@@ -315,16 +482,25 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration) (on
 	// lost: echoes never received even after full drain — genuine drops.
 	lost := txAtStop - finalRx
 
+	var lossRate float64
+	if txAtStop > 0 {
+		lossRate = float64(lost) / float64(txAtStop) * 100
+	}
+
 	secs := dur.Seconds()
 	tx := txBytes.Load()
 	rx := rxBytes.Load()
 	return oneResult{
-		txMsgS:  float64(txAtStop) / secs,
-		txGbps:  float64(tx) * 8 / 1e9 / secs,
-		rxMsgS:  float64(rxAtStop) / secs,
-		rxGbps:  float64(rx) * 8 / 1e9 / secs,
-		drained: drained,
-		lost:    lost,
+		txMsgS:   float64(txAtStop) / secs,
+		txGbps:   float64(tx) * 8 / 1e9 / secs,
+		rxMsgS:   float64(rxAtStop) / secs,
+		rxGbps:   float64(rx) * 8 / 1e9 / secs,
+		lossRate: lossRate,
+		drained:  drained,
+		lost:     lost,
+		p50:      fmtDuration(hist.percentile(50)),
+		p99:      fmtDuration(hist.percentile(99)),
+		retx:     ch.Retransmits(),
 	}, nil
 }
 

@@ -174,6 +174,15 @@ func (ch *Channel) Close() error {
 	return nil
 }
 
+// Retransmits returns the cumulative number of frame retransmit events on this
+// channel since it was created.  Returns 0 if reliable mode is not enabled.
+func (ch *Channel) Retransmits() int64 {
+	if ch.reliable == nil {
+		return 0
+	}
+	return ch.reliable.retransmits.Load()
+}
+
 // closeLocal closes the channel without sending a notification to the peer.
 // Used by the mux goroutine when a close event is received, or when the
 // session itself terminates.

@@ -3,6 +3,7 @@ package wiresocket
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -80,6 +81,10 @@ type reliableState struct {
 	rtoRunning bool            // true while rtoTimer is armed
 	rto        time.Duration   // current RTO (doubles on retransmit)
 	rtoTimer   *time.Timer
+
+	// retransmits counts the total number of frame retransmit events since
+	// this reliableState was created or last reset.
+	retransmits atomic.Int64
 
 	// ── receive side ──────────────────────────────────────────────────────
 	recvMu    sync.Mutex
@@ -264,6 +269,7 @@ func (rs *reliableState) retransmit() {
 	}
 
 	p.retries++
+	rs.retransmits.Add(1)
 	if p.retries > rs.cfg.MaxRetries {
 		rs.sendMu.Unlock()
 		dbg("reliable: max retries exceeded, closing channel",
@@ -490,6 +496,7 @@ func (rs *reliableState) reset() {
 	rs.nextSeq = 1
 	rs.peerWindow = rs.cfg.WindowSize
 	rs.rto = rs.cfg.BaseRTO
+	rs.retransmits.Store(0)
 	if rs.rtoTimer != nil {
 		rs.rtoTimer.Stop()
 		rs.rtoRunning = false

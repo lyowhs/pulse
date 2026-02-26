@@ -81,6 +81,14 @@ type ServerConfig struct {
 	// to approximately this many bytes per second.  A burst of up to 2× the
 	// per-second rate is allowed before throttling begins.  0 means unlimited.
 	SendRateLimitBPS int64
+
+	// WorkChannelSize is the number of incoming packets buffered between the
+	// UDP reader goroutine and the worker pool.  If the channel is full,
+	// excess packets are silently dropped.  Defaults to
+	// max(WorkerCount*64, 4096).  Increase this when sending large fragmented
+	// frames so the reader does not drop fragments before workers can process
+	// them (e.g. set to inflightCap * fragsPerEvent + 64).
+	WorkChannelSize int
 }
 
 func (cfg *ServerConfig) defaults() {
@@ -104,6 +112,12 @@ func (cfg *ServerConfig) defaults() {
 	}
 	if cfg.MaxPacketSize == 0 {
 		cfg.MaxPacketSize = defaultMaxPacketSize
+	}
+	if cfg.WorkChannelSize == 0 {
+		cfg.WorkChannelSize = cfg.WorkerCount * 64
+		if cfg.WorkChannelSize < 4096 {
+			cfg.WorkChannelSize = 4096
+		}
 	}
 }
 
@@ -241,7 +255,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg:            cfg,
 		keypair:        kp,
 		cookies:        newCookieManager(kp.Public),
-		work:           make(chan incomingPacket, cfg.WorkerCount*64),
+		work:           make(chan incomingPacket, cfg.WorkChannelSize),
 		maxFragPayload: maxFrag,
 	}
 	return s, nil

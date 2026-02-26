@@ -2,6 +2,7 @@ package wiresocket
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,6 +34,9 @@ type coalescer struct {
 	// Sending to stopC requests a synchronous flush-and-stop; the run loop
 	// closes the response channel when the flush is complete.
 	stopC chan chan struct{}
+	// stopped is set to true once the run goroutine has exited, making
+	// subsequent stop() calls return immediately without blocking.
+	stopped atomic.Bool
 }
 
 type coalesceItem struct {
@@ -60,6 +64,9 @@ func newCoalescer(conn *Conn, interval time.Duration, maxFrameBytes int) *coales
 // If ctx expires before the flush completes, stop returns early (the
 // coalescer goroutine continues running until conn.done closes it).
 func (c *coalescer) stop(ctx context.Context) {
+	if c.stopped.Load() {
+		return // already flushed and stopped
+	}
 	resp := make(chan struct{})
 	select {
 	case c.stopC <- resp:
@@ -176,6 +183,7 @@ func (c *coalescer) run() {
 			if sess := getSession(); sess != nil {
 				flushAll(sess)
 			}
+			c.stopped.Store(true)
 			close(resp)
 			return
 
@@ -184,6 +192,7 @@ func (c *coalescer) run() {
 				stopTimer()
 				flushAll(sess)
 			}
+			c.stopped.Store(true)
 			return
 
 		case item := <-c.input:

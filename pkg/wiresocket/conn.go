@@ -355,6 +355,22 @@ func (c *Conn) Done() <-chan struct{} {
 // events and waiting for reliable-channel ACKs before tearing down the session.
 const defaultDrainTimeout = 5 * time.Second
 
+// Flush flushes any events buffered in the coalescer, sending them to the
+// remote peer immediately.  Unlike Close, Flush does not send a disconnect or
+// tear down the session — the connection remains open for further sends and
+// receives after Flush returns.
+//
+// For reliable channels, Flush also blocks until all outstanding sent frames
+// have been ACKed by the remote peer (same guarantee as Close).
+//
+// Flush is useful when a caller needs to ensure all queued events have left
+// the local buffer before inspecting delivery metrics, while still keeping
+// the connection alive.  Bounded by ctx; partial flushes are silently
+// tolerated.
+func (c *Conn) Flush(ctx context.Context) {
+	c.drainBeforeClose(ctx)
+}
+
 // Close closes the connection.  Before tearing down the session it performs a
 // graceful drain:
 //
