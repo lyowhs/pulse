@@ -467,6 +467,11 @@ func (s *session) sendFragments(plain []byte) error {
 			sent += n
 			if err != nil {
 				if errors.Is(err, syscall.ENOBUFS) {
+					dbg("send: ENOBUFS on WriteBatch, retrying",
+						"local_index", s.localIndex,
+						"sent",        sent,
+						"total",       fragCount,
+					)
 					runtime.Gosched()
 					continue
 				}
@@ -481,6 +486,11 @@ func (s *session) sendFragments(plain []byte) error {
 			sent += n
 			if err != nil {
 				if errors.Is(err, syscall.ENOBUFS) {
+					dbg("send: ENOBUFS on WriteBatch, retrying",
+						"local_index", s.localIndex,
+						"sent",        sent,
+						"total",       fragCount,
+					)
 					runtime.Gosched()
 					continue
 				}
@@ -760,6 +770,11 @@ func (s *session) receiveFragment(b []byte) bool {
 			lastSeen: time.Now(),
 		}
 		s.fragBufs[frameID] = rbuf
+		dbg("recv: new fragment reassembly buffer",
+			"local_index", s.localIndex,
+			"frame_id",    frameID,
+			"frag_count",  fragCount,
+		)
 	} else if rbuf.total != fragCount {
 		s.fragMu.Unlock()
 		recvBufPool.Put(bp)

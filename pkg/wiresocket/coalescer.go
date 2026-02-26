@@ -224,6 +224,7 @@ func (c *coalescer) run() {
 				// At least one channel has reached the frame-size limit.
 				// Flush immediately rather than waiting for the timer.
 				if sess := getSession(); sess != nil {
+					dbg("coalescer: size-limit flush", "channel_id", fullCh, "channels", len(pending))
 					if len(pending) == 1 {
 						// Fast path: only one channel pending.
 						flushOne(sess, fullCh)
@@ -244,6 +245,7 @@ func (c *coalescer) run() {
 
 		case <-timerC:
 			timerC = nil
+			dbg("coalescer: timer flush", "channels", len(pending))
 			if sess := getSession(); sess != nil {
 				flushAll(sess)
 			}

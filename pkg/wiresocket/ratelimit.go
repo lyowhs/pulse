@@ -54,6 +54,8 @@ func (b *tokenBucket) wait(done <-chan struct{}, n int) error {
 		waitNs := int64(needed / b.rate)
 		b.mu.Unlock()
 
+		dbg("rate limit: throttling send", "need_bytes", n, "wait_ns", waitNs)
+
 		// Wait for the calculated duration or until the session closes.
 		timer := time.NewTimer(time.Duration(waitNs))
 		select {

@@ -129,6 +129,11 @@ func (rs *reliableState) preSend(frame *Frame) error {
 	for rs.numPending >= rs.peerWindow {
 		// Window full: block until the receiver ACKs frames and frees space.
 		// cond.Wait atomically releases sendMu and suspends this goroutine.
+		dbg("reliable: send window full, waiting for ACK",
+			"channel_id", rs.channel.id,
+			"num_pending", rs.numPending,
+			"peer_window", rs.peerWindow,
+		)
 		rs.cond.Wait()
 		// Check if the channel/conn closed while we were waiting.
 		select {
@@ -222,6 +227,12 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 		rs.peerWindow = w
 	}
 	if freed > 0 {
+		dbg("reliable: ACK freed frames",
+			"channel_id",  rs.channel.id,
+			"freed",       freed,
+			"cum_ack_seq", ackSeq,
+			"num_pending", rs.numPending,
+		)
 		rs.cond.Broadcast()
 	}
 
@@ -332,13 +343,30 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 			if rs.oooFrames[idx] == nil {
 				rs.oooFrames[idx] = f
 				rs.ooo |= 1 << (gap - 1)
+				dbg("reliable: buffering out-of-order frame",
+					"channel_id", rs.channel.id,
+					"seq",        seq,
+					"expected",   rs.expectSeq,
+					"gap",        gap,
+				)
 			}
 			// else duplicate — drop
+		} else {
+			dbg("reliable: OOO frame too far ahead, dropping",
+				"channel_id", rs.channel.id,
+				"seq",        seq,
+				"expected",   rs.expectSeq,
+				"gap",        gap,
+			)
 		}
-		// else too far ahead — drop
 
 	default:
 		// seq < expectSeq: duplicate — drop
+		dbg("reliable: duplicate in-order frame dropped",
+			"channel_id", rs.channel.id,
+			"seq",        seq,
+			"expected",   rs.expectSeq,
+		)
 	}
 
 	rs.ackDirty = true
@@ -482,6 +510,12 @@ func (rs *reliableState) waitEmpty(ctx context.Context) error {
 
 	rs.sendMu.Lock()
 	defer rs.sendMu.Unlock()
+	if rs.numPending > 0 {
+		dbg("reliable: drain waiting for ACKs",
+			"channel_id",  rs.channel.id,
+			"num_pending", rs.numPending,
+		)
+	}
 	for rs.numPending > 0 {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -494,6 +528,10 @@ func (rs *reliableState) waitEmpty(ctx context.Context) error {
 // reset clears all pending send-side state and wakes blocked senders.
 // Called when the underlying session closes (persistent reconnect or permanent close).
 func (rs *reliableState) reset() {
+	dbg("reliable: resetting state",
+		"channel_id",  rs.channel.id,
+		"num_pending", rs.numPending,
+	)
 	rs.sendMu.Lock()
 	// Free all pending frames.
 	for i := range rs.pending {

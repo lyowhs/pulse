@@ -179,6 +179,7 @@ func (c *Conn) wireSession(sess *session) {
 	for i := range c.channels {
 		if ch := c.channels[i].Load(); ch != nil {
 			if rs := ch.reliable.Load(); rs != nil {
+				dbg("conn: resetting reliable channel state on reconnect", "channel_id", ch.id)
 				rs.reset()
 			}
 		}
