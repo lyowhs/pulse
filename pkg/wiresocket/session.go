@@ -104,6 +104,12 @@ type session struct {
 	closed    atomic.Bool // set to true before done is closed; enables a lock-free isDone fast-path
 	closeOnce sync.Once   // ensures close() is idempotent without a TOCTOU race
 
+	// removed is set to true by the first server code path (handleDisconnect,
+	// gc, or the OnConnect goroutine defer) that removes this session from the
+	// server's routing table and decrements totalSessions.  The remaining paths
+	// find it already set and skip the decrement, preventing double-counting.
+	removed atomic.Bool
+
 	// How long without any received packet before declaring the peer dead.
 	timeout time.Duration
 

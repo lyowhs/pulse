@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
-
+	"sync/atomic"
 )
 
 // ErrChannelClosed is returned when an operation is performed on a closed Channel.
@@ -34,7 +34,9 @@ type Channel struct {
 
 	// reliable is non-nil when reliable delivery is enabled on this channel.
 	// nil means fire-and-forget (zero overhead on the send/receive hot-paths).
-	reliable *reliableState
+	// Uses atomic.Pointer so the router goroutines (workers) can load it
+	// concurrently with SetReliable being called from OnConnect.
+	reliable atomic.Pointer[reliableState]
 }
 
 func newChannel(id uint8, conn *Conn, bufSize int) *Channel {
@@ -64,7 +66,23 @@ func (ch *Channel) ID() uint8 { return ch.id }
 // Both sides of a channel must coordinate: the sender calls SetReliable to opt
 // in; the receiver detects reliable frames automatically (via the Seq field).
 func (ch *Channel) SetReliable(cfg ReliableCfg) {
-	ch.reliable = newReliableState(ch, cfg)
+	rs := newReliableState(ch, cfg)
+	// If auto-creation already installed a receive-only state (because frames
+	// arrived before SetReliable was called), copy the receive-side progress
+	// into the new state so we don't reset expectSeq back to 1.
+	if old := ch.reliable.Load(); old != nil {
+		old.recvMu.Lock()
+		rs.expectSeq = old.expectSeq
+		rs.ooo = old.ooo
+		rs.oooFrames = old.oooFrames
+		rs.ackDirty = old.ackDirty
+		if old.ackTimer != nil {
+			old.ackTimer.Stop()
+			old.ackTimer = nil
+		}
+		old.recvMu.Unlock()
+	}
+	ch.reliable.Store(rs)
 }
 
 // Send sends an event on this channel to the remote peer.
@@ -107,9 +125,9 @@ func (ch *Channel) Send(ctx context.Context, e *Event) error {
 			return err
 		}
 		frame := &Frame{ChannelId: ch.id, Events: []*Event{e}}
-		if ch.reliable != nil {
+		if rs := ch.reliable.Load(); rs != nil {
 			dbg("channel send (reliable)", "channel_id", ch.id, "event_type", e.Type)
-			if err := ch.reliable.preSend(frame); err != nil {
+			if err := rs.preSend(frame); err != nil {
 				if err == ErrConnClosed && ch.conn.isPersistent() {
 					continue
 				}
@@ -177,10 +195,11 @@ func (ch *Channel) Close() error {
 // Retransmits returns the cumulative number of frame retransmit events on this
 // channel since it was created.  Returns 0 if reliable mode is not enabled.
 func (ch *Channel) Retransmits() int64 {
-	if ch.reliable == nil {
+	rs := ch.reliable.Load()
+	if rs == nil {
 		return 0
 	}
-	return ch.reliable.retransmits.Load()
+	return rs.retransmits.Load()
 }
 
 // closeLocal closes the channel without sending a notification to the peer.

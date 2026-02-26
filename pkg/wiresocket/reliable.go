@@ -150,7 +150,7 @@ func (rs *reliableState) preSend(frame *Frame) error {
 	// Piggyback any pending ACK from the receive side (free ride on data packets).
 	rs.recvMu.Lock()
 	if rs.ackDirty {
-		frame.AckSeq = rs.expectSeq - 1
+		frame.AckSeq = rs.expectSeq
 		frame.AckBitmap = rs.ooo
 		frame.WindowSize = rs.myWindow()
 		rs.ackDirty = false
@@ -185,10 +185,12 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 
 	freed := 0
 
-	// Free all frames with seq <= ackSeq (cumulative ACK).
+	// Free all frames with seq < ackSeq (cumulative ACK).
+	// AckSeq == expectSeq on the receiver, meaning "next expected is AckSeq",
+	// so all seq < AckSeq have been received in-order.
 	for s := rs.nextSeq - uint32(rs.numPending); s != rs.nextSeq; s++ {
 		slot := &rs.pending[s&0xFF]
-		if !slot.used || slot.seq > ackSeq {
+		if !slot.used || slot.seq >= ackSeq {
 			break
 		}
 		slot.used = false
@@ -213,7 +215,11 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 
 	rs.numPending -= freed
 	if peerWindow > 0 {
-		rs.peerWindow = int(peerWindow)
+		w := int(peerWindow)
+		if w > rs.cfg.WindowSize {
+			w = rs.cfg.WindowSize
+		}
+		rs.peerWindow = w
 	}
 	if freed > 0 {
 		rs.cond.Broadcast()
@@ -313,8 +319,10 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 	switch {
 	case seq == rs.expectSeq:
 		// In-order: deliver this frame and any consecutive buffered OOO frames.
+		// Keep recvMu held throughout to prevent a concurrent worker from
+		// delivering the next in-sequence frame to ch.events out of order.
+		rs.deliverInOrderLocked(f)
 		rs.recvMu.Unlock()
-		rs.deliverInOrder(seq, f)
 		return
 
 	case seq > rs.expectSeq:
@@ -338,11 +346,17 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 	rs.recvMu.Unlock()
 }
 
-// deliverInOrder delivers f (which has seq == expectSeq) and then advances
-// through any consecutively buffered OOO frames.  Must be called without
-// recvMu held (it will acquire it internally as needed).
-func (rs *reliableState) deliverInOrder(seq uint32, f *Frame) {
-	// Deliver this frame's events.
+// deliverInOrderLocked delivers f (which has seq == expectSeq) and then
+// advances through any consecutively buffered OOO frames.  Must be called
+// WITH recvMu held; returns with recvMu held.
+//
+// All delivery to ch.events happens while the mutex is held, which prevents
+// a concurrent worker from pushing events for the next in-sequence frame
+// before this frame's events have been enqueued (ordering safety).
+// deliverEventToChannel is non-blocking (drop-oldest on overflow), so holding
+// recvMu during delivery cannot deadlock.
+func (rs *reliableState) deliverInOrderLocked(f *Frame) {
+	// Deliver this frame's events while holding recvMu.
 	for _, e := range f.Events {
 		if e.Type == channelCloseType {
 			rs.channel.closeLocal()
@@ -350,8 +364,6 @@ func (rs *reliableState) deliverInOrder(seq uint32, f *Frame) {
 			deliverEventToChannel(rs.channel, e)
 		}
 	}
-
-	rs.recvMu.Lock()
 	rs.expectSeq++
 
 	// Drain any buffered OOO frames that are now in order.
@@ -364,8 +376,6 @@ func (rs *reliableState) deliverInOrder(seq uint32, f *Frame) {
 
 		if next != nil {
 			rs.expectSeq++
-			// Release the lock while delivering to avoid holding it during channel ops.
-			rs.recvMu.Unlock()
 			for _, e := range next.Events {
 				if e.Type == channelCloseType {
 					rs.channel.closeLocal()
@@ -373,13 +383,11 @@ func (rs *reliableState) deliverInOrder(seq uint32, f *Frame) {
 					deliverEventToChannel(rs.channel, e)
 				}
 			}
-			rs.recvMu.Lock()
 		}
 	}
 
 	rs.ackDirty = true
 	rs.scheduleACKLocked()
-	rs.recvMu.Unlock()
 }
 
 // myWindow returns the number of slots available in the receive channel buffer.
@@ -411,7 +419,7 @@ func (rs *reliableState) sendACK() {
 		rs.recvMu.Unlock()
 		return
 	}
-	cumAck := rs.expectSeq - 1
+	cumAck := rs.expectSeq
 	bitmap := rs.ooo
 	window := rs.myWindow()
 	rs.ackDirty = false
@@ -445,7 +453,7 @@ func (rs *reliableState) consumePendingACK() (cumAck uint32, bitmap uint64, wind
 	if !rs.ackDirty {
 		return 0, 0, 0, false
 	}
-	cumAck = rs.expectSeq - 1
+	cumAck = rs.expectSeq
 	bitmap = rs.ooo
 	window = rs.myWindow()
 	rs.ackDirty = false

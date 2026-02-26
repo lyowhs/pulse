@@ -48,7 +48,8 @@
       "Bash(export PATH=$PATH:/usr/local/go/bin && go vet ./pkg/wiresocket/... 2>&1)",
       "Bash(tail:*)",
       "Bash(export PATH=$PATH:/usr/local/go/bin:/usr/bin:/bin && go build ./... 2>&1)",
-      "Bash(export PATH=$PATH:/usr/local/go/bin && go build ./cmd/pulse/... 2>&1)"
+      "Bash(export PATH=$PATH:/usr/local/go/bin && go build ./cmd/pulse/... 2>&1)",
+      "Bash(cat:*)"
     ]
   }
 }

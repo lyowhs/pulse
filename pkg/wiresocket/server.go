@@ -487,8 +487,10 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 					"remote_addr", pkt.addr.String(),
 				)
 				sess.close()
-				s.sessions.Delete(localIdx)
-				s.totalSessions.Add(-1)
+				if sess.removed.CompareAndSwap(false, true) {
+					s.sessions.Delete(localIdx)
+					s.totalSessions.Add(-1)
+				}
 			}()
 			s.cfg.OnConnect(conn)
 		}()
@@ -582,8 +584,10 @@ func (s *Server) handleDisconnect(pkt incomingPacket) {
 		"remote_addr", pkt.addr.String(),
 	)
 	sess.close()
-	s.sessions.Delete(idx)
-	s.totalSessions.Add(-1)
+	if sess.removed.CompareAndSwap(false, true) {
+		s.sessions.Delete(idx)
+		s.totalSessions.Add(-1)
+	}
 }
 
 // gc periodically removes expired sessions and sends keepalives.
@@ -603,8 +607,10 @@ func (s *Server) gc(ctx context.Context) {
 						"expired", sess.isExpired(),
 					)
 					sess.close()
-					s.sessions.Delete(k)
-					s.totalSessions.Add(-1)
+					if sess.removed.CompareAndSwap(false, true) {
+						s.sessions.Delete(k)
+						s.totalSessions.Add(-1)
+					}
 					return true
 				}
 				if sess.needsKeepalive() {

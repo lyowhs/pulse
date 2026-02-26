@@ -113,11 +113,13 @@ func (c *coalescer) run() {
 	// sendFrame sends a frame, routing through the reliable path when applicable.
 	sendFrame := func(sess *session, chId uint8, events []*Event) {
 		frame := &Frame{ChannelId: chId, Events: events}
-		if ch := c.conn.channels[chId].Load(); ch != nil && ch.reliable != nil {
-			if err := ch.reliable.preSend(frame); err != nil {
-				dbg("coalescer: reliable preSend failed, dropping events",
-					"channel_id", chId, "count", len(events), "err", err)
-				return
+		if ch := c.conn.channels[chId].Load(); ch != nil {
+			if rs := ch.reliable.Load(); rs != nil {
+				if err := rs.preSend(frame); err != nil {
+					dbg("coalescer: reliable preSend failed, dropping events",
+						"channel_id", chId, "count", len(events), "err", err)
+					return
+				}
 			}
 		}
 		if err := sess.send(frame); err != nil {

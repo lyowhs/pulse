@@ -117,10 +117,10 @@ func UnmarshalFrame(b []byte) (*Frame, error) {
 	}
 
 	// Pre-pass: count events and sum payload bytes so we can batch-allocate.
+	// Do NOT return early when nEvents == 0: the body may still contain
+	// reliability fields (Seq, AckSeq, AckBitmap, WindowSize) that must be
+	// parsed by the loop below, e.g. standalone ACK frames with no events.
 	nEvents, payloadBytes := scanEvents(body)
-	if nEvents == 0 {
-		return f, nil
-	}
 
 	// One allocation for all Event structs.  Each &batch[i] escapes to the
 	// caller via f.Events; the backing array lives as long as any *Event from

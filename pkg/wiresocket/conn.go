@@ -125,19 +125,23 @@ func (c *Conn) wireSession(sess *session) {
 
 		// Process any piggybacked or standalone ACK.
 		if f.AckSeq != 0 {
-			if rs := ch.reliable; rs != nil {
+			if rs := ch.reliable.Load(); rs != nil {
 				rs.onAck(f.AckSeq, f.AckBitmap, f.WindowSize)
 			}
 		}
 
 		// Reliable data frame.
 		if f.Seq != 0 {
-			rs := ch.reliable
+			rs := ch.reliable.Load()
 			if rs == nil {
 				// Auto-create receive-side state for channels that did not
 				// call SetReliable but are receiving reliable frames.
+				// Use CAS to prevent duplicate creation from concurrent workers.
 				rs = newAutoReliable(ch)
-				ch.reliable = rs
+				if !ch.reliable.CompareAndSwap(nil, rs) {
+					// Another worker won the race; use its state.
+					rs = ch.reliable.Load()
+				}
 			}
 			rs.onRecv(f.Seq, f)
 			return
@@ -173,8 +177,10 @@ func (c *Conn) wireSession(sess *session) {
 	// For persistent conns this fires on every reconnect, purging unACKed frames
 	// from the old session (which is now dead) and waking blocked senders.
 	for i := range c.channels {
-		if ch := c.channels[i].Load(); ch != nil && ch.reliable != nil {
-			ch.reliable.reset()
+		if ch := c.channels[i].Load(); ch != nil {
+			if rs := ch.reliable.Load(); rs != nil {
+				rs.reset()
+			}
 		}
 	}
 
@@ -418,8 +424,10 @@ func (c *Conn) drainBeforeClose(ctx context.Context) {
 			return
 		}
 		ch := c.channels[i].Load()
-		if ch != nil && ch.reliable != nil {
-			_ = ch.reliable.waitEmpty(ctx)
+		if ch != nil {
+			if rs := ch.reliable.Load(); rs != nil {
+				_ = rs.waitEmpty(ctx)
+			}
 		}
 	}
 }
