@@ -1,5 +1,7 @@
 # Wiresocket Protocol Specification
 
+> **DRAFT** — This document reflects implementation as of 2026-02-26 and is pending formal review.
+
 Version: 1 (`noisePrologue = "wiresocket v1"`)
 
 ---
@@ -18,7 +20,9 @@ server over a single UDP socket.
 - **Multiplexing**: up to 256 independent channels per session (channel IDs 0–255)
 - **Fragmentation**: frames exceeding one UDP datagram are split across up to 65 535 fragments
 - **DoS mitigation**: WireGuard-style cookies (XChaCha20-Poly1305)
-- **Replay protection**: 64-bit sliding window
+- **Replay protection**: 4096-entry sliding window
+- **Reliable delivery**: optional per-channel sequencing, cumulative + selective ACKs (SACK), retransmit with exponential backoff, and window-based flow control
+- **Rate limiting**: optional per-session send rate cap (token bucket; configurable bytes-per-second)
 
 All multi-byte integers are **little-endian** unless stated otherwise.
 
@@ -428,19 +432,29 @@ sends keepalives will still receive them in return.
 ## 8. Replay Protection
 
 Incoming data, keepalive, disconnect, and fragment packets are all subject to
-replay protection using a 64-bit sliding window of size 64.
+replay protection using a 4096-entry sliding window implemented as a
+`[64]uint64` bitmap (64 words × 64 bits).
 
 ```
-Window covers: [head - 63, head]
+Window covers: [head - 4095, head]
 ```
 
 - If `counter > head`: accepted (new high-water mark).
-- If `counter < head - 63`: rejected (too old).
+- If `counter < head - 4095`: rejected (too old).
 - Otherwise: check bitmask. If bit already set: rejected (duplicate).
 
 The window is updated (`head` advanced, bitmap updated) only after AEAD
 decryption succeeds. `head` is stored atomically for a lock-free fast path
 on the common case of strictly in-order delivery.
+
+**Why 4096 entries?** On Linux, `sendFragments` allocates all N fragment
+counters in a tight loop *before* the `sendmmsg` batch is written to the
+socket. A concurrent keepalive send can steal a counter mid-loop and arrive
+at the peer before the fragment batch, causing the peer's `head` to advance
+past the early fragment counters. With the original 64-entry window, a
+difference ≥ 64 triggered spurious replay rejections and permanent event
+loss. A 4096-entry window safely accommodates the maximum in-flight fragment
+count with ample headroom.
 
 ---
 
@@ -465,8 +479,9 @@ When all `frag_count` fragments for a `frame_id` arrive, the payloads are
 concatenated in `frag_index` order and the result is decoded as a Frame.
 
 Incomplete fragment sets are garbage-collected after `2 × KeepaliveInterval`
-of inactivity. At most `MaxIncompleteFrames` (default 64) partial frames
-are buffered per session; excess fragments are silently dropped.
+of inactivity. At most `MaxIncompleteFrames` (default 64, configurable per
+`ServerConfig`/`DialConfig`) partial frames are buffered per session; excess
+fragments are silently dropped.
 
 Duplicate fragments (same `frame_id` + `frag_index`) are ignored.
 
@@ -475,21 +490,42 @@ Duplicate fragments (same `frame_id` + `frag_index`) are ignored.
 ## 10. Frame Wire Format
 
 A **Frame** is the plaintext inside a Data or reassembled DataFragment packet.
+It uses a custom encoding that is a strict subset of Protocol Buffers wire
+format, allowing standard proto decoders to parse it as an extension of the
+proto schema.
 
 ```
-Byte 0:    channel_id   (uint8)
-Byte 1..N: events       (sequence of length-prefixed event bodies)
+Byte 0:       channel_id    (uint8, raw — not proto-encoded)
+Bytes 1..N:   events        (field-1 LEN records, one per event)
+[optional]    Seq           (field-2 varint)  — omitted when 0 (unreliable)
+[optional]    AckSeq        (field-3 varint)  — omitted when 0
+[optional]    AckBitmap     (field-4 I64 LE)  — omitted when 0
+[optional]    WindowSize    (field-5 varint)  — omitted when 0
 ```
 
-Each event body is encoded as a Protocol Buffers–style LEN field
-(field 1, wire type 2):
+Each event body is encoded as a Protocol Buffers–style LEN field:
 
 ```
-varint(0x0A)             # field=1, wire type=LEN (proto tag)
+varint(0x0A)             # field=1, wire type=2 (LEN)  → event body follows
 varint(len(event_body))  # byte length of event body
 event_body[0]            # event type (uint8, 0–254 app-defined; 255 internal)
 event_body[1:]           # opaque payload bytes (may be empty)
 ```
+
+The reliability fields are appended after all events using these proto tags:
+
+```
+varint(0x10)             # field=2, wire type=0 (varint)  → Seq (uint32)
+varint(0x18)             # field=3, wire type=0 (varint)  → AckSeq (uint32)
+varint(0x21)             # field=4, wire type=1 (I64 LE)  → AckBitmap (uint64)
+varint(0x28)             # field=5, wire type=0 (varint)  → WindowSize (uint32)
+```
+
+All four reliability fields are zero-omitted, preserving backward
+compatibility with peers that implement only unreliable delivery.
+
+A **standalone ACK** frame carries no events (`Events` is empty) and has
+`Seq == 0`; it carries only `AckSeq`, `AckBitmap`, and `WindowSize`.
 
 Multiple events may be packed into a single Frame (coalescing).
 
@@ -501,13 +537,87 @@ Multiple events may be packed into a single Frame (coalescing).
 | 1–254 | Application-defined channels |
 | 255 | Internal (`channelCloseType`) |
 
-Event type 255 on channel ID 255 signals that the remote peer has closed
-that channel. The receiver evicts the channel and signals any blocked `Recv`
-callers with an error.
+Event type 255 (`channelCloseType`) on any channel signals that the remote
+peer has closed that channel. The receiver evicts the channel and signals any
+blocked `Recv` callers with an error.
 
 ---
 
-## 11. Numeric Limits
+## 11. Reliable Delivery
+
+Reliable delivery is opt-in per channel via `Channel.SetReliable(ReliableCfg)`.
+Channels that do not call `SetReliable` have zero overhead; all reliability
+fields in their frames are zero and ignored on receipt.
+
+### 11.1 Sequence numbers
+
+Sequence numbers are `uint32`, starting at **1** (0 is reserved to mean
+"unreliable"). The sender assigns a monotonically increasing sequence number
+to each outgoing frame in `preSend`. Sequence numbers reset to 1 whenever
+the underlying session reconnects (persistent connections).
+
+### 11.2 Cumulative ACK
+
+`AckSeq` carries the **next expected** sequence number (TCP-style). A value
+of `AckSeq = N` means the receiver has received all frames with
+`seq ∈ [1, N-1]` in order and is waiting for `seq == N`. The sender frees
+all pending frames with `seq < AckSeq`.
+
+### 11.3 Selective ACK (SACK)
+
+`AckBitmap` is a 64-bit SACK bitmap. Bit `i` (LSB = bit 0) is set when
+the frame with sequence number `AckSeq + i + 1` has been received out of
+order. The sender uses this to free selectively acknowledged frames without
+waiting for gap-filling retransmits.
+
+The receiver maintains an out-of-order (OOO) buffer of at most
+`reliableOOOWindow = 64` slots. Frames arriving more than 64 positions ahead
+of the expected sequence are dropped.
+
+### 11.4 Flow control (window)
+
+`WindowSize` reports how many additional frames the sender of the ACK can
+accept (receive-buffer headroom). The remote sender blocks when
+`numPending >= peerWindow`. `WindowSize` is updated dynamically as the
+receiver's channel buffer drains. The initial window equals the configured
+`ReliableCfg.WindowSize` (default 256).
+
+### 11.5 ACK timing
+
+ACKs are **piggybacked** on outgoing data frames whenever possible: before
+a data frame is sent, any pending ACK state is consumed and written into
+the frame's `AckSeq`/`AckBitmap`/`WindowSize` fields at no extra cost.
+
+When no data is ready to send, a **standalone ACK** is dispatched after at
+most `ACKDelay` (default 20 ms) by a `time.AfterFunc` timer.
+
+### 11.6 Retransmit
+
+A single retransmit timer (`time.AfterFunc`) is armed per channel after any
+frame is sent. On firing it retransmits the oldest unACKed frame and
+reschedules itself with **exponential backoff** (RTO doubles each retry,
+capped at `maxRTO = 30 s`). After `MaxRetries` (default 10) consecutive
+retransmit attempts the channel is closed.
+
+The retransmit timer is reset to `BaseRTO` (default 200 ms) whenever an ACK
+frees at least one frame.
+
+### 11.7 Reconnect behaviour
+
+When a persistent `Conn` reconnects, `reset()` is called on every channel
+that has a `reliableState`. This purges all pending frames, resets `nextSeq`
+to 1, restores `peerWindow` to the configured maximum, and broadcasts on the
+flow-control condition variable to unblock any goroutines waiting in
+`preSend`. The receiver-side `expectSeq` is also reset to 1 and the OOO
+buffer is cleared.
+
+In-flight frames that had not been ACKed before the reconnect are discarded;
+the application layer is responsible for any end-to-end retransmission policy
+across reconnects.
+
+---
+
+## 12. Numeric Limits
 
 | Constant | Value |
 |---|---|
@@ -520,18 +630,25 @@ callers with an error.
 | `sizeKeepalive` / `sizeDisconnect` | 32 bytes |
 | `defaultMaxPacketSize` | 1232 bytes |
 | `defaultMaxFragPayload` | 1192 bytes |
-| `maxReassemblyBufs` (default) | 64 |
-| `windowSize` (replay) | 64 |
+| `MaxIncompleteFrames` (default) | 64 (configurable) |
+| `windowWords` | 64 |
+| `windowSize` (replay) | 4096 (= 64 words × 64 bits) |
 | `maxTimestampSkew` | 180 s |
 | `cookieRotation` | 2 min |
 | `rekeyAfterTime` | 180 s |
 | `rekeyAfterMessages` | 2^60 |
 | Maximum fragments per frame | 65 535 |
 | Maximum channels | 256 (IDs 0–255) |
+| `defaultReliableWindow` | 256 frames |
+| `defaultBaseRTO` | 200 ms |
+| `defaultMaxRetries` | 10 |
+| `defaultACKDelay` | 20 ms |
+| `maxRTO` | 30 s |
+| `reliableOOOWindow` | 64 slots |
 
 ---
 
-## 12. Implementation Notes
+## 13. Implementation Notes
 
 ### Batch sends (Linux)
 
@@ -565,3 +682,25 @@ sysctl -w net.core.wmem_max=4194304
 
 or use `SO_RCVBUFFORCE` (requires `CAP_NET_ADMIN`).
 In Docker, pass `--sysctl net.core.rmem_max=4194304`.
+
+### Rate limiting
+
+When `SendRateLimitBPS` is non-zero in `ServerConfig` or `DialConfig`, a
+token-bucket limiter is installed on the session's send path. The burst
+capacity is 2× the per-second rate, allowing short bursts to proceed at
+full wire speed. The limiter is checked in `session.send()` and
+`session.sendFragments()` before each write; it sleeps on a timer when
+tokens are exhausted and aborts early if the session closes.
+
+### Pipeline sizing (`ProbeUDPRecvBufSize`)
+
+Benchmark and high-throughput pipeline code should call
+`wiresocket.ProbeUDPRecvBufSize(requested int) int` to determine the actual
+achievable receive-buffer size before computing `inflightCap`. On Linux
+without `CAP_NET_ADMIN`, `SO_RCVBUF` is clamped by `net.core.rmem_max`; the
+probe function creates a temporary loopback socket, applies
+`SO_RCVBUFFORCE` (falling back to `SO_RCVBUF`), reads back the result with
+`getsockopt`, and divides by 2 to undo the kernel's automatic doubling. On
+other platforms it returns `requested` unchanged. Using the probed value
+prevents the in-flight frame count from exceeding what the kernel buffer can
+hold, avoiding packet loss under burst sends.
