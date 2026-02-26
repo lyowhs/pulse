@@ -246,13 +246,27 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		fragsPerEvent = (payloadSize + maxFrag - 1) / maxFrag
 	}
 
-	// Cap inflightCap so that the total fragment data in-flight stays within
-	// the socket receive buffer.  dialSession sets SO_RCVBUF to 4 MiB; Linux
-	// doubles the value internally, giving ~8 MiB of actual buffer.  We use
-	// 75 % of that (6 MiB) as a headroom margin to absorb bursty scheduling.
-	if fragsPerEvent > 1 {
-		const socketBuf = 6 << 20 // 75 % of ~8 MiB kernel receive buffer
-		maxByBuf := socketBuf / (fragsPerEvent * mtu)
+	// Cap inflightCap so that all in-flight fragments fit inside the kernel
+	// receive buffer.  We probe the actual achievable buffer size rather than
+	// assuming 6 MiB: on Linux without CAP_NET_ADMIN, SO_RCVBUF is clamped by
+	// net.core.rmem_max (≈ 104 KiB on stock kernels), far below the requested
+	// 4 MiB.  Using the hardcoded constant caused massive socket-level drops on
+	// Linux because inflightCap was set orders of magnitude too high.
+	//
+	// Derivation of the cap:
+	//   in-flight UDP packets = inflightCap / eventsPerFrame × fragsPerEvent
+	//   in-flight bytes       ≈ (inflightCap / eventsPerFrame) × fragsPerEvent × mtu
+	//   constraint            ≤ socketBuf
+	//   ⟹ inflightCap        ≤ socketBuf × eventsPerFrame / (fragsPerEvent × mtu)
+	//
+	// The cap is applied unconditionally (not just for fragsPerEvent > 1) so
+	// that large single-fragment frames (e.g. mtu=65507, size=4096) are also
+	// bounded — they can overflow the socket buffer just as easily.
+	{
+		const requested = 4 << 20 // matches dialSession / Serve socket buffer request
+		actualBuf := wiresocket.ProbeUDPRecvBufSize(requested)
+		socketBuf := actualBuf * 3 / 4 // 75 % headroom margin
+		maxByBuf := socketBuf * eventsPerFrame / (fragsPerEvent * mtu)
 		if maxByBuf < 1 {
 			maxByBuf = 1
 		}

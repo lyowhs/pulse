@@ -7,6 +7,46 @@ import (
 	"syscall"
 )
 
+// ProbeUDPRecvBufSize returns the actual kernel-allocated UDP receive buffer
+// size achievable for a socket requesting size bytes.
+//
+// It creates a temporary loopback UDP socket, applies the same
+// SO_RCVBUFFORCE → SO_RCVBUF fallback logic used by setSocketBuffers, reads
+// back the actual value with GetsockoptInt (dividing by 2 to undo the kernel's
+// internal doubling), and then closes the probe socket.  The returned value
+// represents the usable receive buffer available to real sessions.
+//
+// Callers should use the returned value — not the requested size — when sizing
+// pipeline parameters such as inflightCap so that in-flight data does not
+// exceed what the kernel will actually buffer.
+func ProbeUDPRecvBufSize(requested int) int {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return requested
+	}
+	defer conn.Close()
+
+	rc, err := conn.SyscallConn()
+	if err != nil {
+		return requested
+	}
+
+	var actual int
+	_ = rc.Control(func(fd uintptr) {
+		ifd := int(fd)
+		if e := syscall.SetsockoptInt(ifd, syscall.SOL_SOCKET, syscall.SO_RCVBUFFORCE, requested); e != nil {
+			_ = syscall.SetsockoptInt(ifd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, requested)
+		}
+		v, _ := syscall.GetsockoptInt(ifd, syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+		actual = v / 2 // undo kernel doubling
+	})
+
+	if actual < 1 {
+		actual = requested
+	}
+	return actual
+}
+
 // setSocketBuffers sets the kernel SO_RCVBUF and SO_SNDBUF for conn to size.
 //
 // On Linux, net.UDPConn.SetReadBuffer / SetWriteBuffer issue SO_RCVBUF /

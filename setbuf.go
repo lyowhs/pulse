@@ -4,14 +4,6 @@ package wiresocket
 
 import "net"
 
-// ProbeUDPRecvBufSize returns the actual kernel-allocated UDP receive buffer
-// size achievable for a socket requesting size bytes.
-//
-// On non-Linux platforms SetReadBuffer / SetWriteBuffer are not clamped as
-// aggressively as on Linux (macOS and Windows typically grant the full
-// requested size), so we optimistically return the requested value.
-func ProbeUDPRecvBufSize(requested int) int { return requested }
-
 // setSocketBuffers sets the kernel socket receive and send buffers for conn.
 // On non-Linux platforms the standard SetReadBuffer / SetWriteBuffer calls are
 // used directly; there is no privileged bypass mechanism.
