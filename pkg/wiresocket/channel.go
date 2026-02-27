@@ -209,5 +209,10 @@ func (ch *Channel) closeLocal() {
 	ch.closeOnce.Do(func() {
 		dbg("channel closed", "channel_id", ch.id)
 		close(ch.done)
+		// Wake any goroutine blocked in preSend's cond.Wait so it can
+		// detect the channel-closed condition and return ErrChannelClosed.
+		if rs := ch.reliable.Load(); rs != nil {
+			rs.cond.Broadcast()
+		}
 	})
 }

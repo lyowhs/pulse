@@ -80,7 +80,27 @@ type ServerConfig struct {
 	// SendRateLimitBPS, if non-zero, limits the outgoing byte rate per session
 	// to approximately this many bytes per second.  A burst of up to 2× the
 	// per-second rate is allowed before throttling begins.  0 means unlimited.
+	// Ignored when CongestionControl is non-nil.
 	SendRateLimitBPS int64
+
+	// CongestionControl, when non-nil, enables the AIMD congestion controller
+	// on each accepted server connection.  Each Conn gets an independent CC
+	// instance starting from the same configuration.
+	// Requires at least one reliable channel on each Conn for loss feedback.
+	// Overrides SendRateLimitBPS when set.
+	CongestionControl *CongestionConfig
+
+	// DefaultReliable configures reliable delivery applied to every channel on
+	// every accepted connection.  When nil and DisableDefaultReliable is false,
+	// reliable delivery is enabled automatically with sensible defaults.
+	// Override specific channels via Channel.SetReliable.
+	DefaultReliable *ReliableCfg
+
+	// DisableDefaultReliable, if true, disables the automatic reliable-delivery
+	// default for all channels on accepted connections.  Use for real-time or
+	// latency-sensitive workloads where head-of-line blocking is worse than a
+	// dropped frame.
+	DisableDefaultReliable bool
 
 	// WorkChannelSize is the number of incoming packets buffered between the
 	// UDP reader goroutine and the worker pool.  If the channel is full,
@@ -117,6 +137,16 @@ func (cfg *ServerConfig) defaults() {
 		cfg.WorkChannelSize = cfg.WorkerCount * 64
 		if cfg.WorkChannelSize < 4096 {
 			cfg.WorkChannelSize = 4096
+		}
+	}
+	// Reliable delivery is on by default.
+	if !cfg.DisableDefaultReliable && cfg.DefaultReliable == nil {
+		cfg.DefaultReliable = &ReliableCfg{}
+	}
+	// CC requires reliable with enough retries to survive rate-limited sends.
+	if cfg.CongestionControl != nil && cfg.DefaultReliable != nil {
+		if cfg.DefaultReliable.MaxRetries < 30 {
+			cfg.DefaultReliable.MaxRetries = 30
 		}
 	}
 }
@@ -464,7 +494,14 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	// Having sess.router set first ensures no events are silently dropped.
 	var conn *Conn
 	if s.cfg.OnConnect != nil {
-		conn = newConn(sess, s.cfg.CoalesceInterval)
+		conn = newConn(sess, s.cfg.CoalesceInterval, s.cfg.DefaultReliable)
+		if s.cfg.CongestionControl != nil {
+			cc := newAIMDController(normalizeCCConfig(*s.cfg.CongestionControl), conn)
+			conn.cc = cc
+			// newConn already called wireSession; install CC on the session directly.
+			conn.sess.rateLimiter = cc
+			go cc.run()
+		}
 	}
 
 	s.sessions.Store(localIdx, sess)

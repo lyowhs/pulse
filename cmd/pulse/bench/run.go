@@ -28,7 +28,8 @@ throughput for each combination of --size and --mtu.  No second terminal needed.
 	cmd.Flags().IntSlice("mtu", []int{1472}, "UDP payload MTU(s) to sweep (comma-separated or repeated)")
 	cmd.Flags().IntSlice("size", []int{1024, 64 * 1024, 512 * 1024}, "payload size(s) in bytes to sweep")
 	cmd.Flags().Duration("coalesce", 200*time.Microsecond, "coalesce interval; 0 disables")
-	cmd.Flags().Bool("reliable", false, "enable reliable delivery on the bench channel")
+	cmd.Flags().Bool("reliable", true, "use reliable delivery (default: on; set --reliable=false to disable)")
+	cmd.Flags().Bool("cc", false, "enable AIMD congestion control (auto-enables reliable delivery for loss feedback)")
 	return cmd
 }
 
@@ -38,6 +39,7 @@ func runBench(cmd *cobra.Command, _ []string) error {
 	sizes, _ := cmd.Flags().GetIntSlice("size")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
 	reliable, _ := cmd.Flags().GetBool("reliable")
+	cc, _ := cmd.Flags().GetBool("cc")
 
 	type result struct {
 		mtu      int
@@ -59,7 +61,7 @@ func runBench(cmd *cobra.Command, _ []string) error {
 	for _, mtu := range mtus {
 		for _, size := range sizes {
 			skipped := size > maxPayloadForMTU(mtu)
-			r, err := runOne(dur, mtu, size, coalesce, reliable)
+			r, err := runOne(dur, mtu, size, coalesce, reliable, cc)
 			if err != nil {
 				return fmt.Errorf("bench mtu=%d size=%d: %w", mtu, size, err)
 			}
@@ -198,7 +200,7 @@ func maxPayloadForMTU(mtu int) int {
 // and returns throughput, loss, latency, and retransmit metrics.
 // Returns a zero result (not an error) when the payload cannot be sent at the
 // given MTU.
-func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, reliable bool) (oneResult, error) {
+func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, reliable, cc bool) (oneResult, error) {
 	if payloadSize > maxPayloadForMTU(mtu) {
 		fmt.Fprintf(os.Stderr, "  skipping mtu=%-5d payload=%-10s — exceeds 255-fragment limit\n",
 			mtu, fmtSize(int64(payloadSize)))
@@ -296,6 +298,14 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	rttMask := rttRingSize - 1
 	sendTimes := make([]atomic.Int64, rttRingSize)
 
+	// reliableCfg sizes the reliable send window to match the token semaphore
+	// so the reliable window never becomes a throughput bottleneck.  When
+	// reliable=false this is nil and DisableDefaultReliable suppresses reliable.
+	var reliableCfg *wiresocket.ReliableCfg
+	if reliable {
+		reliableCfg = &wiresocket.ReliableCfg{WindowSize: inflightCap}
+	}
+
 	kp, err := wiresocket.GenerateKeypair()
 	if err != nil {
 		return oneResult{}, err
@@ -315,14 +325,29 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	if srvMaxIncomplete < 512 {
 		srvMaxIncomplete = 512
 	}
+	// workerCount: reliable delivery requires in-order frame processing so
+	// that reliableState.onRecv never sees OOO gaps larger than
+	// reliableOOOWindow (256).  With GOMAXPROCS workers, goroutine scheduling
+	// stalls let frames overtake each other on loopback, creating gaps that
+	// exceed 256 → permanent frame drops → retransmit storm → conn.Flush
+	// timeout → large lost count.  A single worker serialises onRecv calls,
+	// keeping the gap ≤ 1 on an in-order loopback path.  When reliable is
+	// disabled the multi-worker path is safe (no OOO state to overflow).
+	workerCount := 0 // 0 = default (GOMAXPROCS)
+	if reliable {
+		workerCount = 1
+	}
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
-		Addr:                addr,
-		PrivateKey:          kp.Private,
-		OnConnect:           echoConn,
-		MaxPacketSize:       mtu,
-		CoalesceInterval:    coalesce,
-		MaxIncompleteFrames: srvMaxIncomplete,
-		EventBufSize:        eventBufSize,
+		Addr:                   addr,
+		PrivateKey:             kp.Private,
+		OnConnect:              echoConn,
+		MaxPacketSize:          mtu,
+		CoalesceInterval:       coalesce,
+		MaxIncompleteFrames:    srvMaxIncomplete,
+		EventBufSize:           eventBufSize,
+		DisableDefaultReliable: !reliable,
+		DefaultReliable:        reliableCfg,
+		WorkerCount:            workerCount,
 		// WorkChannelSize must hold all fragments of all in-flight events so
 		// that the UDP reader goroutine never drops a fragment before a worker
 		// can reassemble it.  Add a 64-packet headroom for keepalives.
@@ -347,26 +372,29 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	conn, err := wiresocket.Dial(context.Background(), addr, wiresocket.DialConfig{
-		ServerPublicKey:     kp.Public,
-		HandshakeTimeout:    5 * time.Second,
-		MaxRetries:          10,
-		MaxPacketSize:       mtu,
-		CoalesceInterval:    coalesce,
-		EventBufSize:        eventBufSize,
+	dialCfg := wiresocket.DialConfig{
+		ServerPublicKey:        kp.Public,
+		HandshakeTimeout:       5 * time.Second,
+		MaxRetries:             10,
+		MaxPacketSize:          mtu,
+		CoalesceInterval:       coalesce,
+		EventBufSize:           eventBufSize,
+		DisableDefaultReliable: !reliable,
+		DefaultReliable:        reliableCfg,
 		// Double inflightCap so the client has headroom to reassemble the
 		// next batch of frames while echoes from the current batch are still
 		// in-flight back to the sender.
 		MaxIncompleteFrames: inflightCap * 2,
-	})
+	}
+	if cc {
+		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}
+	}
+	conn, err := wiresocket.Dial(context.Background(), addr, dialCfg)
 	if err != nil {
 		return oneResult{}, fmt.Errorf("dial: %w", err)
 	}
 
 	ch := conn.Channel(benchChannel)
-	if reliable {
-		ch.SetReliable(wiresocket.ReliableCfg{})
-	}
 	payload := make([]byte, payloadSize)
 
 	var txMsgs, txBytes, rxMsgs, rxBytes atomic.Int64

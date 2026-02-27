@@ -30,7 +30,8 @@ func clientCommand() *cobra.Command {
 	cmd.Flags().Int("parallel", 1, "number of concurrent sender goroutines")
 	cmd.Flags().Int("mtu", 1472, "UDP payload MTU in bytes")
 	cmd.Flags().Duration("coalesce", 200*time.Microsecond, "coalesce interval; 0 disables coalescing")
-	cmd.Flags().Bool("reliable", false, "enable reliable delivery with default window/RTO settings")
+	cmd.Flags().Bool("reliable", true, "use reliable delivery (default: on; set --reliable=false to disable)")
+	cmd.Flags().Bool("cc", false, "enable AIMD congestion control (auto-enables reliable delivery for loss feedback)")
 	return cmd
 }
 
@@ -43,6 +44,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 	mtu, _ := cmd.Flags().GetInt("mtu")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
 	reliable, _ := cmd.Flags().GetBool("reliable")
+	cc, _ := cmd.Flags().GetBool("cc")
 
 	var serverPub [32]byte
 	b, err := hex.DecodeString(pubkeyHex)
@@ -56,14 +58,20 @@ func runClient(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "connecting to %s …\n", serverAddr)
 
+	dialCfg := wiresocket.DialConfig{
+		ServerPublicKey:        serverPub,
+		HandshakeTimeout:       5 * time.Second,
+		MaxRetries:             10,
+		MaxPacketSize:          mtu,
+		CoalesceInterval:       coalesce,
+		DisableDefaultReliable: !reliable,
+	}
+	if cc {
+		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}
+	}
+
 	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
-	conn, err := wiresocket.Dial(dialCtx, serverAddr, wiresocket.DialConfig{
-		ServerPublicKey:  serverPub,
-		HandshakeTimeout: 5 * time.Second,
-		MaxRetries:       10,
-		MaxPacketSize:    mtu,
-		CoalesceInterval: coalesce,
-	})
+	conn, err := wiresocket.Dial(dialCtx, serverAddr, dialCfg)
 	dialCancel()
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -72,9 +80,6 @@ func runClient(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "connected\n\n")
 
 	ch := conn.Channel(benchChannel)
-	if reliable {
-		ch.SetReliable(wiresocket.ReliableCfg{})
-	}
 
 	var txMsgs, txBytes, rxMsgs, rxBytes atomic.Int64
 
@@ -123,10 +128,19 @@ func runClient(cmd *cobra.Command, args []string) error {
 	if reliable {
 		reliableStr = "yes"
 	}
-	fmt.Fprintf(os.Stdout, "  payload %-10s  duration %-8s  senders %d  mtu %d  coalesce %s  reliable %s\n\n",
-		fmtSize(int64(size)), dur, parallel, mtu, coalesce, reliableStr)
-	fmt.Fprintf(os.Stdout, "  %7s   %10s   %10s   %10s   %10s\n",
-		"elapsed", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s")
+	ccStr := "no"
+	if cc {
+		ccStr = "yes"
+	}
+	fmt.Fprintf(os.Stdout, "  payload %-10s  duration %-8s  senders %d  mtu %d  coalesce %s  reliable %s  cc %s\n\n",
+		fmtSize(int64(size)), dur, parallel, mtu, coalesce, reliableStr, ccStr)
+	if cc {
+		fmt.Fprintf(os.Stdout, "  %7s   %10s   %10s   %10s   %10s   %10s\n",
+			"elapsed", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s", "cc KiB/s")
+	} else {
+		fmt.Fprintf(os.Stdout, "  %7s   %10s   %10s   %10s   %10s\n",
+			"elapsed", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s")
+	}
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -160,10 +174,18 @@ func runClient(cmd *cobra.Command, args []string) error {
 			curTXM, curTXB := txMsgs.Load(), txBytes.Load()
 			curRXM, curRXB := rxMsgs.Load(), rxBytes.Load()
 
-			fmt.Fprintf(os.Stdout, "  %7s   %10d   %10.3f   %10d   %10.3f\n",
-				elapsed,
-				curTXM-prevTXM, float64(curTXB-prevTXB)*8/1e9,
-				curRXM-prevRXM, float64(curRXB-prevRXB)*8/1e9)
+			if cc {
+				fmt.Fprintf(os.Stdout, "  %7s   %10d   %10.3f   %10d   %10.3f   %10.1f\n",
+					elapsed,
+					curTXM-prevTXM, float64(curTXB-prevTXB)*8/1e9,
+					curRXM-prevRXM, float64(curRXB-prevRXB)*8/1e9,
+					conn.CongestionRateKBps())
+			} else {
+				fmt.Fprintf(os.Stdout, "  %7s   %10d   %10.3f   %10d   %10.3f\n",
+					elapsed,
+					curTXM-prevTXM, float64(curTXB-prevTXB)*8/1e9,
+					curRXM-prevRXM, float64(curRXB-prevRXB)*8/1e9)
+			}
 
 			prevTXM, prevTXB, prevRXM, prevRXB = curTXM, curTXB, curRXM, curRXB
 

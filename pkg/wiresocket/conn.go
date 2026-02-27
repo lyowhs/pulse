@@ -51,19 +51,40 @@ type Conn struct {
 	//  - non-persistent: aliased to sess.done (closed when the session ends)
 	//  - persistent: closed when reconnectLoop exits after Close()
 	done chan struct{}
+
+	// cc is non-nil when CongestionControl is configured.  It persists across
+	// session reconnects so that the learned rate (ssthresh) is preserved.
+	cc *aimdController
+
+	// defaultReliable, when non-nil, is applied to every channel opened on
+	// this connection.  Individual channels can override via SetReliable.
+	defaultReliable *ReliableCfg
+}
+
+// CongestionRateKBps returns the current AIMD congestion-controller send rate
+// in KiB/s, or 0 if congestion control is not configured on this Conn.
+func (c *Conn) CongestionRateKBps() float64 {
+	if c.cc == nil {
+		return 0
+	}
+	return c.cc.currentRateKBps()
 }
 
 // newConn creates a non-persistent Conn over an already-established session.
 // coalesceInterval > 0 enables the event coalescer.
 // wireSession is called here so the router is in place before the caller
 // starts the read-loop goroutine.
-func newConn(s *session, coalesceInterval time.Duration) *Conn {
+func newConn(s *session, coalesceInterval time.Duration, defaultReliable *ReliableCfg) *Conn {
 	c := &Conn{
-		sess: s,
-		done: s.done, // alias: done when the session closes
+		sess:            s,
+		done:            s.done, // alias: done when the session closes
+		defaultReliable: defaultReliable,
 	}
 	c.ch0 = newChannel(0, c, s.eventBuf)
 	c.channels[0].Store(c.ch0)
+	if defaultReliable != nil {
+		c.ch0.SetReliable(*defaultReliable)
+	}
 	if coalesceInterval > 0 {
 		c.coalescer = newCoalescer(c, coalesceInterval, s.maxFragPayload)
 	}
@@ -120,6 +141,14 @@ func (c *Conn) currentSession(ctx context.Context) (*session, error) {
 // in the Go memory model, so no extra synchronisation is needed for visibility
 // of sess.router inside the read-loop goroutine.
 func (c *Conn) wireSession(sess *session) {
+	// If a congestion controller is configured, wire it into the new session as
+	// the rate limiter and re-baseline the retransmit counter so that the
+	// reliable-state reset on reconnect is not misread as a loss event.
+	if c.cc != nil {
+		sess.rateLimiter = c.cc
+		c.cc.onReconnect()
+	}
+
 	sess.router = func(f *Frame) {
 		ch := c.getOrOpenChannel(f.ChannelId)
 
@@ -282,6 +311,9 @@ func (c *Conn) getOrOpenChannel(id uint8) *Channel {
 	}
 	ch := newChannel(id, c, cap(c.ch0.events))
 	if c.channels[id].CompareAndSwap(nil, ch) {
+		if c.defaultReliable != nil {
+			ch.SetReliable(*c.defaultReliable)
+		}
 		return ch // we won the race
 	}
 	// Another goroutine stored a channel for this id concurrently.

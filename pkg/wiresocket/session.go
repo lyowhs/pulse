@@ -39,6 +39,12 @@ const (
 	rekeyAfterMessages = uint64(1) << 60
 )
 
+// sendLimiter is implemented by tokenBucket (static rate) and aimdController
+// (dynamic AIMD rate).  nil means unlimited — callers guard with != nil.
+type sendLimiter interface {
+	wait(done <-chan struct{}, n int) error
+}
+
 // session holds all state for one established peer connection.
 type session struct {
 	// Transport keys (kept for reference; AEADs are derived from them).
@@ -89,7 +95,8 @@ type session struct {
 
 	// rateLimiter, when non-nil, throttles outgoing bytes to a configured
 	// rate.  nil means unlimited (zero overhead on the send hot-path).
-	rateLimiter *tokenBucket
+	// Implements either a static tokenBucket or an aimdController.
+	rateLimiter sendLimiter
 
 	// onClose, if non-nil, is called once by close() to propagate teardown.
 	// Used by non-persistent Conns to close all channels when the session ends.
@@ -168,7 +175,7 @@ func newSession(
 		}
 	}
 
-	var rl *tokenBucket
+	var rl sendLimiter
 	if sendRateLimitBPS > 0 {
 		rl = newTokenBucket(sendRateLimitBPS)
 	}

@@ -16,17 +16,31 @@ type tokenBucket struct {
 }
 
 // newTokenBucket creates a token bucket for the given byte-per-second rate.
-// The burst capacity is set to 2× the per-second rate so short bursts can
-// proceed at full wire speed before throttling kicks in.
+// The burst capacity equals the per-second rate (1-second burst window),
+// allowing short bursts while keeping the CC-visible first-second throughput
+// close to the configured rate.
 func newTokenBucket(bps int64) *tokenBucket {
 	rate := float64(bps) / 1e9 // convert bytes/sec → bytes/ns
-	burst := float64(bps) * 2  // 2-second burst capacity
+	burst := float64(bps)      // 1-second burst capacity
 	return &tokenBucket{
 		tokens: burst,
 		rate:   rate,
 		burst:  burst,
 		last:   time.Now().UnixNano(),
 	}
+}
+
+// setRate updates the token bucket to a new rate.  It is safe to call
+// concurrently with wait; the next call to wait will pick up the new rate.
+func (b *tokenBucket) setRate(bps float64) {
+	b.mu.Lock()
+	b.rate = bps / 1e9 // bytes/ns
+	newBurst := bps    // 1× burst (mirrors newTokenBucket)
+	if b.tokens > newBurst {
+		b.tokens = newBurst // clamp existing tokens if rate dropped
+	}
+	b.burst = newBurst
+	b.mu.Unlock()
 }
 
 // wait blocks until n bytes of credit are available, then consumes them.

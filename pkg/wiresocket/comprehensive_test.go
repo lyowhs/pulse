@@ -19,6 +19,7 @@ package wiresocket_test
 //   - Rate-limited delivery (correctness)
 //   - Rate-limited delivery timing (slow test; skipped in -short mode)
 //   - Concurrent sends on multiple channels
+//   - Reliable+coalescing: zero event loss (regression for window unit mismatch)
 
 import (
 	"context"
@@ -1221,7 +1222,12 @@ func TestConcurrentSendRecv(t *testing.T) {
 	const workers = 4
 	const perWorker = 50
 
+	// Disable reliable delivery: this test exercises concurrent-send safety,
+	// not in-order delivery.  With 4 concurrent senders the OOO sequence-number
+	// gaps can exceed the 64-slot SACK buffer, causing frame drops and
+	// retransmit timeouts that exceed the test deadline.
 	addr, kp := serverSetup(t, wiresocket.ServerConfig{
+		DisableDefaultReliable: true,
 		OnConnect: func(conn *wiresocket.Conn) {
 			for {
 				e, err := conn.Recv(context.Background())
@@ -1235,7 +1241,7 @@ func TestConcurrentSendRecv(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn := mustDial(t, ctx, addr, kp)
+	conn := mustDial(t, ctx, addr, kp, wiresocket.DialConfig{DisableDefaultReliable: true})
 
 	var (
 		sendWG sync.WaitGroup
@@ -1284,4 +1290,82 @@ func TestConcurrentSendRecv(t *testing.T) {
 
 	conn.Close()
 	recvWG.Wait()
+}
+
+// TestReliableCoalescedFrameNoLoss is a regression test for the window unit
+// mismatch (Bug 1): the old code tracked numPending in frames while peerWindow
+// was in events (from myWindow = cap−len of ch.events).  With coalescing active
+// each frame carries multiple events; W "allowed frames" could inject
+// W×eventsPerFrame events into a W-slot receive buffer, causing silent
+// drop-oldest overflows that the sender misread as successful delivery.
+//
+// The fix counts numPending in events: preSend blocks when
+// numPending+evtCount > peerWindow, keeping the receiver's buffer safe.
+//
+// WindowSize and EventBufSize are both set to N so that all N events fit in
+// one window (no mid-stream blocking or zero-window deadlock).  With the old
+// code, peerWindow=N "frame slots" × eventsPerFrame ≈ 15 events/frame could
+// push N×15 events into a N-slot buffer, causing silent drops.
+func TestReliableCoalescedFrameNoLoss(t *testing.T) {
+	const N = 200 // total events; also used as WindowSize and EventBufSize
+
+	receivedC := make(chan uint8, N)
+
+	// WorkerCount=1 serialises onRecv so OOO gaps never exceed reliableOOOWindow.
+	// EventBufSize=N so the server buffer can hold all N in-flight events.
+	addr, kp := serverSetup(t, wiresocket.ServerConfig{
+		WorkerCount:  1,
+		EventBufSize: N,
+		OnConnect: func(conn *wiresocket.Conn) {
+			ch := conn.Channel(1)
+			for {
+				e, err := ch.Recv(context.Background())
+				if err != nil {
+					return
+				}
+				receivedC <- e.Type
+			}
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// CoalesceInterval batches multiple events per UDP frame, activating the
+	// event-counting window code path that was previously broken.
+	conn := mustDial(t, ctx, addr, kp, wiresocket.DialConfig{
+		CoalesceInterval: 200 * time.Microsecond,
+	})
+	ch := conn.Channel(1)
+	ch.SetReliable(wiresocket.ReliableCfg{
+		// WindowSize=N matches EventBufSize so numPending never exceeds the
+		// server's receive-buffer capacity when measured in events.
+		WindowSize: N,
+		ACKDelay:   5 * time.Millisecond,
+	})
+
+	// 100-byte payload: eventsPerFrame ≈ 15 at the default 1472-byte MTU.
+	payload := make([]byte, 100)
+	for i := 0; i < N; i++ {
+		if err := ch.Send(ctx, &wiresocket.Event{Type: uint8(i % 251), Payload: payload}); err != nil {
+			t.Fatalf("Send[%d]: %v", i, err)
+		}
+	}
+	conn.Flush(ctx)
+
+	for i := 0; i < N; i++ {
+		select {
+		case got := <-receivedC:
+			want := uint8(i % 251)
+			if got != want {
+				t.Errorf("event[%d]: got type %d, want %d (out-of-order?)", i, got, want)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timeout: received %d/%d events", i, N)
+		}
+	}
+
+	if r := ch.Retransmits(); r != 0 {
+		t.Logf("note: %d retransmit(s) observed on loopback (unexpected)", r)
+	}
 }

@@ -8,12 +8,32 @@ import (
 )
 
 const (
-	defaultReliableWindow  = 256
-	defaultBaseRTO         = 200 * time.Millisecond
-	defaultMaxRetries      = 10
-	defaultACKDelay        = 20 * time.Millisecond
-	maxRTO                 = 30 * time.Second
-	reliableOOOWindow      = 64 // must equal the bitmap width
+	// defaultReliableWindow is the default reliable send/receive window in
+	// events (not frames).  Because one coalesced frame may carry many events,
+	// sizing the window in events rather than frames prevents the sender from
+	// overflowing the receiver's channel buffer with a burst of large frames.
+	// 4096 events supports high-throughput coalesced workloads without tuning.
+	defaultReliableWindow = 4096
+	defaultBaseRTO        = 200 * time.Millisecond
+	defaultMaxRetries     = 10
+	defaultACKDelay       = 20 * time.Millisecond
+	maxRTO                = 30 * time.Second
+
+	// reliableOOOWindow is the size of the out-of-order frame buffer.  It must
+	// be at least as large as defaultReliableWindow so that a full in-flight
+	// window of frames can arrive out-of-order without any being dropped.
+	// Since defaultReliableWindow is now measured in events and each frame
+	// carries at least one event, the worst-case in-flight frame count equals
+	// defaultReliableWindow (one event per frame).  Both constants share the
+	// same value so the invariant is always satisfied.
+	reliableOOOWindow = defaultReliableWindow
+
+	// sackBitmapBits is the width of the SACK bitmap in ACK frames.  The wire
+	// format uses a uint64, so only the first 64 OOO slots can be selectively
+	// acknowledged.  Frames in OOO slots 65..reliableOOOWindow are buffered
+	// correctly but are not reported in SACK; the sender learns about them via
+	// the cumulative ACK once the window advances past those positions.
+	sackBitmapBits = 64
 )
 
 // ReliableCfg configures reliable delivery and flow control for a Channel.
@@ -58,11 +78,12 @@ func (c *ReliableCfg) withDefaults() ReliableCfg {
 
 // pendingFrame is one slot in the send-side ring buffer.
 type pendingFrame struct {
-	seq     uint32
-	frame   *Frame    // immutable once stored; re-sent as-is on retransmit
-	sentAt  time.Time
-	retries int
-	used    bool
+	seq      uint32
+	frame    *Frame    // immutable once stored; re-sent as-is on retransmit
+	sentAt   time.Time
+	retries  int
+	used     bool
+	evtCount int // number of events in frame; used to decrement numPending by events
 }
 
 // reliableState is the per-channel reliability and flow-control state.
@@ -73,14 +94,15 @@ type reliableState struct {
 
 	// ── send side ─────────────────────────────────────────────────────────
 	sendMu     sync.Mutex
-	nextSeq    uint32          // next sequence number to assign (starts at 1)
-	pending    [256]pendingFrame
-	numPending int
-	peerWindow int             // receiver-advertised window; starts at cfg.WindowSize
+	nextSeq    uint32        // next sequence number to assign (starts at 1)
+	pending    []pendingFrame // ring buffer; len == cfg.WindowSize; indexed by seq % len
+	numPending int           // total events (not frames) currently in-flight
+	peerWindow int           // receiver-advertised window in events; starts at cfg.WindowSize
 	cond       *sync.Cond     // wait when numPending >= peerWindow
-	rtoRunning bool            // true while rtoTimer is armed
-	rto        time.Duration   // current RTO (doubles on retransmit)
-	rtoTimer   *time.Timer
+	rtoRunning        bool          // true while rtoTimer is armed or retransmit is in-flight
+	rto               time.Duration // current RTO (doubles on retransmit)
+	rtoTimer          *time.Timer
+	retransmitInFlight bool         // true while retransmit() goroutine is blocked in sess.send()
 
 	// retransmits counts the total number of frame retransmit events since
 	// this reliableState was created or last reset.
@@ -102,6 +124,7 @@ func newReliableState(ch *Channel, cfg ReliableCfg) *reliableState {
 		channel:    ch,
 		nextSeq:    1,
 		expectSeq:  1,
+		pending:    make([]pendingFrame, cfg.WindowSize),
 		peerWindow: cfg.WindowSize,
 		rto:        cfg.BaseRTO,
 	}
@@ -121,17 +144,30 @@ func newAutoReliable(ch *Channel) *reliableState {
 // piggybacks any pending ACK from the receive side, saves frame in the
 // pending ring, and arms the retransmit timer.
 //
+// The window is measured in **events** (not frames) to prevent a burst of
+// coalesced frames from overflowing the receiver's channel buffer.  A frame
+// with N events consumes N window slots; the window opens again when the
+// receiver ACKs those events.
+//
 // It blocks when the send window is full (flow control) and returns
 // ErrConnClosed if the channel or connection closes while waiting.
 // The caller must call sess.send(frame) after preSend returns nil.
 func (rs *reliableState) preSend(frame *Frame) error {
+	// Treat ACK-only frames (no events) as costing 1 window slot so they
+	// still participate in flow control and the ring doesn't lose track.
+	evtCount := len(frame.Events)
+	if evtCount == 0 {
+		evtCount = 1
+	}
+
 	rs.sendMu.Lock()
-	for rs.numPending >= rs.peerWindow {
-		// Window full: block until the receiver ACKs frames and frees space.
+	for rs.numPending+evtCount > rs.peerWindow {
+		// Window full: block until the receiver ACKs events and frees space.
 		// cond.Wait atomically releases sendMu and suspends this goroutine.
 		dbg("reliable: send window full, waiting for ACK",
 			"channel_id", rs.channel.id,
 			"num_pending", rs.numPending,
+			"evt_count", evtCount,
 			"peer_window", rs.peerWindow,
 		)
 		rs.cond.Wait()
@@ -166,13 +202,14 @@ func (rs *reliableState) preSend(frame *Frame) error {
 	}
 	rs.recvMu.Unlock()
 
-	slot := &rs.pending[seq&0xFF]
+	slot := &rs.pending[seq%uint32(len(rs.pending))]
 	slot.seq = seq
 	slot.frame = frame
 	slot.sentAt = time.Now()
 	slot.retries = 0
 	slot.used = true
-	rs.numPending++
+	slot.evtCount = evtCount
+	rs.numPending += evtCount
 
 	if !rs.rtoRunning {
 		rs.rtoRunning = true
@@ -188,31 +225,38 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 	rs.sendMu.Lock()
 	defer rs.sendMu.Unlock()
 
-	freed := 0
+	freed := 0 // accumulated event count (not frame count) freed this call
 
 	// Free all frames with seq < ackSeq (cumulative ACK).
 	// AckSeq == expectSeq on the receiver, meaning "next expected is AckSeq",
 	// so all seq < AckSeq have been received in-order.
-	for s := rs.nextSeq - uint32(rs.numPending); s != rs.nextSeq; s++ {
-		slot := &rs.pending[s&0xFF]
+	// numPending tracks events; iterate by seq (frames) but accumulate evtCount.
+	ringSize := uint32(len(rs.pending))
+	// Compute the oldest in-flight seq: frames are stored starting at
+	// (nextSeq - numFramesInFlight), but numPending is in events so we scan
+	// the whole ring for used+seq<ackSeq entries.
+	for i := range rs.pending {
+		slot := &rs.pending[i]
 		if !slot.used || slot.seq >= ackSeq {
-			break
+			continue
 		}
+		freed += slot.evtCount
 		slot.used = false
 		slot.frame = nil
-		freed++
 	}
 
 	// Free SACK-indicated frames (selective ACK beyond cumulative).
+	// The bitmap is uint64 (sackBitmapBits wide); iterating beyond 64 bits
+	// would always produce 0 from the shift, so limit to sackBitmapBits.
 	if bitmap != 0 {
-		for i := 0; i < reliableOOOWindow; i++ {
+		for i := 0; i < sackBitmapBits; i++ {
 			if bitmap&(1<<uint(i)) != 0 {
 				sackSeq := ackSeq + uint32(i) + 1
-				slot := &rs.pending[sackSeq&0xFF]
+				slot := &rs.pending[sackSeq%ringSize]
 				if slot.used && slot.seq == sackSeq {
+					freed += slot.evtCount
 					slot.used = false
 					slot.frame = nil
-					freed++
 				}
 			}
 		}
@@ -248,8 +292,14 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 			rs.rto = rs.cfg.BaseRTO
 			if rs.rtoTimer != nil {
 				rs.rtoTimer.Stop()
+				rs.rtoTimer = nil
 			}
-			rs.rtoTimer = time.AfterFunc(rs.rto, rs.retransmit)
+			// Only arm a new timer directly if no retransmit goroutine is
+			// in-flight.  If one is, it will re-arm after its send completes
+			// using the freshly-reset rto above.
+			if !rs.retransmitInFlight {
+				rs.rtoTimer = time.AfterFunc(rs.rto, rs.retransmit)
+			}
 		}
 	}
 }
@@ -271,6 +321,15 @@ func (rs *reliableState) earliestPendingLocked() *pendingFrame {
 // unACKed frame with exponential RTO backoff.
 func (rs *reliableState) retransmit() {
 	rs.sendMu.Lock()
+
+	// Prevent goroutine pile-up: if a previous retransmit is still blocked
+	// inside sess.send() (waiting for the CC rate limiter), skip this timer
+	// fire.  The in-flight goroutine will re-arm the timer once its send
+	// completes, using whatever rto (possibly reset by onAck) is current then.
+	if rs.retransmitInFlight {
+		rs.sendMu.Unlock()
+		return
+	}
 
 	if rs.numPending == 0 {
 		rs.rtoRunning = false
@@ -306,7 +365,10 @@ func (rs *reliableState) retransmit() {
 	p.sentAt = time.Now()
 	frame := p.frame
 
-	rs.rtoTimer = time.AfterFunc(rs.rto, rs.retransmit)
+	// Mark in-flight BEFORE unlocking.  Do NOT arm the next timer here —
+	// arming it after sess.send() returns prevents goroutine pile-up when the
+	// CC rate limiter blocks the send for longer than the current RTO.
+	rs.retransmitInFlight = true
 	rs.sendMu.Unlock()
 
 	// Re-send outside the lock.  sess.send re-encrypts with a fresh nonce.
@@ -318,6 +380,17 @@ func (rs *reliableState) retransmit() {
 		)
 		_ = sess.send(frame)
 	}
+
+	// Re-arm the retransmit timer now that the (potentially rate-limited)
+	// send has completed.  Clear the in-flight flag so the next timer fire
+	// can proceed.  Use rs.rto as-is: onAck may have reset it to BaseRTO
+	// while we were blocked, giving us the correct (shorter) next timeout.
+	rs.sendMu.Lock()
+	rs.retransmitInFlight = false
+	if rs.numPending > 0 && rs.rtoRunning {
+		rs.rtoTimer = time.AfterFunc(rs.rto, rs.retransmit)
+	}
+	rs.sendMu.Unlock()
 }
 
 // ── receive side ──────────────────────────────────────────────────────────────
@@ -342,7 +415,13 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 			idx := (gap - 1) % reliableOOOWindow
 			if rs.oooFrames[idx] == nil {
 				rs.oooFrames[idx] = f
-				rs.ooo |= 1 << (gap - 1)
+				// The SACK bitmap (uint64) can only represent the first 64
+				// OOO slots.  Frames beyond that are still buffered and will
+				// be delivered once the window slides; they are just not
+				// selectively acknowledged until the cumulative ACK catches up.
+				if gap <= sackBitmapBits {
+					rs.ooo |= 1 << (gap - 1)
+				}
 				dbg("reliable: buffering out-of-order frame",
 					"channel_id", rs.channel.id,
 					"seq",        seq,
@@ -395,12 +474,16 @@ func (rs *reliableState) deliverInOrderLocked(f *Frame) {
 	rs.expectSeq++
 
 	// Drain any buffered OOO frames that are now in order.
-	for rs.ooo&1 != 0 {
+	// Use oooFrames[0] != nil as the condition rather than ooo&1 != 0: the
+	// SACK bitmap only tracks the first 64 slots, so frames buffered beyond
+	// slot 64 have ooo bit = 0 even though the frame is present.  Checking
+	// the pointer directly ensures we drain the full window.
+	for rs.oooFrames[0] != nil {
 		next := rs.oooFrames[0]
 		// Rotate the OOO window: shift everything down by one slot.
 		copy(rs.oooFrames[:], rs.oooFrames[1:])
 		rs.oooFrames[reliableOOOWindow-1] = nil
-		rs.ooo >>= 1
+		rs.ooo >>= 1 // safe: bits beyond 64 were never set, shifting 0s is fine
 
 		if next != nil {
 			rs.expectSeq++

@@ -49,7 +49,11 @@
       "Bash(tail:*)",
       "Bash(export PATH=$PATH:/usr/local/go/bin:/usr/bin:/bin && go build ./... 2>&1)",
       "Bash(export PATH=$PATH:/usr/local/go/bin && go build ./cmd/pulse/... 2>&1)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(ls:*)",
+      "Bash(for i in 1 2 3)",
+      "Bash(do go test ./pkg/wiresocket/... -run TestConcurrentSendRecv -v -count=1)",
+      "Bash(done)"
     ]
   }
 }
