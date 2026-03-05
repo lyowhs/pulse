@@ -24,6 +24,7 @@ func serverCommand() *cobra.Command {
 	cmd.Flags().String("key", "", "hex-encoded server private key (generated if omitted)")
 	cmd.Flags().Int("mtu", 1472, "UDP payload MTU in bytes")
 	cmd.Flags().Duration("coalesce", 100*time.Microsecond, "coalesce interval; 0 disables coalescing")
+	cmd.Flags().Bool("reliable", true, "use reliable delivery (default: on; set --reliable=false to disable)")
 	return cmd
 }
 
@@ -32,6 +33,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	keyHex, _ := cmd.Flags().GetString("key")
 	mtu, _ := cmd.Flags().GetInt("mtu")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
+	reliable, _ := cmd.Flags().GetBool("reliable")
 
 	var privKey [32]byte
 	if keyHex == "" {
@@ -50,13 +52,58 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		copy(privKey[:], b)
 	}
 
-	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
-		Addr:             addr,
-		PrivateKey:       privKey,
-		OnConnect:        echoConn,
-		MaxPacketSize:    mtu,
-		CoalesceInterval: coalesce,
-	})
+	// Compute server parameters that match what a well-configured bench client
+	// will use.  The client's inflightCap is bounded by its socket buffer; we
+	// probe the same buffer here so the server's reassembly table and event
+	// channel never become the bottleneck.
+	const (
+		sizeDataHdr = 16
+		sizeFragHdr = 8
+		sizeAEAD    = 16
+		minMaxInc   = 512 // matches bench run's maxReassembly floor
+		requested   = 4 << 20
+	)
+	// Worst-case inflightCap: assume one fragment per frame (smallest payload).
+	// A higher real fragsPerEvent reduces inflightCap further, so this is safe.
+	actualBuf := wiresocket.ProbeUDPRecvBufSize(requested)
+	socketBuf := actualBuf * 3 / 4
+	inflightCap := socketBuf / mtu
+	if inflightCap < 4 {
+		inflightCap = 4
+	}
+
+	srvMaxIncomplete := minMaxInc
+	if inflightCap > srvMaxIncomplete {
+		srvMaxIncomplete = inflightCap
+	}
+
+	// EventBufSize must hold all in-flight events without overflow so the
+	// server's myWindow() never collapses the client's send window to near zero.
+	eventBufSize := 256
+	if inflightCap > eventBufSize {
+		eventBufSize = inflightCap
+	}
+
+	// With reliable delivery, serialise packet processing to prevent goroutine
+	// scheduling reorder on loopback from creating OOO gaps larger than the
+	// reliableOOOWindow.
+	workerCount := 0 // default: GOMAXPROCS
+	if reliable {
+		workerCount = 1
+	}
+
+	srvCfg := wiresocket.ServerConfig{
+		Addr:                   addr,
+		PrivateKey:             privKey,
+		OnConnect:              echoConn,
+		MaxPacketSize:          mtu,
+		CoalesceInterval:       coalesce,
+		MaxIncompleteFrames:    srvMaxIncomplete,
+		EventBufSize:           eventBufSize,
+		WorkerCount:            workerCount,
+		DisableDefaultReliable: !reliable,
+	}
+	srv, err := wiresocket.NewServer(srvCfg)
 	if err != nil {
 		return err
 	}

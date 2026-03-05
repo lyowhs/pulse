@@ -178,11 +178,21 @@ func (c *coalescer) run() {
 			// Graceful-drain request from Close(): flush all pending events,
 			// including any items that arrived in the input buffer since the
 			// last flush cycle, then signal completion.
+			//
+			// Items are processed one at a time and flushed immediately when a
+			// channel's size limit is reached — the same policy as the normal
+			// run path.  This prevents accumulating thousands of events into a
+			// single oversized frame that can never fit in the reliable send
+			// window, which would cause preSend to block indefinitely.
 			stopTimer()
+			sess := getSession()
 			for len(c.input) > 0 {
-				addItem(<-c.input)
+				fullCh, full := addItem(<-c.input)
+				if full && sess != nil {
+					flushOne(sess, fullCh)
+				}
 			}
-			if sess := getSession(); sess != nil {
+			if sess != nil {
 				flushAll(sess)
 			}
 			c.stopped.Store(true)

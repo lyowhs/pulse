@@ -53,7 +53,13 @@
       "Bash(ls:*)",
       "Bash(for i in 1 2 3)",
       "Bash(do go test ./pkg/wiresocket/... -run TestConcurrentSendRecv -v -count=1)",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(/tmp/pulse bench:*)",
+      "Bash(jobs:*)",
+      "Bash(pgrep:*)",
+      "Bash(/tmp/pulse_bench bench:*)",
+      "Bash(ss:*)",
+      "Bash(/tmp/pulse_bench2 bench:*)"
     ]
   }
 }

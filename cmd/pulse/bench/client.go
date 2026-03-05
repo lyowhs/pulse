@@ -53,6 +53,43 @@ func runClient(cmd *cobra.Command, args []string) error {
 	}
 	copy(serverPub[:], b)
 
+	// Compute pipeline parameters to avoid overwhelming the socket buffers.
+	// Mirrors the inflightCap calculation in bench run so that the number of
+	// in-flight fragments never exceeds what the kernel can actually buffer.
+	const (
+		sizeDataHdr = 16
+		sizeFragHdr = 8
+		sizeAEAD    = 16
+		requested   = 4 << 20 // matches dialSession socket buffer request
+	)
+	maxFrag := mtu - sizeDataHdr - sizeFragHdr - sizeAEAD
+	fragsPerEvent := 1
+	if maxFrag > 0 && size > maxFrag {
+		fragsPerEvent = (size + maxFrag - 1) / maxFrag
+	}
+	actualBuf := wiresocket.ProbeUDPRecvBufSize(requested)
+	socketBuf := actualBuf * 3 / 4 // 75% headroom margin
+	inflightCap := socketBuf / (fragsPerEvent * mtu)
+	if inflightCap < 4 {
+		inflightCap = 4
+	}
+
+	// eventBufSize bounds the client's advertised echo receive window
+	// (myWindow = eventBufSize - len(ch.events)).  Setting it to inflightCap
+	// ensures the server's echo peerWindow stays at inflightCap, so the
+	// server never sends more than inflightCap × fragsPerEvent echo fragments
+	// at once — keeping them within the client's socket buffer.
+	eventBufSize := inflightCap
+	maxIncomplete := 64
+	if inflightCap*2 > maxIncomplete {
+		maxIncomplete = inflightCap * 2
+	}
+
+	var reliableCfg *wiresocket.ReliableCfg
+	if reliable {
+		reliableCfg = &wiresocket.ReliableCfg{WindowSize: inflightCap}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -64,7 +101,10 @@ func runClient(cmd *cobra.Command, args []string) error {
 		MaxRetries:             10,
 		MaxPacketSize:          mtu,
 		CoalesceInterval:       coalesce,
+		EventBufSize:           eventBufSize,
+		MaxIncompleteFrames:    maxIncomplete,
 		DisableDefaultReliable: !reliable,
+		DefaultReliable:        reliableCfg,
 	}
 	if cc {
 		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}
