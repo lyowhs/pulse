@@ -25,6 +25,7 @@ func serverCommand() *cobra.Command {
 	cmd.Flags().Int("mtu", 1472, "UDP payload MTU in bytes")
 	cmd.Flags().Duration("coalesce", 100*time.Microsecond, "coalesce interval; 0 disables coalescing")
 	cmd.Flags().Bool("reliable", true, "use reliable delivery (default: on; set --reliable=false to disable)")
+	cmd.Flags().StringArray("allowed-keys", nil, "hex-encoded client public key to whitelist (may be repeated)")
 	return cmd
 }
 
@@ -34,6 +35,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	mtu, _ := cmd.Flags().GetInt("mtu")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
 	reliable, _ := cmd.Flags().GetBool("reliable")
+	allowedKeyHexes, _ := cmd.Flags().GetStringArray("allowed-keys")
 
 	var privKey [32]byte
 	if keyHex == "" {
@@ -50,6 +52,18 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			return fmt.Errorf("--key must be a 64-character hex string (32 bytes)")
 		}
 		copy(privKey[:], b)
+	}
+
+	// Parse --allowed-keys into a slice of [32]byte public keys.
+	var allowedPeers [][32]byte
+	for _, h := range allowedKeyHexes {
+		b, err := hex.DecodeString(h)
+		if err != nil || len(b) != 32 {
+			return fmt.Errorf("--allowed-keys: %q must be a 64-character hex string (32 bytes)", h)
+		}
+		var pk [32]byte
+		copy(pk[:], b)
+		allowedPeers = append(allowedPeers, pk)
 	}
 
 	// With reliable delivery, serialise packet processing to prevent goroutine
@@ -69,6 +83,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		MaxPacketSize:    mtu,
 		CoalesceInterval: coalesce,
 		WorkerCount:      workerCount,
+		AllowedPeers:     allowedPeers,
 	}
 	srv, err := wiresocket.NewServer(srvCfg)
 	if err != nil {
@@ -78,6 +93,11 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	pub := srv.PublicKey()
 	fmt.Fprintf(os.Stderr, "bench server listening on %s\n", addr)
 	fmt.Fprintf(os.Stderr, "public key: %s\n", hex.EncodeToString(pub[:]))
+	if len(allowedPeers) > 0 {
+		fmt.Fprintf(os.Stderr, "allowed peers: %d key(s)\n", len(allowedPeers))
+	} else {
+		fmt.Fprintf(os.Stderr, "allowed peers: all (no whitelist)\n")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

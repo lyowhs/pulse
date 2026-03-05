@@ -25,6 +25,7 @@ func clientCommand() *cobra.Command {
 	}
 	cmd.Flags().String("pubkey", "", "hex-encoded server public key (required)")
 	cmd.MarkFlagRequired("pubkey")
+	cmd.Flags().String("key", "", "hex-encoded client private key (generated if omitted; public key printed to stderr)")
 	cmd.Flags().DurationP("duration", "d", 10*time.Second, "how long to run the benchmark")
 	cmd.Flags().Int("size", 32*1024, "event payload size in bytes")
 	cmd.Flags().Int("parallel", 1, "number of concurrent sender goroutines")
@@ -38,6 +39,7 @@ func clientCommand() *cobra.Command {
 func runClient(cmd *cobra.Command, args []string) error {
 	serverAddr := args[0]
 	pubkeyHex, _ := cmd.Flags().GetString("pubkey")
+	clientKeyHex, _ := cmd.Flags().GetString("key")
 	dur, _ := cmd.Flags().GetDuration("duration")
 	size, _ := cmd.Flags().GetInt("size")
 	parallel, _ := cmd.Flags().GetInt("parallel")
@@ -52,6 +54,24 @@ func runClient(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--pubkey must be a 64-character hex string (32 bytes)")
 	}
 	copy(serverPub[:], b)
+
+	// Resolve the client keypair: use --key if provided, otherwise generate one.
+	var clientPrivKey [32]byte
+	if clientKeyHex != "" {
+		b, err := hex.DecodeString(clientKeyHex)
+		if err != nil || len(b) != 32 {
+			return fmt.Errorf("--key must be a 64-character hex string (32 bytes)")
+		}
+		copy(clientPrivKey[:], b)
+	} else {
+		kp, err := wiresocket.GenerateKeypair()
+		if err != nil {
+			return fmt.Errorf("generate keypair: %w", err)
+		}
+		clientPrivKey = kp.Private
+		fmt.Fprintf(os.Stderr, "client private key: %s\n", hex.EncodeToString(clientPrivKey[:]))
+		fmt.Fprintf(os.Stderr, "client public key:  %s\n", hex.EncodeToString(kp.Public[:]))
+	}
 
 	// Compute pipeline parameters to avoid overwhelming the socket buffers.
 	// inflightCap bounds the reliable window and EventBufSize so that in-flight
@@ -80,6 +100,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 	// computed by the library from the socket buffer.
 	dialCfg := wiresocket.DialConfig{
 		ServerPublicKey:  serverPub,
+		PrivateKey:       clientPrivKey,
 		HandshakeTimeout: 5 * time.Second,
 		MaxRetries:       10,
 		MaxPacketSize:    mtu,

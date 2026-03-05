@@ -96,6 +96,13 @@ type ServerConfig struct {
 	// Overrides SendRateLimitBPS when set.
 	CongestionControl *CongestionConfig
 
+	// AllowedPeers, if non-empty, is a whitelist of client static public keys
+	// that are permitted to establish sessions.  Any client whose public key is
+	// absent from the list is silently rejected during the handshake.
+	// AllowedPeers and Authenticate are evaluated independently; a client must
+	// satisfy both when both are set.
+	AllowedPeers [][32]byte
+
 	// WorkChannelSize is the number of incoming packets buffered between the
 	// UDP reader goroutine and the worker pool.  If the channel is full,
 	// excess packets are silently dropped.  Defaults to
@@ -258,6 +265,11 @@ type Server struct {
 
 	// totalSessions counts active sessions for monitoring.
 	totalSessions atomic.Int64
+
+	// allowedPeers is the runtime-mutable peer whitelist, protected by peersMu.
+	// An empty slice means the whitelist is disabled (all clients accepted).
+	peersMu     sync.RWMutex
+	allowedPeers [][32]byte
 }
 
 type incomingPacket struct {
@@ -289,6 +301,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cookies:        newCookieManager(kp.Public),
 		work:           make(chan incomingPacket, cfg.WorkChannelSize),
 		maxFragPayload: maxFrag,
+	}
+	// Copy AllowedPeers from config into the runtime-mutable slice.
+	if len(cfg.AllowedPeers) > 0 {
+		s.allowedPeers = make([][32]byte, len(cfg.AllowedPeers))
+		copy(s.allowedPeers, cfg.AllowedPeers)
 	}
 	return s, nil
 }
@@ -459,6 +476,22 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	// Optional authentication callback.
 	if s.cfg.Authenticate != nil && !s.cfg.Authenticate(clientPub) {
 		dbg("server: client rejected by Authenticate callback", "remote_addr", pkt.addr.String())
+		return
+	}
+
+	// Optional static whitelist check.
+	s.peersMu.RLock()
+	nPeers := len(s.allowedPeers)
+	peerAllowed := false
+	for _, pk := range s.allowedPeers {
+		if clientPub == pk {
+			peerAllowed = true
+			break
+		}
+	}
+	s.peersMu.RUnlock()
+	if nPeers > 0 && !peerAllowed {
+		dbg("server: client not in AllowedPeers whitelist", "remote_addr", pkt.addr.String())
 		return
 	}
 
@@ -669,6 +702,51 @@ func (s *Server) gc(ctx context.Context) {
 // ActiveSessions returns the current number of established sessions.
 func (s *Server) ActiveSessions() int64 {
 	return s.totalSessions.Load()
+}
+
+// AddPeer adds pub to the runtime peer whitelist.  If the whitelist was
+// empty, adding the first key enables it — subsequent connections are
+// restricted to listed keys only.  Adding a key that is already present
+// is a no-op.
+func (s *Server) AddPeer(pub [32]byte) {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	for _, pk := range s.allowedPeers {
+		if pk == pub {
+			return
+		}
+	}
+	s.allowedPeers = append(s.allowedPeers, pub)
+}
+
+// RemovePeer removes pub from the runtime peer whitelist and returns true
+// if the key was found.  When the last key is removed the whitelist becomes
+// empty and all clients are accepted again.
+func (s *Server) RemovePeer(pub [32]byte) bool {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	for i, pk := range s.allowedPeers {
+		if pk == pub {
+			last := len(s.allowedPeers) - 1
+			s.allowedPeers[i] = s.allowedPeers[last]
+			s.allowedPeers = s.allowedPeers[:last]
+			return true
+		}
+	}
+	return false
+}
+
+// Peers returns a snapshot of the current peer whitelist.  An empty slice
+// means the whitelist is disabled and all clients are accepted.
+func (s *Server) Peers() [][32]byte {
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
+	if len(s.allowedPeers) == 0 {
+		return nil
+	}
+	out := make([][32]byte, len(s.allowedPeers))
+	copy(out, s.allowedPeers)
+	return out
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
