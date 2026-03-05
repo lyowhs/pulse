@@ -107,6 +107,78 @@ func TestConcurrentClients(t *testing.T) {
 	}
 }
 
+// TestPersistentReconnect verifies that a persistent Conn (ReconnectMin > 0)
+// automatically reconnects after the server closes the session.  The client
+// must be able to send and receive events both before and after the disconnect.
+func TestPersistentReconnect(t *testing.T) {
+	// connectedC receives a signal each time OnConnect fires (one per session).
+	connectedC := make(chan struct{}, 4)
+
+	addr, kp := serverSetup(t, wiresocket.ServerConfig{
+		OnConnect: func(conn *wiresocket.Conn) {
+			connectedC <- struct{}{}
+			// Echo one event, then close the connection.  Close() sends a
+			// typeDisconnect packet so the client's read loop detects the
+			// disconnect and triggers a reconnect.
+			e, err := conn.Recv(context.Background())
+			if err != nil {
+				return
+			}
+			conn.Send(context.Background(), &wiresocket.Event{Type: e.Type + 10})
+			conn.Close()
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	conn, err := wiresocket.Dial(ctx, addr, wiresocket.DialConfig{
+		ServerPublicKey: kp.Public,
+		ReconnectMin:    50 * time.Millisecond,
+		ReconnectMax:    200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// First session: send + receive echo.
+	if err := conn.Send(ctx, &wiresocket.Event{Type: 1}); err != nil {
+		t.Fatalf("first Send: %v", err)
+	}
+	e, err := conn.Recv(ctx)
+	if err != nil {
+		t.Fatalf("first Recv: %v", err)
+	}
+	if e.Type != 11 {
+		t.Errorf("first echo: got type %d, want 11", e.Type)
+	}
+
+	// Wait for the server to start a second OnConnect (reconnect completed).
+	select {
+	case <-connectedC: // first connect
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for first OnConnect")
+	}
+	select {
+	case <-connectedC: // second connect (after reconnect)
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for reconnect OnConnect")
+	}
+
+	// Second session: should work transparently.
+	if err := conn.Send(ctx, &wiresocket.Event{Type: 2}); err != nil {
+		t.Fatalf("second Send: %v", err)
+	}
+	e, err = conn.Recv(ctx)
+	if err != nil {
+		t.Fatalf("second Recv: %v", err)
+	}
+	if e.Type != 12 {
+		t.Errorf("second echo: got type %d, want 12", e.Type)
+	}
+}
+
 // TestContextCancelDial verifies that Dial returns promptly when a
 // pre-cancelled context is passed.
 func TestContextCancelDial(t *testing.T) {

@@ -250,6 +250,83 @@ func TestConcurrentChannelSends(t *testing.T) {
 	}
 }
 
+// TestChannelID verifies that Channel.ID() returns the channel identifier that
+// was passed to Conn.Channel().
+func TestChannelID(t *testing.T) {
+	addr, kp := serverSetup(t, wiresocket.ServerConfig{
+		OnConnect: func(conn *wiresocket.Conn) { <-conn.Done() },
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn := mustDial(t, ctx, addr, kp)
+
+	for _, id := range []uint16{0, 1, 5, 255, 1000} {
+		ch := conn.Channel(id)
+		if ch.ID() != id {
+			t.Errorf("Channel(%d).ID() = %d, want %d", id, ch.ID(), id)
+		}
+	}
+}
+
+// TestChannelDoneClosedAfterClose verifies that Channel.Done() is closed when
+// the channel is closed.
+func TestChannelDoneClosedAfterClose(t *testing.T) {
+	addr, kp := serverSetup(t, wiresocket.ServerConfig{
+		OnConnect: func(conn *wiresocket.Conn) { <-conn.Done() },
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn := mustDial(t, ctx, addr, kp)
+
+	ch := conn.Channel(3)
+	// Done() must not be closed yet.
+	select {
+	case <-ch.Done():
+		t.Fatal("Channel.Done() closed before Close()")
+	default:
+	}
+
+	ch.Close()
+
+	select {
+	case <-ch.Done():
+		// expected
+	case <-ctx.Done():
+		t.Error("timeout: Channel.Done() not closed after Close()")
+	}
+}
+
+// TestChannelEventsReturnsSameChannel verifies that Channel.Events() returns
+// the same underlying channel that Recv reads from — i.e., an event sent by
+// the server arrives on the Events() channel.
+func TestChannelEventsReturnsSameChannel(t *testing.T) {
+	addr, kp := serverSetup(t, wiresocket.ServerConfig{
+		OnConnect: func(conn *wiresocket.Conn) {
+			// Push one event onto channel 1 as soon as client connects.
+			conn.Channel(1).Send(context.Background(), &wiresocket.Event{Type: 77})
+			<-conn.Done()
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn := mustDial(t, ctx, addr, kp)
+	ch := conn.Channel(1)
+
+	evtCh := ch.Events()
+	if evtCh == nil {
+		t.Fatal("Channel.Events() returned nil")
+	}
+
+	select {
+	case e := <-evtCh:
+		if e.Type != 77 {
+			t.Errorf("received Type=%d via Events(), want 77", e.Type)
+		}
+	case <-ctx.Done():
+		t.Error("timeout: no event on Channel.Events()")
+	}
+}
+
 // TestConcurrentSendRecv verifies that a single connection handles concurrent
 // senders and receivers without data corruption or deadlock.
 func TestConcurrentSendRecv(t *testing.T) {

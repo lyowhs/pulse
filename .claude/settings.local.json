@@ -60,7 +60,8 @@
       "Bash(/tmp/pulse_bench bench:*)",
       "Bash(ss:*)",
       "Bash(/tmp/pulse_bench2 bench:*)",
-      "Read(//proc/sys/net/core/**)"
+      "Read(//proc/sys/net/core/**)",
+      "Bash(wc:*)"
     ]
   }
 }

@@ -115,3 +115,82 @@ func TestFrameEmptyDecode(t *testing.T) {
 		t.Errorf("expected 0 events, got %d", len(got.Events))
 	}
 }
+
+// TestFrameLargePayload verifies that events with payloads ≥ 128 bytes round-trip
+// correctly.  Payloads of this size cause the protobuf LEN-field length varint
+// to use two bytes (body = 1+128 = 129 ≥ 128), exercising the multi-byte
+// varint path in both AppendMarshal and UnmarshalFrame.
+func TestFrameLargePayload(t *testing.T) {
+	for _, size := range []int{127, 128, 129, 255, 256, 1000} {
+		payload := make([]byte, size)
+		for i := range payload {
+			payload[i] = byte(i & 0xFF)
+		}
+		f := &wiresocket.Frame{
+			ChannelId: 3,
+			Events:    []*wiresocket.Event{{Type: 42, Payload: payload}},
+		}
+		wire := f.Marshal()
+		got, err := wiresocket.UnmarshalFrame(wire)
+		if err != nil {
+			t.Fatalf("size=%d: UnmarshalFrame: %v", size, err)
+		}
+		if len(got.Events) != 1 {
+			t.Fatalf("size=%d: got %d events, want 1", size, len(got.Events))
+		}
+		e := got.Events[0]
+		if e.Type != 42 {
+			t.Errorf("size=%d: Type=%d, want 42", size, e.Type)
+		}
+		if len(e.Payload) != size {
+			t.Errorf("size=%d: payload len=%d, want %d", size, len(e.Payload), size)
+		}
+		for i, b := range e.Payload {
+			if b != byte(i&0xFF) {
+				t.Errorf("size=%d: payload[%d]=%d, want %d", size, i, b, byte(i&0xFF))
+				break
+			}
+		}
+	}
+}
+
+// TestFrameAppendMarshal verifies that AppendMarshal appends the encoding to a
+// non-empty dst without overwriting or modifying the existing bytes.
+func TestFrameAppendMarshal(t *testing.T) {
+	prefix := []byte{0xAA, 0xBB, 0xCC}
+	f := &wiresocket.Frame{
+		ChannelId: 1,
+		Events:    []*wiresocket.Event{{Type: 7, Payload: []byte("hello")}},
+	}
+	dst := append([]byte(nil), prefix...)
+	result := f.AppendMarshal(dst)
+
+	// The first three bytes must be unchanged.
+	for i, b := range prefix {
+		if result[i] != b {
+			t.Errorf("prefix[%d] modified: got %02x, want %02x", i, result[i], b)
+		}
+	}
+
+	// The remainder must decode to the original frame.
+	wire := result[len(prefix):]
+	got, err := wiresocket.UnmarshalFrame(wire)
+	if err != nil {
+		t.Fatalf("UnmarshalFrame of AppendMarshal suffix: %v", err)
+	}
+	if got.ChannelId != f.ChannelId {
+		t.Errorf("ChannelId: got %d, want %d", got.ChannelId, f.ChannelId)
+	}
+	if len(got.Events) != 1 || got.Events[0].Type != 7 || string(got.Events[0].Payload) != "hello" {
+		t.Errorf("decoded event mismatch: %+v", got.Events)
+	}
+}
+
+// TestFrameTruncatedBody verifies that a 1-byte buffer (not enough for the
+// 2-byte channel ID) returns a decode error.
+func TestFrameTruncatedBody(t *testing.T) {
+	_, err := wiresocket.UnmarshalFrame([]byte{0x01})
+	if err == nil {
+		t.Error("UnmarshalFrame with 1-byte buffer: expected error, got nil")
+	}
+}
