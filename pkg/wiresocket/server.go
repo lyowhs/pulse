@@ -148,12 +148,6 @@ func (cfg *ServerConfig) defaults() {
 		}
 		if cfg.EventBufSize == 0 {
 			cfg.EventBufSize = ic
-			// The sender initialises peerWindow = defaultReliableWindow before
-			// receiving any ACK, so EventBufSize must be at least that large or
-			// the first burst of coalesced events will overflow the buffer.
-			if cfg.EventBufSize < defaultReliableWindow {
-				cfg.EventBufSize = defaultReliableWindow
-			}
 		}
 	}
 	if cfg.SessionTimeout == 0 {
@@ -283,20 +277,17 @@ type Server struct {
 
 	// allowedPeers is the runtime-mutable peer whitelist, protected by peersMu.
 	// An empty slice means the whitelist is disabled (all clients accepted).
-	peersMu     sync.RWMutex
+	peersMu      sync.RWMutex
 	allowedPeers [][32]byte
+
+	// pktBufPool recycles read buffers sized to cfg.MaxPacketSize.
+	pktBufPool sync.Pool
 }
 
 type incomingPacket struct {
 	data   []byte
 	addr   *net.UDPAddr
 	rawBuf []byte // pool-borrowed buffer; returned after handlePacket returns
-}
-
-// pktBufPool recycles 65535-byte buffers used by the server read loop,
-// eliminating one allocation per incoming packet.
-var pktBufPool = sync.Pool{
-	New: func() any { return make([]byte, 65535) },
 }
 
 // NewServer creates a Server from cfg.  Call Serve to start it.
@@ -310,12 +301,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	kp := Keypair{Private: cfg.PrivateKey, Public: pub}
 
 	maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
+	pktSz := cfg.MaxPacketSize
 	s := &Server{
 		cfg:            cfg,
 		keypair:        kp,
 		cookies:        newCookieManager(kp.Public),
 		work:           make(chan incomingPacket, cfg.WorkChannelSize),
 		maxFragPayload: maxFrag,
+		pktBufPool:     sync.Pool{New: func() any { return make([]byte, pktSz) }},
 	}
 	// Copy AllowedPeers from config into the runtime-mutable slice.
 	if len(cfg.AllowedPeers) > 0 {
@@ -368,11 +361,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		defer close(readDone)
 		msgs := make([]ipv4.Message, readBatchSz)
 		for i := range msgs {
-			msgs[i].Buffers = [][]byte{pktBufPool.Get().([]byte)}
+			msgs[i].Buffers = [][]byte{s.pktBufPool.Get().([]byte)}
 		}
 		defer func() {
 			for i := range msgs {
-				pktBufPool.Put(msgs[i].Buffers[0])
+				s.pktBufPool.Put(msgs[i].Buffers[0])
 			}
 		}()
 
@@ -399,13 +392,13 @@ func (s *Server) Serve(ctx context.Context) error {
 				case s.work <- pkt:
 				default:
 					// Worker queue full — drop packet (caller will retransmit).
-					pktBufPool.Put(rawBuf)
+					s.pktBufPool.Put(rawBuf)
 					if addr != nil {
 						dbg("server: worker queue full, dropping packet", "remote_addr", addr.String())
 					}
 				}
 				// Replenish the slot for the next batch.
-				msgs[i].Buffers[0] = pktBufPool.Get().([]byte)
+				msgs[i].Buffers[0] = s.pktBufPool.Get().([]byte)
 				msg.N = 0
 			}
 		}
@@ -429,7 +422,7 @@ func (s *Server) worker(ctx context.Context) {
 			}
 			s.handlePacket(ctx, pkt)
 			if pkt.rawBuf != nil {
-				pktBufPool.Put(pkt.rawBuf)
+				s.pktBufPool.Put(pkt.rawBuf)
 			}
 		case <-ctx.Done():
 			return

@@ -23,15 +23,12 @@ type DialConfig struct {
 	PrivateKey [32]byte
 
 	// EventBufSize is the number of events buffered per channel on the receive
-	// side.  Defaults to max(socketBuf*3/4/MaxPacketSize, defaultReliableWindow),
-	// probed from the kernel UDP receive buffer — the same formula used by
-	// ServerConfig.  The floor of defaultReliableWindow (4096) is critical:
-	// the sender assumes the receiver can absorb that many events before the
-	// first ACK arrives; a smaller buffer causes the first burst of coalesced
-	// events to overflow and be silently dropped.
-	// Override to tune the flow-control window advertised to the remote peer;
-	// for example, set it to inflightCap when sending large fragmented events
-	// so the server's echo window stays within the socket buffer capacity.
+	// side.  Defaults to socketBuf*3/4/(fragsPerEvent*MaxPacketSize), probed
+	// from the kernel UDP receive buffer — the same formula used by
+	// ServerConfig.  The value scales down automatically for large
+	// MaxEventPayloadSize so the total in-flight fragment count stays within
+	// the socket buffer.
+	// Override to tune the flow-control window advertised to the remote peer.
 	EventBufSize int
 
 	// HandshakeTimeout is the maximum time to wait for the server to respond
@@ -145,12 +142,6 @@ func (cfg *DialConfig) defaults() {
 		}
 		if cfg.EventBufSize == 0 {
 			cfg.EventBufSize = ic
-			// The sender initialises peerWindow = defaultReliableWindow before
-			// receiving any ACK, so EventBufSize must be at least that large or
-			// the first burst of coalesced events will overflow the buffer.
-			if cfg.EventBufSize < defaultReliableWindow {
-				cfg.EventBufSize = defaultReliableWindow
-			}
 		}
 	}
 }
@@ -406,7 +397,7 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 	pc := ipv4.NewPacketConn(conn)
 	msgs := make([]ipv4.Message, batchSz)
 	for i := range msgs {
-		msgs[i].Buffers = [][]byte{make([]byte, 65535)}
+		msgs[i].Buffers = [][]byte{make([]byte, sess.maxFragPayload+sizeDataHeader+sizeFragmentHeader+sizeAEADTag)}
 	}
 	raddrStr := raddr.String()
 
