@@ -1171,7 +1171,7 @@ func TestConcurrentChannelSends(t *testing.T) {
 	addr, kp := serverSetup(t, wiresocket.ServerConfig{
 		OnConnect: func(conn *wiresocket.Conn) {
 			var wg sync.WaitGroup
-			for id := uint8(1); id <= G; id++ {
+			for id := uint16(1); id <= G; id++ {
 				ch := conn.Channel(id)
 				wg.Add(1)
 				go func(ch *wiresocket.Channel) {
@@ -1193,7 +1193,7 @@ func TestConcurrentChannelSends(t *testing.T) {
 	conn := mustDial(t, ctx, addr, kp)
 
 	var wg sync.WaitGroup
-	for id := uint8(1); id <= G; id++ {
+	for id := uint16(1); id <= G; id++ {
 		ch := conn.Channel(id)
 		wg.Add(1)
 		go func(ch *wiresocket.Channel) {

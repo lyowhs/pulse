@@ -48,15 +48,13 @@ pkg/
     crypto.go           # BLAKE2s hash/MAC, HKDF-BLAKE2s KDF, X25519 DH, ChaCha20-Poly1305 AEAD
     noise.go            # Noise IK handshake state machine (initiator + responder)
     packet.go           # wire format: HandshakeInit/Resp/CookieReply/DataHeader
-    replay.go           # 64-entry sliding-window replay-protection counter
+    frame.go            # Frame/Event encode/decode; channel_id is uint16 LE (2 bytes)
+    replay.go           # 4096-entry sliding-window replay-protection counter
     cookie.go           # WireGuard-style DoS-mitigation cookie mechanism
     session.go          # session state (transport keys, nonces, replay window, timers)
     conn.go             # Conn — bidirectional event-stream API (Send/Recv/Events/Close)
     server.go           # Server — multi-worker UDP server; sync.Map session routing
     client.go           # Dial — client handshake + background read/keepalive loops
-    proto/
-      stream.proto      # protobuf schema (Event, Frame)
-      event.go          # hand-rolled proto wire encode/decode (no protoc dependency)
 ```
 
 ## Key Conventions

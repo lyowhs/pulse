@@ -12,7 +12,7 @@ import (
 )
 
 // benchChannel is the logical channel used for all benchmark traffic.
-const benchChannel = uint8(1)
+const benchChannel = uint16(1)
 
 // Command returns the bench cobra command with server and client subcommands.
 func Command() *cobra.Command {

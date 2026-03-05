@@ -73,7 +73,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 }
 
 const (
-	appChannel    = uint8(17)
+	appChannel    = uint16(17)
 	eventTypeTest = uint8(1)
 )
 
@@ -97,7 +97,7 @@ func makeHandler(logger *log.Logger) func(*wiresocket.Conn) {
 	}
 }
 
-func logEvent(logger *log.Logger, remote string, ch uint8, e *wiresocket.Event) {
+func logEvent(logger *log.Logger, remote string, ch uint16, e *wiresocket.Event) {
 	switch {
 	case len(e.Payload) == 0:
 		logger.Printf("[%s] ch=%-3d type=%d", remote, ch, e.Type)

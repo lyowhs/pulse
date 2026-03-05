@@ -40,7 +40,7 @@ type coalescer struct {
 }
 
 type coalesceItem struct {
-	channelId uint8
+	channelId uint16
 	event     *Event
 }
 
@@ -83,7 +83,7 @@ func (c *coalescer) stop(ctx context.Context) {
 
 // push enqueues an event for coalesced delivery.  It blocks only when the
 // input buffer is full (natural back-pressure).
-func (c *coalescer) push(ctx context.Context, channelId uint8, e *Event) error {
+func (c *coalescer) push(ctx context.Context, channelId uint16, e *Event) error {
 	select {
 	case c.input <- coalesceItem{channelId: channelId, event: e}:
 		return nil
@@ -95,8 +95,8 @@ func (c *coalescer) push(ctx context.Context, channelId uint8, e *Event) error {
 }
 
 func (c *coalescer) run() {
-	pending := make(map[uint8][]*Event)
-	pendingBytes := make(map[uint8]int)
+	pending := make(map[uint16][]*Event)
+	pendingBytes := make(map[uint16]int)
 	var timer *time.Timer
 	var timerC <-chan time.Time
 
@@ -111,9 +111,10 @@ func (c *coalescer) run() {
 	}
 
 	// sendFrame sends a frame, routing through the reliable path when applicable.
-	sendFrame := func(sess *session, chId uint8, events []*Event) {
+	sendFrame := func(sess *session, chId uint16, events []*Event) {
 		frame := &Frame{ChannelId: chId, Events: events}
-		if ch := c.conn.channels[chId].Load(); ch != nil {
+		if v, ok := c.conn.channelMap.Load(chId); ok {
+			ch := v.(*Channel)
 			if rs := ch.reliable.Load(); rs != nil {
 				if err := rs.preSend(frame); err != nil {
 					dbg("coalescer: reliable preSend failed, dropping events",
@@ -138,7 +139,7 @@ func (c *coalescer) run() {
 	}
 
 	// flushOne sends and clears a single channel's pending events.
-	flushOne := func(sess *session, chId uint8) {
+	flushOne := func(sess *session, chId uint16) {
 		if events := pending[chId]; len(events) > 0 {
 			sendFrame(sess, chId, events)
 			delete(pending, chId)
@@ -160,7 +161,7 @@ func (c *coalescer) run() {
 		return sess
 	}
 
-	addItem := func(item coalesceItem) (fullChannelId uint8, full bool) {
+	addItem := func(item coalesceItem) (fullChannelId uint16, full bool) {
 		chId := item.channelId
 		pending[chId] = append(pending[chId], item.event)
 		if c.maxFrameBytes > 0 {

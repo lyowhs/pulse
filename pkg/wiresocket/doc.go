@@ -1,5 +1,6 @@
 // Package wiresocket implements a secure, bidirectional event-stream protocol
-// over UDP, designed to serve 10,000s of simultaneous clients.
+// over UDP with up to 65535 logical channels per connection, designed to
+// serve 10,000s of simultaneous clients.
 //
 // # Protocol
 //

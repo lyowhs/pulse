@@ -32,7 +32,8 @@ import (
 func makeTestChannel(bufSize int) (*Channel, *reliableState) {
 	conn := &Conn{done: make(chan struct{})}
 	ch := newChannel(0, conn, bufSize)
-	conn.channels[0].Store(ch)
+	conn.ch0 = ch
+	conn.channelMap.Store(uint16(0), ch)
 	ch.SetReliable(ReliableCfg{WindowSize: 256})
 	return ch, ch.reliable.Load()
 }
@@ -41,7 +42,8 @@ func makeTestChannel(bufSize int) (*Channel, *reliableState) {
 func makeTestChannelWithCfg(bufSize int, cfg ReliableCfg) (*Channel, *reliableState) {
 	conn := &Conn{done: make(chan struct{})}
 	ch := newChannel(0, conn, bufSize)
-	conn.channels[0].Store(ch)
+	conn.ch0 = ch
+	conn.channelMap.Store(uint16(0), ch)
 	ch.SetReliable(cfg)
 	return ch, ch.reliable.Load()
 }

@@ -1,7 +1,7 @@
 package wiresocket
 
 // Wire encoding is custom:
-//   - A Frame begins with one raw byte: [channel_id].
+//   - A Frame begins with two bytes: [channel_id_lo][channel_id_hi] (uint16 LE).
 //   - Followed by a sequence of length-prefixed Event bodies (proto field 1,
 //     wire type LEN).
 //   - Each Event body begins with one raw byte: [type].
@@ -26,7 +26,7 @@ type Event struct {
 // preserving backward compatibility with peers that do not implement reliable
 // delivery.
 type Frame struct {
-	ChannelId uint8
+	ChannelId uint16
 	Events    []*Event
 
 	// Seq is the sender's frame sequence number for reliable channels.
@@ -53,14 +53,14 @@ type Frame struct {
 //
 // Wire format:
 //
-//	[channel_id(1)]
+//	[channel_id(2)]                   uint16 little-endian
 //	[field-1 LEN event-body]...       where event-body = [type(1)][payload...]
 //	[field-2 varint Seq]              omitted when Seq == 0
 //	[field-3 varint AckSeq]           omitted when AckSeq == 0
 //	[field-4 I64 AckBitmap]           omitted when AckBitmap == 0
 //	[field-5 varint WindowSize]       omitted when WindowSize == 0
 func (f *Frame) AppendMarshal(dst []byte) []byte {
-	dst = append(dst, f.ChannelId)
+	dst = append(dst, byte(f.ChannelId), byte(f.ChannelId>>8))
 	for _, e := range f.Events {
 		body := 1 + len(e.Payload)
 		dst = appendVarint(dst, 0x0A) // field 1, wire type LEN
@@ -96,7 +96,7 @@ func (f *Frame) AppendMarshal(dst []byte) []byte {
 	return dst
 }
 
-// Marshal serialises f into wire format: [channel_id][LEN-field events...].
+// Marshal serialises f into wire format: [channel_id(2)][LEN-field events...].
 func (f *Frame) Marshal() []byte { return f.AppendMarshal(nil) }
 
 // UnmarshalFrame parses a Frame from wire bytes.
@@ -110,8 +110,11 @@ func UnmarshalFrame(b []byte) (*Frame, error) {
 	if len(b) == 0 {
 		return &Frame{}, nil
 	}
-	f := &Frame{ChannelId: b[0]}
-	body := b[1:]
+	if len(b) < 2 {
+		return nil, errors.New("wiresocket: frame too short for channel ID")
+	}
+	f := &Frame{ChannelId: uint16(b[0]) | uint16(b[1])<<8}
+	body := b[2:]
 	if len(body) == 0 {
 		return f, nil
 	}

@@ -124,11 +124,10 @@ func newAIMDController(cfg normalizedCC, conn *Conn) *aimdController {
 		tb:       newTokenBucket(int64(cfg.initialRate)),
 		getRetransmits: func() int64 {
 			var total int64
-			for i := range conn.channels {
-				if ch := conn.channels[i].Load(); ch != nil {
-					total += ch.Retransmits()
-				}
-			}
+			conn.channelMap.Range(func(_, v any) bool {
+				total += v.(*Channel).Retransmits()
+				return true
+			})
 			return total
 		},
 		done: conn.done,

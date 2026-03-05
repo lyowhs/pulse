@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -24,14 +23,12 @@ var ErrConnClosed = errors.New("wiresocket: connection closed")
 //
 // A Conn may safely be used from multiple goroutines simultaneously.
 type Conn struct {
-	// channels is a fixed 256-entry array of atomic channel pointers, one slot
-	// per possible uint8 channel ID.  Each slot is nil until the channel is
-	// first opened.  Using atomic.Pointer[Channel] instead of sync.Map
-	// eliminates a map lookup, a type assertion, and internal sync.Map
-	// bookkeeping on every received event — the hot-path load reduces to a
-	// single atomic pointer read.
-	channels [256]atomic.Pointer[Channel]
-	ch0      *Channel
+	// channelMap stores open channels keyed by their uint16 ID.
+	// sync.Map is used so that per-Conn memory scales with the number of
+	// actually-opened channels rather than the full ID space (65535 entries ×
+	// 16 B = 1 MB would be too heavy per connection).
+	channelMap sync.Map // uint16 → *Channel
+	ch0        *Channel // fast path for channel 0 (Send/Recv)
 
 	// coalescer batches outgoing events; nil when coalescing is disabled.
 	coalescer *coalescer
@@ -81,7 +78,7 @@ func newConn(s *session, coalesceInterval time.Duration, defaultReliable *Reliab
 		defaultReliable: defaultReliable,
 	}
 	c.ch0 = newChannel(0, c, s.eventBuf)
-	c.channels[0].Store(c.ch0)
+	c.channelMap.Store(uint16(0), c.ch0)
 	if defaultReliable != nil {
 		c.ch0.SetReliable(*defaultReliable)
 	}
@@ -180,8 +177,8 @@ func (c *Conn) wireSession(sess *session) {
 		for _, e := range f.Events {
 			if e.Type == channelCloseType {
 				dbg("conn: channel close from peer", "channel_id", f.ChannelId)
-				if existing := c.channels[f.ChannelId].Swap(nil); existing != nil {
-					existing.closeLocal()
+				if v, ok := c.channelMap.LoadAndDelete(f.ChannelId); ok {
+					v.(*Channel).closeLocal()
 				}
 				return
 			}
@@ -205,23 +202,22 @@ func (c *Conn) wireSession(sess *session) {
 	// Reset reliable state on all open channels when a new session is wired.
 	// For persistent conns this fires on every reconnect, purging unACKed frames
 	// from the old session (which is now dead) and waking blocked senders.
-	for i := range c.channels {
-		if ch := c.channels[i].Load(); ch != nil {
-			if rs := ch.reliable.Load(); rs != nil {
-				dbg("conn: resetting reliable channel state on reconnect", "channel_id", ch.id)
-				rs.reset()
-			}
+	c.channelMap.Range(func(_, v any) bool {
+		ch := v.(*Channel)
+		if rs := ch.reliable.Load(); rs != nil {
+			dbg("conn: resetting reliable channel state on reconnect", "channel_id", ch.id)
+			rs.reset()
 		}
-	}
+		return true
+	})
 
 	// For non-persistent conns, close all channels when the session tears down.
 	if !c.isPersistent() {
 		sess.onClose = func() {
-			for i := range c.channels {
-				if ch := c.channels[i].Load(); ch != nil {
-					ch.closeLocal()
-				}
-			}
+			c.channelMap.Range(func(_, v any) bool {
+				v.(*Channel).closeLocal()
+				return true
+			})
 		}
 	}
 }
@@ -231,11 +227,10 @@ func (c *Conn) wireSession(sess *session) {
 func (c *Conn) reconnectLoop() {
 	defer func() {
 		// Permanently closed: shut down all channels.
-		for i := range c.channels {
-			if ch := c.channels[i].Load(); ch != nil {
-				ch.closeLocal()
-			}
-		}
+		c.channelMap.Range(func(_, v any) bool {
+			v.(*Channel).closeLocal()
+			return true
+		})
 		close(c.done)
 	}()
 
@@ -303,31 +298,31 @@ func (c *Conn) reconnectLoop() {
 }
 
 // getOrOpenChannel returns the Channel for id, creating it if it does not
-// already exist.  The common case (channel already open) is a single atomic
-// pointer Load with no lock or type-assertion overhead.
-func (c *Conn) getOrOpenChannel(id uint8) *Channel {
-	if ch := c.channels[id].Load(); ch != nil {
-		return ch
+// already exist.  Channel 0 is returned directly via the ch0 fast path.
+func (c *Conn) getOrOpenChannel(id uint16) *Channel {
+	if id == 0 {
+		return c.ch0 // fast path for the default channel
+	}
+	if v, ok := c.channelMap.Load(id); ok {
+		return v.(*Channel)
 	}
 	ch := newChannel(id, c, cap(c.ch0.events))
-	if c.channels[id].CompareAndSwap(nil, ch) {
-		if c.defaultReliable != nil {
-			ch.SetReliable(*c.defaultReliable)
-		}
-		return ch // we won the race
+	if c.defaultReliable != nil {
+		ch.SetReliable(*c.defaultReliable)
 	}
-	// Another goroutine stored a channel for this id concurrently.
-	dbg("mux: channel already created by racing goroutine", "channel_id", id)
-	if existing := c.channels[id].Load(); existing != nil {
-		return existing
+	// LoadOrStore is race-safe: only one goroutine wins; the rest use the winner.
+	actual, loaded := c.channelMap.LoadOrStore(id, ch)
+	if loaded {
+		dbg("mux: channel already created by racing goroutine", "channel_id", id)
+		return actual.(*Channel)
 	}
-	return ch // slot nil again (e.g. closed between CAS and Load); use ours
+	return ch
 }
 
 // Channel returns the logical channel with the given id, creating it if it
 // does not already exist.  Channel 0 is the default channel shared with Send
-// and Recv.
-func (c *Conn) Channel(id uint8) *Channel {
+// and Recv.  Valid IDs are 0–65534; ID 65535 is reserved for internal use.
+func (c *Conn) Channel(id uint16) *Channel {
 	return c.getOrOpenChannel(id)
 }
 
@@ -452,17 +447,15 @@ func (c *Conn) drainBeforeClose(ctx context.Context) {
 		c.coalescer.stop(ctx)
 	}
 	// Step 2: wait for every reliable channel's send window to empty.
-	for i := range c.channels {
+	c.channelMap.Range(func(_, v any) bool {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
-		ch := c.channels[i].Load()
-		if ch != nil {
-			if rs := ch.reliable.Load(); rs != nil {
-				_ = rs.waitEmpty(ctx)
-			}
+		if rs := v.(*Channel).reliable.Load(); rs != nil {
+			_ = rs.waitEmpty(ctx)
 		}
-	}
+		return true
+	})
 }
 
 // RemoteAddr returns the UDP address of the remote peer.

@@ -18,15 +18,16 @@ const channelCloseType = uint8(255)
 // Channel is a logical multiplexed stream within a Conn.
 //
 // Multiple Channels can be opened over a single Conn, each identified by a
-// uint8 ID.  Channel 0 is the default channel, shared with Conn.Send and
-// Conn.Recv.  All other IDs are free for the application to use.
+// uint16 ID (0–65534; 65535 is reserved).  Channel 0 is the default channel,
+// shared with Conn.Send and Conn.Recv.  All other IDs are free for the
+// application to use.
 //
 // For persistent Conns, Send and Recv block transparently while the underlying
 // connection is being re-established.
 //
 // A Channel may safely be used from multiple goroutines simultaneously.
 type Channel struct {
-	id        uint8
+	id        uint16
 	conn      *Conn
 	events    chan *Event
 	done      chan struct{}
@@ -39,7 +40,7 @@ type Channel struct {
 	reliable atomic.Pointer[reliableState]
 }
 
-func newChannel(id uint8, conn *Conn, bufSize int) *Channel {
+func newChannel(id uint16, conn *Conn, bufSize int) *Channel {
 	dbg("channel opened", "channel_id", id, "buf_size", bufSize)
 	return &Channel{
 		id:     id,
@@ -50,7 +51,7 @@ func newChannel(id uint8, conn *Conn, bufSize int) *Channel {
 }
 
 // ID returns this channel's identifier.
-func (ch *Channel) ID() uint8 { return ch.id }
+func (ch *Channel) ID() uint16 { return ch.id }
 
 // SetReliable enables reliable delivery and window-based flow control on this
 // channel.  It must be called before the first Send or Recv.

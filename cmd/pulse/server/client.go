@@ -148,7 +148,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 }
 
 // formatEvent returns a single-line description of an event.
-func formatEvent(remote string, ch uint8, e *wiresocket.Event) string {
+func formatEvent(remote string, ch uint16, e *wiresocket.Event) string {
 	base := fmt.Sprintf("[%s] ch=%-3d type=%d", remote, ch, e.Type)
 	switch {
 	case len(e.Payload) == 0:

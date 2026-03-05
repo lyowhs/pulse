@@ -173,7 +173,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 			sess:    sess,
 		}
 		c.ch0 = newChannel(0, c, cfg.EventBufSize)
-		c.channels[0].Store(c.ch0)
+		c.channelMap.Store(uint16(0), c.ch0)
 		if cfg.CoalesceInterval > 0 {
 			maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
 			c.coalescer = newCoalescer(c, cfg.CoalesceInterval, maxFrag)
