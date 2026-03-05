@@ -22,8 +22,16 @@ type DialConfig struct {
 	// via its static public key in the Authenticate callback.
 	PrivateKey [32]byte
 
-	// EventBufSize is the number of events buffered on the receive side.
-	// Defaults to 256.
+	// EventBufSize is the number of events buffered per channel on the receive
+	// side.  Defaults to max(socketBuf*3/4/MaxPacketSize, defaultReliableWindow),
+	// probed from the kernel UDP receive buffer — the same formula used by
+	// ServerConfig.  The floor of defaultReliableWindow (4096) is critical:
+	// the sender assumes the receiver can absorb that many events before the
+	// first ACK arrives; a smaller buffer causes the first burst of coalesced
+	// events to overflow and be silently dropped.
+	// Override to tune the flow-control window advertised to the remote peer;
+	// for example, set it to inflightCap when sending large fragmented events
+	// so the server's echo window stays within the socket buffer capacity.
 	EventBufSize int
 
 	// HandshakeTimeout is the maximum time to wait for the server to respond
@@ -88,9 +96,6 @@ type DialConfig struct {
 }
 
 func (cfg *DialConfig) defaults() {
-	if cfg.EventBufSize == 0 {
-		cfg.EventBufSize = 256
-	}
 	if cfg.HandshakeTimeout == 0 {
 		cfg.HandshakeTimeout = 5 * time.Second
 	}
@@ -110,14 +115,27 @@ func (cfg *DialConfig) defaults() {
 	if cfg.MaxPacketSize == 0 {
 		cfg.MaxPacketSize = defaultMaxPacketSize
 	}
-	if cfg.MaxIncompleteFrames == 0 {
+	// Auto-size MaxIncompleteFrames and EventBufSize from the kernel UDP socket
+	// buffer so neither becomes a bottleneck regardless of payload size.
+	if cfg.MaxIncompleteFrames == 0 || cfg.EventBufSize == 0 {
 		const bufRequest = 4 << 20
 		actual := ProbeUDPRecvBufSize(bufRequest)
 		ic := actual * 3 / 4 / cfg.MaxPacketSize
 		if ic < maxReassemblyBufs {
 			ic = maxReassemblyBufs
 		}
-		cfg.MaxIncompleteFrames = ic
+		if cfg.MaxIncompleteFrames == 0 {
+			cfg.MaxIncompleteFrames = ic
+		}
+		if cfg.EventBufSize == 0 {
+			cfg.EventBufSize = ic
+			// The sender initialises peerWindow = defaultReliableWindow before
+			// receiving any ACK, so EventBufSize must be at least that large or
+			// the first burst of coalesced events will overflow the buffer.
+			if cfg.EventBufSize < defaultReliableWindow {
+				cfg.EventBufSize = defaultReliableWindow
+			}
+		}
 	}
 }
 

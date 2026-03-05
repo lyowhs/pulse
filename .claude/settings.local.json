@@ -59,7 +59,8 @@
       "Bash(pgrep:*)",
       "Bash(/tmp/pulse_bench bench:*)",
       "Bash(ss:*)",
-      "Bash(/tmp/pulse_bench2 bench:*)"
+      "Bash(/tmp/pulse_bench2 bench:*)",
+      "Read(//proc/sys/net/core/**)"
     ]
   }
 }

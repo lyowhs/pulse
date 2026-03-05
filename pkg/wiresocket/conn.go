@@ -398,7 +398,20 @@ const defaultDrainTimeout = 5 * time.Second
 // the connection alive.  Bounded by ctx; partial flushes are silently
 // tolerated.
 func (c *Conn) Flush(ctx context.Context) {
-	c.drainBeforeClose(ctx)
+	// Step 1: flush the coalescer without stopping it so further sends work.
+	if c.coalescer != nil {
+		c.coalescer.flush(ctx)
+	}
+	// Step 2: wait for every reliable channel's send window to empty.
+	c.channelMap.Range(func(_, v any) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		if rs := v.(*Channel).reliable.Load(); rs != nil {
+			_ = rs.waitEmpty(ctx)
+		}
+		return true
+	})
 }
 
 // Close closes the connection.  Before tearing down the session it performs a

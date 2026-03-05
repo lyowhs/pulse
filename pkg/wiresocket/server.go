@@ -125,8 +125,11 @@ func (cfg *ServerConfig) defaults() {
 		}
 		if cfg.EventBufSize == 0 {
 			cfg.EventBufSize = ic
-			if cfg.EventBufSize < 256 {
-				cfg.EventBufSize = 256
+			// The sender initialises peerWindow = defaultReliableWindow before
+			// receiving any ACK, so EventBufSize must be at least that large or
+			// the first burst of coalesced events will overflow the buffer.
+			if cfg.EventBufSize < defaultReliableWindow {
+				cfg.EventBufSize = defaultReliableWindow
 			}
 		}
 	}

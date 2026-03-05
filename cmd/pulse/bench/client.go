@@ -69,26 +69,22 @@ func runClient(cmd *cobra.Command, args []string) error {
 		inflightCap = 4
 	}
 
-	// eventBufSize bounds the client's advertised echo receive window
-	// (myWindow = eventBufSize - len(ch.events)).  Setting it to inflightCap
-	// ensures the server's echo peerWindow stays at inflightCap, so the
-	// server never sends more than inflightCap × fragsPerEvent echo fragments
-	// at once — keeping them within the client's socket buffer.
-	eventBufSize := inflightCap
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	fmt.Fprintf(os.Stderr, "connecting to %s …\n", serverAddr)
 
-	// MaxIncompleteFrames is auto-computed by the library from the socket buffer.
+	// EventBufSize is set to inflightCap so the server's echo peerWindow stays
+	// within inflightCap events — keeping echo fragments within the socket
+	// buffer for large fragmented payloads.  MaxIncompleteFrames is auto-
+	// computed by the library from the socket buffer.
 	dialCfg := wiresocket.DialConfig{
 		ServerPublicKey:  serverPub,
 		HandshakeTimeout: 5 * time.Second,
 		MaxRetries:       10,
 		MaxPacketSize:    mtu,
 		CoalesceInterval: coalesce,
-		EventBufSize:     eventBufSize,
+		EventBufSize:     inflightCap,
 	}
 	if cc {
 		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}

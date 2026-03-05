@@ -34,6 +34,11 @@ type coalescer struct {
 	// Sending to stopC requests a synchronous flush-and-stop; the run loop
 	// closes the response channel when the flush is complete.
 	stopC chan chan struct{}
+	// flushC carries a response channel from flush() to the run loop.
+	// Sending to flushC requests a synchronous flush without stopping; the
+	// run loop closes the response channel when the flush is complete and
+	// then continues running normally.
+	flushC chan chan struct{}
 	// stopped is set to true once the run goroutine has exited, making
 	// subsequent stop() calls return immediately without blocking.
 	stopped atomic.Bool
@@ -51,6 +56,7 @@ func newCoalescer(conn *Conn, interval time.Duration, maxFrameBytes int) *coales
 		input:         make(chan coalesceItem, coalesceInputBuf),
 		maxFrameBytes: maxFrameBytes,
 		stopC:         make(chan chan struct{}, 1),
+		flushC:        make(chan chan struct{}, 1),
 	}
 	go c.run()
 	return c
@@ -78,6 +84,29 @@ func (c *coalescer) stop(ctx context.Context) {
 	case <-ctx.Done():
 	case <-c.conn.done:
 		// The connection is already down; the run loop flushed on conn.done.
+	}
+}
+
+// flush requests a synchronous flush of all pending events without stopping
+// the coalescer goroutine.  After flush returns the coalescer continues
+// running and accepts further events.
+//
+// flush is safe to call concurrently with push and stop.
+// If ctx expires before the flush completes, flush returns early.
+func (c *coalescer) flush(ctx context.Context) {
+	if c.stopped.Load() {
+		return // already stopped; nothing to flush
+	}
+	resp := make(chan struct{})
+	select {
+	case c.flushC <- resp:
+		// Sent; wait for acknowledgement.
+		select {
+		case <-resp:
+		case <-ctx.Done():
+		}
+	case <-ctx.Done():
+	case <-c.conn.done:
 	}
 }
 
@@ -165,8 +194,28 @@ func (c *coalescer) run() {
 		chId := item.channelId
 		pending[chId] = append(pending[chId], item.event)
 		if c.maxFrameBytes > 0 {
-			pendingBytes[chId] += len(item.event.Payload)
-			if pendingBytes[chId] >= c.maxFrameBytes {
+			// Track estimated wire bytes for this event to match the actual frame
+			// encoding from Frame.AppendMarshal.  Each event encodes as:
+			//   field tag 0x0A (1 byte) + varint(body_len) + type(1) + payload
+			// where body_len = 1 + len(payload).
+			//   body_len ≤ 127  → varint = 1 byte → overhead = 3
+			//   body_len ≥ 128  → varint = 2 bytes → overhead = 4
+			// Using raw payload bytes alone understates the frame size, causing
+			// coalesced frames to exceed maxFragPayload and be split into 2 UDP
+			// fragments instead of 1, doubling the in-flight packet count.
+			payloadLen := len(item.event.Payload)
+			evtWire := payloadLen + 3 // tag(1) + varint(1) + type(1)
+			if payloadLen+1 >= 128 {  // body_len ≥ 128 → 2-byte varint
+				evtWire++
+			}
+			pendingBytes[chId] += evtWire
+			// Flush when the current frame is large enough that adding one more
+			// event of the same size (plus frame-level header fields) would
+			// exceed maxFrameBytes.  frameHeaderBudget reserves space for
+			// ChannelId(2) + Seq(5) + AckSeq(5) + AckBitmap(9) + WindowSize(5) = 26
+			// bytes; 32 gives a conservative safety margin.
+			const frameHeaderBudget = 32
+			if pendingBytes[chId]+evtWire+frameHeaderBudget >= c.maxFrameBytes {
 				return chId, true
 			}
 		}
@@ -175,6 +224,23 @@ func (c *coalescer) run() {
 
 	for {
 		select {
+		case resp := <-c.flushC:
+			// Non-destructive flush from Conn.Flush(): send all pending events
+			// and signal completion, then continue running so further sends work.
+			stopTimer()
+			sess := getSession()
+			for len(c.input) > 0 {
+				fullCh, full := addItem(<-c.input)
+				if full && sess != nil {
+					flushOne(sess, fullCh)
+				}
+			}
+			if sess != nil {
+				flushAll(sess)
+			}
+			close(resp)
+			// timerC is now nil; it will be re-armed on the next item.
+
 		case resp := <-c.stopC:
 			// Graceful-drain request from Close(): flush all pending events,
 			// including any items that arrived in the input buffer since the

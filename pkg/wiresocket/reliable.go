@@ -119,13 +119,23 @@ type reliableState struct {
 
 func newReliableState(ch *Channel, cfg ReliableCfg) *reliableState {
 	cfg = cfg.withDefaults()
+	// peerWindow is our initial guess at the receiver's free buffer space,
+	// used before the first ACK arrives.  The library guarantees that any
+	// auto-configured receiver has EventBufSize ≥ defaultReliableWindow, so
+	// capping here prevents the first burst from overflowing a receiver whose
+	// EventBufSize is smaller than the caller's WindowSize.
+	// Small WindowSizes (e.g. unit tests) are unaffected: min(2, 4096) = 2.
+	initPeerWindow := cfg.WindowSize
+	if initPeerWindow > defaultReliableWindow {
+		initPeerWindow = defaultReliableWindow
+	}
 	rs := &reliableState{
 		cfg:        cfg,
 		channel:    ch,
 		nextSeq:    1,
 		expectSeq:  1,
 		pending:    make([]pendingFrame, cfg.WindowSize),
-		peerWindow: cfg.WindowSize,
+		peerWindow: initPeerWindow,
 		rto:        cfg.BaseRTO,
 	}
 	rs.cond = sync.NewCond(&rs.sendMu)

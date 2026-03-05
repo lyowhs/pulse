@@ -216,22 +216,33 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	// (= 512 * eventsPerFrame events) keeps the server's reassembly buffer
 	// within its MaxIncompleteFrames limit and prevents the sender from racing
 	// so far ahead that it starves the echo path.
-	//
-	// eventBufSize: ch.events channel depth on both server and client.  The
-	// server read loop calls ipv4.ReadBatch with a window of srvReadBatchSz=64
-	// packets; the router delivers all events from that batch before the
-	// consumer goroutine (echoConn / bench receiver) can run.  If ch.events
-	// overflows the drop-oldest policy discards an event whose token is never
-	// returned, stalling the sender.  Using srvReadBatchSz*eventsPerFrame as
-	// a floor prevents any drops regardless of goroutine scheduling.
-	const (
-		maxReassembly  = 512 // matches MaxIncompleteFrames set on the benchmark server
-		srvReadBatchSz = 64  // server.go readBatchSz
-	)
+	const maxReassembly = 512 // matches MaxIncompleteFrames set on the benchmark server
 	maxFrag := wiresocket.MaxFragmentPayload(mtu)
 	eventsPerFrame := 1
 	if coalesce > 0 && maxFrag > 0 && payloadSize < maxFrag {
-		eventsPerFrame = maxFrag / payloadSize
+		// Mirror the coalescer's flush condition: it fires when
+		//   pendingWireBytes + evtWire + frameHeaderBudget >= maxFragPayload
+		// where pendingWireBytes already includes evtWire for each event so far.
+		// Solving for N events before flush:
+		//   N*evtWire + evtWire + 32 >= maxFrag  →  N >= (maxFrag-32-evtWire)/evtWire
+		// The frame is flushed with N events (the event that triggered the check
+		// is included in pendingBytes but the frame hasn't been sent yet).
+		// Per-event wire overhead: field tag(1) + varint(body_len) + type(1).
+		// body_len = 1+payloadSize; varint = 1 byte for body_len ≤ 127, else 2.
+		overhead := 3
+		if payloadSize+1 >= 128 {
+			overhead = 4
+		}
+		evtWire := payloadSize + overhead
+		// The coalescer flushes after N events when:
+		//   N*evtWire + evtWire + frameHeaderBudget >= maxFrag
+		// Solving for N (smallest integer satisfying the condition):
+		//   N = (maxFrag - frameHeaderBudget) / evtWire  (integer division)
+		const frameHeaderBudget = 32
+		eventsPerFrame = (maxFrag - frameHeaderBudget) / evtWire
+		if eventsPerFrame < 1 {
+			eventsPerFrame = 1
+		}
 	}
 	inflightCap := maxReassembly * eventsPerFrame
 
@@ -269,16 +280,6 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		if inflightCap > maxByBuf {
 			inflightCap = maxByBuf
 		}
-	}
-
-	eventBufSize := 256
-	if burst := srvReadBatchSz * eventsPerFrame; burst > eventBufSize {
-		eventBufSize = burst
-	}
-	// ch.events must hold all in-flight echoes without dropping any, even if
-	// they all arrive in a single burst before the receiver goroutine runs.
-	if inflightCap > eventBufSize {
-		eventBufSize = inflightCap
 	}
 
 	// RTT ring buffer: the sender writes a send-timestamp at index
@@ -324,13 +325,12 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		workerCount = 1
 	}
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
-		Addr:             addr,
-		PrivateKey:       kp.Private,
-		OnConnect:        makeEchoConn(reliable),
-		MaxPacketSize:    mtu,
-		CoalesceInterval: coalesce,
+		Addr:                addr,
+		PrivateKey:          kp.Private,
+		OnConnect:           makeEchoConn(reliable),
+		MaxPacketSize:       mtu,
+		CoalesceInterval:    coalesce,
 		MaxIncompleteFrames: srvMaxIncomplete,
-		EventBufSize:        eventBufSize,
 		WorkerCount:         workerCount,
 		// WorkChannelSize must hold all fragments of all in-flight events so
 		// that the UDP reader goroutine never drops a fragment before a worker
@@ -356,16 +356,17 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		time.Sleep(5 * time.Millisecond)
 	}
 
+	// EventBufSize = inflightCap so the server's echo peerWindow stays within
+	// inflightCap events, keeping echo fragments within the socket buffer for
+	// large fragmented payloads.  MaxIncompleteFrames is doubled to give the
+	// client headroom while echoes from one batch are still in-flight.
 	dialCfg := wiresocket.DialConfig{
-		ServerPublicKey:  kp.Public,
-		HandshakeTimeout: 5 * time.Second,
-		MaxRetries:       10,
-		MaxPacketSize:    mtu,
-		CoalesceInterval: coalesce,
-		EventBufSize:     eventBufSize,
-		// Double inflightCap so the client has headroom to reassemble the
-		// next batch of frames while echoes from the current batch are still
-		// in-flight back to the sender.
+		ServerPublicKey:     kp.Public,
+		HandshakeTimeout:    5 * time.Second,
+		MaxRetries:          10,
+		MaxPacketSize:       mtu,
+		CoalesceInterval:    coalesce,
+		EventBufSize:        inflightCap,
 		MaxIncompleteFrames: inflightCap * 2,
 	}
 	if cc {
