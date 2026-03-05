@@ -54,20 +54,15 @@ func runClient(cmd *cobra.Command, args []string) error {
 	copy(serverPub[:], b)
 
 	// Compute pipeline parameters to avoid overwhelming the socket buffers.
-	// Mirrors the inflightCap calculation in bench run so that the number of
-	// in-flight fragments never exceeds what the kernel can actually buffer.
-	const (
-		sizeDataHdr = 16
-		sizeFragHdr = 8
-		sizeAEAD    = 16
-		requested   = 4 << 20 // matches dialSession socket buffer request
-	)
-	maxFrag := mtu - sizeDataHdr - sizeFragHdr - sizeAEAD
+	// inflightCap bounds the reliable window and EventBufSize so that in-flight
+	// fragments never exceed what the kernel can actually buffer.
+	maxFrag := wiresocket.MaxFragmentPayload(mtu)
 	fragsPerEvent := 1
 	if maxFrag > 0 && size > maxFrag {
 		fragsPerEvent = (size + maxFrag - 1) / maxFrag
 	}
-	actualBuf := wiresocket.ProbeUDPRecvBufSize(requested)
+	const bufRequest = 4 << 20 // matches dialSession socket buffer request
+	actualBuf := wiresocket.ProbeUDPRecvBufSize(bufRequest)
 	socketBuf := actualBuf * 3 / 4 // 75% headroom margin
 	inflightCap := socketBuf / (fragsPerEvent * mtu)
 	if inflightCap < 4 {
@@ -80,10 +75,6 @@ func runClient(cmd *cobra.Command, args []string) error {
 	// server never sends more than inflightCap × fragsPerEvent echo fragments
 	// at once — keeping them within the client's socket buffer.
 	eventBufSize := inflightCap
-	maxIncomplete := 64
-	if inflightCap*2 > maxIncomplete {
-		maxIncomplete = inflightCap * 2
-	}
 
 	var reliableCfg *wiresocket.ReliableCfg
 	if reliable {
@@ -95,6 +86,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "connecting to %s …\n", serverAddr)
 
+	// MaxIncompleteFrames is auto-computed by the library from the socket buffer.
 	dialCfg := wiresocket.DialConfig{
 		ServerPublicKey:        serverPub,
 		HandshakeTimeout:       5 * time.Second,
@@ -102,7 +94,6 @@ func runClient(cmd *cobra.Command, args []string) error {
 		MaxPacketSize:          mtu,
 		CoalesceInterval:       coalesce,
 		EventBufSize:           eventBufSize,
-		MaxIncompleteFrames:    maxIncomplete,
 		DisableDefaultReliable: !reliable,
 		DefaultReliable:        reliableCfg,
 	}

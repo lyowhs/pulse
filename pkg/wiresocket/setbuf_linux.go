@@ -4,7 +4,13 @@ package wiresocket
 
 import (
 	"net"
+	"sync"
 	"syscall"
+)
+
+var (
+	probeOnce   sync.Once
+	probeResult int
 )
 
 // ProbeUDPRecvBufSize returns the actual kernel-allocated UDP receive buffer
@@ -19,7 +25,15 @@ import (
 // Callers should use the returned value — not the requested size — when sizing
 // pipeline parameters such as inflightCap so that in-flight data does not
 // exceed what the kernel will actually buffer.
+//
+// The result is memoized: the kernel limit (net.core.rmem_max) does not change
+// during process lifetime, so only one probe socket is ever opened.
 func ProbeUDPRecvBufSize(requested int) int {
+	probeOnce.Do(func() { probeResult = probeUDPRecvBufSizeOnce(requested) })
+	return probeResult
+}
+
+func probeUDPRecvBufSizeOnce(requested int) int {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return requested

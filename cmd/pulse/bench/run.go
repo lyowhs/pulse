@@ -186,10 +186,7 @@ func fmtDuration(d time.Duration) string {
 // given UDP MTU.  A frame that exceeds this requires more than 65535 fragments
 // and cannot be sent.
 func maxPayloadForMTU(mtu int) int {
-	const sizeDataHeader = 16
-	const sizeFragmentHeader = 8
-	const sizeAEADTag = 16
-	maxFrag := mtu - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
+	maxFrag := wiresocket.MaxFragmentPayload(mtu)
 	if maxFrag <= 0 {
 		return 0
 	}
@@ -228,13 +225,10 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	// returned, stalling the sender.  Using srvReadBatchSz*eventsPerFrame as
 	// a floor prevents any drops regardless of goroutine scheduling.
 	const (
-		sizeDataHdr    = 16
-		sizeFragHdr    = 8
-		sizeAEAD       = 16
 		maxReassembly  = 512 // matches MaxIncompleteFrames set on the benchmark server
 		srvReadBatchSz = 64  // server.go readBatchSz
 	)
-	maxFrag := mtu - sizeDataHdr - sizeFragHdr - sizeAEAD
+	maxFrag := wiresocket.MaxFragmentPayload(mtu)
 	eventsPerFrame := 1
 	if coalesce > 0 && maxFrag > 0 && payloadSize < maxFrag {
 		eventsPerFrame = maxFrag / payloadSize

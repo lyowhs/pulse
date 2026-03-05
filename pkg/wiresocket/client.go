@@ -116,11 +116,18 @@ func (cfg *DialConfig) defaults() {
 	if cfg.KeepaliveInterval == 0 {
 		cfg.KeepaliveInterval = keepaliveInterval
 	}
-	if cfg.MaxIncompleteFrames == 0 {
-		cfg.MaxIncompleteFrames = maxReassemblyBufs
-	}
+	// MaxPacketSize must be resolved before buffer-derived defaults.
 	if cfg.MaxPacketSize == 0 {
 		cfg.MaxPacketSize = defaultMaxPacketSize
+	}
+	if cfg.MaxIncompleteFrames == 0 {
+		const bufRequest = 4 << 20
+		actual := ProbeUDPRecvBufSize(bufRequest)
+		ic := actual * 3 / 4 / cfg.MaxPacketSize
+		if ic < maxReassemblyBufs {
+			ic = maxReassemblyBufs
+		}
+		cfg.MaxIncompleteFrames = ic
 	}
 	// Reliable delivery is on by default.
 	if !cfg.DisableDefaultReliable && cfg.DefaultReliable == nil {

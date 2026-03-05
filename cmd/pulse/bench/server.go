@@ -52,38 +52,6 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		copy(privKey[:], b)
 	}
 
-	// Compute server parameters that match what a well-configured bench client
-	// will use.  The client's inflightCap is bounded by its socket buffer; we
-	// probe the same buffer here so the server's reassembly table and event
-	// channel never become the bottleneck.
-	const (
-		sizeDataHdr = 16
-		sizeFragHdr = 8
-		sizeAEAD    = 16
-		minMaxInc   = 512 // matches bench run's maxReassembly floor
-		requested   = 4 << 20
-	)
-	// Worst-case inflightCap: assume one fragment per frame (smallest payload).
-	// A higher real fragsPerEvent reduces inflightCap further, so this is safe.
-	actualBuf := wiresocket.ProbeUDPRecvBufSize(requested)
-	socketBuf := actualBuf * 3 / 4
-	inflightCap := socketBuf / mtu
-	if inflightCap < 4 {
-		inflightCap = 4
-	}
-
-	srvMaxIncomplete := minMaxInc
-	if inflightCap > srvMaxIncomplete {
-		srvMaxIncomplete = inflightCap
-	}
-
-	// EventBufSize must hold all in-flight events without overflow so the
-	// server's myWindow() never collapses the client's send window to near zero.
-	eventBufSize := 256
-	if inflightCap > eventBufSize {
-		eventBufSize = inflightCap
-	}
-
 	// With reliable delivery, serialise packet processing to prevent goroutine
 	// scheduling reorder on loopback from creating OOO gaps larger than the
 	// reliableOOOWindow.
@@ -92,14 +60,14 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		workerCount = 1
 	}
 
+	// MaxIncompleteFrames and EventBufSize are auto-computed by the library
+	// from the kernel UDP socket buffer size.
 	srvCfg := wiresocket.ServerConfig{
 		Addr:                   addr,
 		PrivateKey:             privKey,
 		OnConnect:              echoConn,
 		MaxPacketSize:          mtu,
 		CoalesceInterval:       coalesce,
-		MaxIncompleteFrames:    srvMaxIncomplete,
-		EventBufSize:           eventBufSize,
 		WorkerCount:            workerCount,
 		DisableDefaultReliable: !reliable,
 	}

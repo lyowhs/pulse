@@ -38,6 +38,20 @@ const (
 	defaultMaxPacketSize = 1232
 )
 
+// MaxFragmentPayload returns the maximum plaintext data bytes that fit in one
+// UDP fragment for the given packet size limit.  This is the payload budget
+// after subtracting the data header, fragment header, and AEAD tag overhead.
+//
+// Use this to compute fragsPerEvent = ceil(payloadSize / MaxFragmentPayload(mtu))
+// when sizing pipeline parameters such as ReliableCfg.WindowSize.
+func MaxFragmentPayload(mtu int) int {
+	v := mtu - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
 // ─── HandshakeInit ───────────────────────────────────────────────────────────
 
 // HandshakeInit is the first message sent by the initiator.

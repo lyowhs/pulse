@@ -38,6 +38,12 @@ type ServerConfig struct {
 
 	// WorkerCount is the number of concurrent packet-processing goroutines.
 	// Defaults to GOMAXPROCS.
+	//
+	// When reliable delivery is enabled, use WorkerCount = 1 on loopback or
+	// other low-latency paths.  Multiple workers process packets concurrently,
+	// and goroutine scheduling jitter on loopback can reorder packets enough to
+	// create out-of-order gaps larger than the receiver's SACK window (64
+	// entries), causing permanent frame drops and retransmit storms.
 	WorkerCount int
 
 	// UnderLoad, if set, returns true when the server is under DoS stress and
@@ -112,8 +118,29 @@ type ServerConfig struct {
 }
 
 func (cfg *ServerConfig) defaults() {
-	if cfg.EventBufSize == 0 {
-		cfg.EventBufSize = 256
+	// MaxPacketSize must be resolved first so buffer-derived defaults are accurate.
+	if cfg.MaxPacketSize == 0 {
+		cfg.MaxPacketSize = defaultMaxPacketSize
+	}
+	// Auto-size MaxIncompleteFrames and EventBufSize from the kernel UDP socket
+	// buffer so the server never drops fragments or starve the client's send
+	// window, regardless of payload size.
+	if cfg.MaxIncompleteFrames == 0 || cfg.EventBufSize == 0 {
+		const bufRequest = 4 << 20
+		actual := ProbeUDPRecvBufSize(bufRequest)
+		ic := actual * 3 / 4 / cfg.MaxPacketSize
+		if ic < maxReassemblyBufs {
+			ic = maxReassemblyBufs
+		}
+		if cfg.MaxIncompleteFrames == 0 {
+			cfg.MaxIncompleteFrames = ic
+		}
+		if cfg.EventBufSize == 0 {
+			cfg.EventBufSize = ic
+			if cfg.EventBufSize < 256 {
+				cfg.EventBufSize = 256
+			}
+		}
 	}
 	if cfg.SessionTimeout == 0 {
 		cfg.SessionTimeout = sessionTimeout
@@ -124,14 +151,8 @@ func (cfg *ServerConfig) defaults() {
 	if cfg.SessionGCInterval == 0 {
 		cfg.SessionGCInterval = 5 * time.Second
 	}
-	if cfg.MaxIncompleteFrames == 0 {
-		cfg.MaxIncompleteFrames = maxReassemblyBufs
-	}
 	if cfg.WorkerCount == 0 {
 		cfg.WorkerCount = runtime.GOMAXPROCS(0)
-	}
-	if cfg.MaxPacketSize == 0 {
-		cfg.MaxPacketSize = defaultMaxPacketSize
 	}
 	if cfg.WorkChannelSize == 0 {
 		cfg.WorkChannelSize = cfg.WorkerCount * 64
