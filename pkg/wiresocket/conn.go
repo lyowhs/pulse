@@ -60,6 +60,15 @@ type Conn struct {
 	newChannelCfg ReliableCfg
 }
 
+// InflightCap returns the maximum number of events that can be in-flight
+// simultaneously on this connection without overflowing the socket receive
+// buffer.  This equals the EventBufSize computed (or provided) at dial time
+// and is the natural bound for application-level send semaphores and RTT
+// measurement ring buffers.
+func (c *Conn) InflightCap() int {
+	return c.newChannelCfg.WindowSize
+}
+
 // CongestionRateKBps returns the current AIMD congestion-controller send rate
 // in KiB/s, or 0 if congestion control is not configured on this Conn.
 func (c *Conn) CongestionRateKBps() float64 {

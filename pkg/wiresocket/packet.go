@@ -41,15 +41,24 @@ const (
 // MaxFragmentPayload returns the maximum plaintext data bytes that fit in one
 // UDP fragment for the given packet size limit.  This is the payload budget
 // after subtracting the data header, fragment header, and AEAD tag overhead.
-//
-// Use this to compute fragsPerEvent = ceil(payloadSize / MaxFragmentPayload(mtu))
-// when sizing pipeline parameters such as ReliableCfg.WindowSize.
 func MaxFragmentPayload(mtu int) int {
 	v := mtu - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
 	if v < 0 {
 		return 0
 	}
 	return v
+}
+
+// MaxEventPayload returns the maximum event payload size in bytes that can be
+// sent as a single (possibly fragmented) frame at the given UDP MTU.  Events
+// larger than this value would require more than 65535 fragments and cannot
+// be transmitted.
+func MaxEventPayload(mtu int) int {
+	maxFrag := MaxFragmentPayload(mtu)
+	if maxFrag <= 0 {
+		return 0
+	}
+	return 65535 * maxFrag
 }
 
 // ─── HandshakeInit ───────────────────────────────────────────────────────────

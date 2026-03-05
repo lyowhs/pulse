@@ -60,7 +60,7 @@ func runBench(cmd *cobra.Command, _ []string) error {
 
 	for _, mtu := range mtus {
 		for _, size := range sizes {
-			skipped := size > maxPayloadForMTU(mtu)
+			skipped := size > wiresocket.MaxEventPayload(mtu)
 			r, err := runOne(dur, mtu, size, coalesce, reliable, cc)
 			if err != nil {
 				return fmt.Errorf("bench mtu=%d size=%d: %w", mtu, size, err)
@@ -182,116 +182,19 @@ func fmtDuration(d time.Duration) string {
 	}
 }
 
-// maxPayloadForMTU returns the maximum single-frame payload in bytes for the
-// given UDP MTU.  A frame that exceeds this requires more than 65535 fragments
-// and cannot be sent.
-func maxPayloadForMTU(mtu int) int {
-	maxFrag := wiresocket.MaxFragmentPayload(mtu)
-	if maxFrag <= 0 {
-		return 0
-	}
-	return 65535 * maxFrag
-}
 
 // runOne starts an in-process echo server + client, drives traffic for dur,
 // and returns throughput, loss, latency, and retransmit metrics.
 // Returns a zero result (not an error) when the payload cannot be sent at the
 // given MTU.
 func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, reliable, cc bool) (oneResult, error) {
-	if payloadSize > maxPayloadForMTU(mtu) {
+	if payloadSize > wiresocket.MaxEventPayload(mtu) {
 		fmt.Fprintf(os.Stderr, "  skipping mtu=%-5d payload=%-10s — exceeds 255-fragment limit\n",
 			mtu, fmtSize(int64(payloadSize)))
 		return oneResult{}, nil
 	}
 	fmt.Fprintf(os.Stderr, "  running mtu=%-5d payload=%-10s duration=%s …\n",
 		mtu, fmtSize(int64(payloadSize)), dur)
-
-	// Compute pipeline parameters before starting the server and client so
-	// both can be configured consistently.
-	//
-	// eventsPerFrame: maximum events in one coalesced UDP packet.  With
-	// coalescing disabled each packet carries exactly one event.
-	//
-	// inflightCap: token-semaphore capacity.  Capping at maxReassembly frames
-	// (= 512 * eventsPerFrame events) keeps the server's reassembly buffer
-	// within its MaxIncompleteFrames limit and prevents the sender from racing
-	// so far ahead that it starves the echo path.
-	const maxReassembly = 512 // matches MaxIncompleteFrames set on the benchmark server
-	maxFrag := wiresocket.MaxFragmentPayload(mtu)
-	eventsPerFrame := 1
-	if coalesce > 0 && maxFrag > 0 && payloadSize < maxFrag {
-		// Mirror the coalescer's flush condition: it fires when
-		//   pendingWireBytes + evtWire + frameHeaderBudget >= maxFragPayload
-		// where pendingWireBytes already includes evtWire for each event so far.
-		// Solving for N events before flush:
-		//   N*evtWire + evtWire + 32 >= maxFrag  →  N >= (maxFrag-32-evtWire)/evtWire
-		// The frame is flushed with N events (the event that triggered the check
-		// is included in pendingBytes but the frame hasn't been sent yet).
-		// Per-event wire overhead: field tag(1) + varint(body_len) + type(1).
-		// body_len = 1+payloadSize; varint = 1 byte for body_len ≤ 127, else 2.
-		overhead := 3
-		if payloadSize+1 >= 128 {
-			overhead = 4
-		}
-		evtWire := payloadSize + overhead
-		// The coalescer flushes after N events when:
-		//   N*evtWire + evtWire + frameHeaderBudget >= maxFrag
-		// Solving for N (smallest integer satisfying the condition):
-		//   N = (maxFrag - frameHeaderBudget) / evtWire  (integer division)
-		const frameHeaderBudget = 32
-		eventsPerFrame = (maxFrag - frameHeaderBudget) / evtWire
-		if eventsPerFrame < 1 {
-			eventsPerFrame = 1
-		}
-	}
-	inflightCap := maxReassembly * eventsPerFrame
-
-	// fragsPerEvent: how many UDP fragments one event requires on the wire.
-	// 1 for non-fragmented payloads; ceil(payload/maxFrag) otherwise.
-	fragsPerEvent := 1
-	if maxFrag > 0 && payloadSize > maxFrag {
-		fragsPerEvent = (payloadSize + maxFrag - 1) / maxFrag
-	}
-
-	// Cap inflightCap so that all in-flight fragments fit inside the kernel
-	// receive buffer.  We probe the actual achievable buffer size rather than
-	// assuming 6 MiB: on Linux without CAP_NET_ADMIN, SO_RCVBUF is clamped by
-	// net.core.rmem_max (≈ 104 KiB on stock kernels), far below the requested
-	// 4 MiB.  Using the hardcoded constant caused massive socket-level drops on
-	// Linux because inflightCap was set orders of magnitude too high.
-	//
-	// Derivation of the cap:
-	//   in-flight UDP packets = inflightCap / eventsPerFrame × fragsPerEvent
-	//   in-flight bytes       ≈ (inflightCap / eventsPerFrame) × fragsPerEvent × mtu
-	//   constraint            ≤ socketBuf
-	//   ⟹ inflightCap        ≤ socketBuf × eventsPerFrame / (fragsPerEvent × mtu)
-	//
-	// The cap is applied unconditionally (not just for fragsPerEvent > 1) so
-	// that large single-fragment frames (e.g. mtu=65507, size=4096) are also
-	// bounded — they can overflow the socket buffer just as easily.
-	{
-		const requested = 4 << 20 // matches dialSession / Serve socket buffer request
-		actualBuf := wiresocket.ProbeUDPRecvBufSize(requested)
-		socketBuf := actualBuf * 3 / 4 // 75 % headroom margin
-		maxByBuf := socketBuf * eventsPerFrame / (fragsPerEvent * mtu)
-		if maxByBuf < 1 {
-			maxByBuf = 1
-		}
-		if inflightCap > maxByBuf {
-			inflightCap = maxByBuf
-		}
-	}
-
-	// RTT ring buffer: the sender writes a send-timestamp at index
-	// (txCount & rttMask) before each send; the receiver reads it at
-	// (rxCount & rttMask) on echo receipt.  The ring must be strictly larger
-	// than inflightCap so sender and receiver never alias the same slot.
-	rttRingSize := 1
-	for rttRingSize <= inflightCap {
-		rttRingSize <<= 1
-	}
-	rttMask := rttRingSize - 1
-	sendTimes := make([]atomic.Int64, rttRingSize)
 
 	kp, err := wiresocket.GenerateKeypair()
 	if err != nil {
@@ -359,6 +262,22 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	if err != nil {
 		return oneResult{}, fmt.Errorf("dial: %w", err)
 	}
+
+	// inflightCap is the number of events that can be in-flight simultaneously
+	// without overflowing the socket receive buffer.  The library derives this
+	// from the probed kernel buffer size and MaxEventPayloadSize.
+	inflightCap := conn.InflightCap()
+
+	// RTT ring buffer: the sender writes a send-timestamp at index
+	// (txCount & rttMask) before each send; the receiver reads it at
+	// (rxCount & rttMask) on echo receipt.  The ring must be strictly larger
+	// than inflightCap so sender and receiver never alias the same slot.
+	rttRingSize := 1
+	for rttRingSize <= inflightCap {
+		rttRingSize <<= 1
+	}
+	rttMask := rttRingSize - 1
+	sendTimes := make([]atomic.Int64, rttRingSize)
 
 	ch := conn.Channel(benchChannel)
 	// Channels are reliable by default with the window auto-sized from
@@ -477,7 +396,9 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	if drainWait < 100*time.Millisecond {
 		drainWait = 100 * time.Millisecond
 	}
-	if fragDelay := time.Duration(fragsPerEvent) * time.Millisecond; fragDelay > drainWait {
+	// Scale drain wait for large fragmented payloads: each event requires
+	// approximately payloadSize/mtu fragments, each taking ~1ms to round-trip.
+	if fragDelay := time.Duration(payloadSize/mtu+1) * time.Millisecond; fragDelay > drainWait {
 		drainWait = fragDelay
 	}
 	time.Sleep(drainWait)
