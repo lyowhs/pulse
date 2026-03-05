@@ -85,16 +85,6 @@ type DialConfig struct {
 	// Overrides SendRateLimitBPS when set.
 	CongestionControl *CongestionConfig
 
-	// DefaultReliable configures reliable delivery applied to every channel
-	// opened on this connection.  When nil and DisableDefaultReliable is false,
-	// reliable delivery is enabled automatically with sensible defaults.
-	// Override specific channels via Channel.SetReliable.
-	DefaultReliable *ReliableCfg
-
-	// DisableDefaultReliable, if true, disables the automatic reliable-delivery
-	// default applied to all channels.  Use for real-time or latency-sensitive
-	// workloads where head-of-line blocking is worse than a dropped frame.
-	DisableDefaultReliable bool
 }
 
 func (cfg *DialConfig) defaults() {
@@ -129,17 +119,6 @@ func (cfg *DialConfig) defaults() {
 		}
 		cfg.MaxIncompleteFrames = ic
 	}
-	// Reliable delivery is on by default.
-	if !cfg.DisableDefaultReliable && cfg.DefaultReliable == nil {
-		cfg.DefaultReliable = &ReliableCfg{}
-	}
-	// CC requires reliable with enough retries to survive rate-limited sends.
-	// Auto-bump MaxRetries when the caller has not explicitly set a high value.
-	if cfg.CongestionControl != nil && cfg.DefaultReliable != nil {
-		if cfg.DefaultReliable.MaxRetries < 30 {
-			cfg.DefaultReliable.MaxRetries = 30
-		}
-	}
 }
 
 // Dial connects to a wiresocket server at addr, completes the Noise IK
@@ -172,6 +151,10 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 			ready:   ready,
 			sess:    sess,
 		}
+		// CC requires reliable with enough retries to survive rate-limited sends.
+		if cfg.CongestionControl != nil && c.newChannelCfg.MaxRetries < 30 {
+			c.newChannelCfg.MaxRetries = 30
+		}
 		c.ch0 = newChannel(0, c, cfg.EventBufSize)
 		c.channelMap.Store(uint16(0), c.ch0)
 		if cfg.CoalesceInterval > 0 {
@@ -182,11 +165,6 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 		// session rate limiter on the first (and every subsequent) session.
 		if cfg.CongestionControl != nil {
 			c.cc = newAIMDController(normalizeCCConfig(*cfg.CongestionControl), c)
-		}
-		// Apply DefaultReliable to ch0 and store for channels opened later.
-		c.defaultReliable = cfg.DefaultReliable
-		if cfg.DefaultReliable != nil {
-			c.ch0.SetReliable(*cfg.DefaultReliable)
 		}
 		// Wire the router before starting the read loop so sess.router is
 		// visible inside the goroutine (goroutine-start happens-before).
@@ -203,7 +181,11 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 
 	// Non-persistent: wire the router (inside newConn) before starting the
 	// read loop so the goroutine-start happens-before makes it visible.
-	conn := newConn(sess, cfg.CoalesceInterval, cfg.DefaultReliable)
+	var newChannelCfg ReliableCfg
+	if cfg.CongestionControl != nil && newChannelCfg.MaxRetries < 30 {
+		newChannelCfg.MaxRetries = 30
+	}
+	conn := newConn(sess, cfg.CoalesceInterval, newChannelCfg)
 	if cfg.CongestionControl != nil {
 		cc := newAIMDController(normalizeCCConfig(*cfg.CongestionControl), conn)
 		conn.cc = cc

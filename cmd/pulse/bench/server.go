@@ -63,13 +63,12 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// MaxIncompleteFrames and EventBufSize are auto-computed by the library
 	// from the kernel UDP socket buffer size.
 	srvCfg := wiresocket.ServerConfig{
-		Addr:                   addr,
-		PrivateKey:             privKey,
-		OnConnect:              echoConn,
-		MaxPacketSize:          mtu,
-		CoalesceInterval:       coalesce,
-		WorkerCount:            workerCount,
-		DisableDefaultReliable: !reliable,
+		Addr:             addr,
+		PrivateKey:       privKey,
+		OnConnect:        makeEchoConn(reliable),
+		MaxPacketSize:    mtu,
+		CoalesceInterval: coalesce,
+		WorkerCount:      workerCount,
 	}
 	srv, err := wiresocket.NewServer(srvCfg)
 	if err != nil {

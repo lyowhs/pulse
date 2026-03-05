@@ -1227,8 +1227,8 @@ func TestConcurrentSendRecv(t *testing.T) {
 	// gaps can exceed the 64-slot SACK buffer, causing frame drops and
 	// retransmit timeouts that exceed the test deadline.
 	addr, kp := serverSetup(t, wiresocket.ServerConfig{
-		DisableDefaultReliable: true,
 		OnConnect: func(conn *wiresocket.Conn) {
+			conn.Channel(0).SetUnreliable()
 			for {
 				e, err := conn.Recv(context.Background())
 				if err != nil {
@@ -1241,7 +1241,8 @@ func TestConcurrentSendRecv(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn := mustDial(t, ctx, addr, kp, wiresocket.DialConfig{DisableDefaultReliable: true})
+	conn := mustDial(t, ctx, addr, kp, wiresocket.DialConfig{})
+	conn.Channel(0).SetUnreliable()
 
 	var (
 		sendWG sync.WaitGroup

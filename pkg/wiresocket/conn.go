@@ -53,9 +53,11 @@ type Conn struct {
 	// session reconnects so that the learned rate (ssthresh) is preserved.
 	cc *aimdController
 
-	// defaultReliable, when non-nil, is applied to every channel opened on
-	// this connection.  Individual channels can override via SetReliable.
-	defaultReliable *ReliableCfg
+	// newChannelCfg is the ReliableCfg applied when a new channel is created.
+	// Zero value gives library defaults (defaultReliableWindow, defaultBaseRTO,
+	// etc.).  Set MaxRetries = 30 when CongestionControl is configured so that
+	// rate-limited sends do not time out at the default MaxRetries of 10.
+	newChannelCfg ReliableCfg
 }
 
 // CongestionRateKBps returns the current AIMD congestion-controller send rate
@@ -71,17 +73,14 @@ func (c *Conn) CongestionRateKBps() float64 {
 // coalesceInterval > 0 enables the event coalescer.
 // wireSession is called here so the router is in place before the caller
 // starts the read-loop goroutine.
-func newConn(s *session, coalesceInterval time.Duration, defaultReliable *ReliableCfg) *Conn {
+func newConn(s *session, coalesceInterval time.Duration, newChannelCfg ReliableCfg) *Conn {
 	c := &Conn{
-		sess:            s,
-		done:            s.done, // alias: done when the session closes
-		defaultReliable: defaultReliable,
+		sess:          s,
+		done:          s.done, // alias: done when the session closes
+		newChannelCfg: newChannelCfg,
 	}
 	c.ch0 = newChannel(0, c, s.eventBuf)
 	c.channelMap.Store(uint16(0), c.ch0)
-	if defaultReliable != nil {
-		c.ch0.SetReliable(*defaultReliable)
-	}
 	if coalesceInterval > 0 {
 		c.coalescer = newCoalescer(c, coalesceInterval, s.maxFragPayload)
 	}
@@ -307,9 +306,6 @@ func (c *Conn) getOrOpenChannel(id uint16) *Channel {
 		return v.(*Channel)
 	}
 	ch := newChannel(id, c, cap(c.ch0.events))
-	if c.defaultReliable != nil {
-		ch.SetReliable(*c.defaultReliable)
-	}
 	// LoadOrStore is race-safe: only one goroutine wins; the rest use the winner.
 	actual, loaded := c.channelMap.LoadOrStore(id, ch)
 	if loaded {

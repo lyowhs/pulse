@@ -35,20 +35,28 @@ func Command() *cobra.Command {
 	return cmd
 }
 
-// echoConn echoes every event received on benchChannel back to the sender.
+// makeEchoConn returns an OnConnect handler that echoes every event received
+// on benchChannel back to the sender.  When reliable is false, the channel is
+// switched to unreliable (fire-and-forget) mode before the echo loop starts.
+//
 // With server-side coalescing enabled, ch.Send is non-blocking (pushes into
 // the coalescer's input buffer and returns immediately), so a simple
 // sequential recv→send loop is sufficient.
-func echoConn(conn *wiresocket.Conn) {
-	ch := conn.Channel(benchChannel)
-	ctx := context.Background()
-	for {
-		e, err := ch.Recv(ctx)
-		if err != nil {
-			return
+func makeEchoConn(reliable bool) func(*wiresocket.Conn) {
+	return func(conn *wiresocket.Conn) {
+		ch := conn.Channel(benchChannel)
+		if !reliable {
+			ch.SetUnreliable()
 		}
-		if err := ch.Send(ctx, e); err != nil {
-			return
+		ctx := context.Background()
+		for {
+			e, err := ch.Recv(ctx)
+			if err != nil {
+				return
+			}
+			if err := ch.Send(ctx, e); err != nil {
+				return
+			}
 		}
 	}
 }

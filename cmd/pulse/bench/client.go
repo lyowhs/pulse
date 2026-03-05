@@ -76,11 +76,6 @@ func runClient(cmd *cobra.Command, args []string) error {
 	// at once — keeping them within the client's socket buffer.
 	eventBufSize := inflightCap
 
-	var reliableCfg *wiresocket.ReliableCfg
-	if reliable {
-		reliableCfg = &wiresocket.ReliableCfg{WindowSize: inflightCap}
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -88,14 +83,12 @@ func runClient(cmd *cobra.Command, args []string) error {
 
 	// MaxIncompleteFrames is auto-computed by the library from the socket buffer.
 	dialCfg := wiresocket.DialConfig{
-		ServerPublicKey:        serverPub,
-		HandshakeTimeout:       5 * time.Second,
-		MaxRetries:             10,
-		MaxPacketSize:          mtu,
-		CoalesceInterval:       coalesce,
-		EventBufSize:           eventBufSize,
-		DisableDefaultReliable: !reliable,
-		DefaultReliable:        reliableCfg,
+		ServerPublicKey:  serverPub,
+		HandshakeTimeout: 5 * time.Second,
+		MaxRetries:       10,
+		MaxPacketSize:    mtu,
+		CoalesceInterval: coalesce,
+		EventBufSize:     eventBufSize,
 	}
 	if cc {
 		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}
@@ -111,6 +104,15 @@ func runClient(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "connected\n\n")
 
 	ch := conn.Channel(benchChannel)
+	// Configure per-channel reliability.  Channels are reliable by default; set
+	// the window to inflightCap so the reliable send window matches the token
+	// semaphore and is never the throughput bottleneck.  Disable reliability
+	// entirely when --reliable=false.
+	if reliable {
+		ch.SetReliable(wiresocket.ReliableCfg{WindowSize: inflightCap})
+	} else {
+		ch.SetUnreliable()
+	}
 
 	var txMsgs, txBytes, rxMsgs, rxBytes atomic.Int64
 

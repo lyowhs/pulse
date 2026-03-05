@@ -42,19 +42,35 @@ type Channel struct {
 
 func newChannel(id uint16, conn *Conn, bufSize int) *Channel {
 	dbg("channel opened", "channel_id", id, "buf_size", bufSize)
-	return &Channel{
+	ch := &Channel{
 		id:     id,
 		conn:   conn,
 		events: make(chan *Event, bufSize),
 		done:   make(chan struct{}),
 	}
+	ch.reliable.Store(newReliableState(ch, conn.newChannelCfg))
+	return ch
 }
 
 // ID returns this channel's identifier.
 func (ch *Channel) ID() uint16 { return ch.id }
 
+// SetUnreliable disables reliable delivery on this channel, reverting it to
+// fire-and-forget mode.  Any goroutine blocked in Send waiting for window
+// space is immediately unblocked with ErrChannelClosed.
+//
+// SetUnreliable may be called at any time, but should be called before the
+// first Send or Recv to avoid a transient reliable window that the peer could
+// observe.
+func (ch *Channel) SetUnreliable() {
+	if old := ch.reliable.Swap(nil); old != nil {
+		old.cond.Broadcast() // unblock any goroutine in preSend's cond.Wait
+	}
+}
+
 // SetReliable enables reliable delivery and window-based flow control on this
-// channel.  It must be called before the first Send or Recv.
+// channel.  Channels are reliable by default; call this to change the
+// configuration (e.g. window size or retransmit timeout) after creation.
 //
 // When reliable mode is active:
 //   - Each sent frame is assigned a sequence number and buffered until ACKed.
@@ -63,14 +79,10 @@ func (ch *Channel) ID() uint16 { return ch.id }
 //   - Received frames are delivered in order; out-of-order arrivals are buffered.
 //   - ACKs are piggybacked on outgoing data frames; standalone ACK packets are
 //     sent after at most cfg.ACKDelay when no data is flowing.
-//
-// Both sides of a channel must coordinate: the sender calls SetReliable to opt
-// in; the receiver detects reliable frames automatically (via the Seq field).
 func (ch *Channel) SetReliable(cfg ReliableCfg) {
 	rs := newReliableState(ch, cfg)
-	// If auto-creation already installed a receive-only state (because frames
-	// arrived before SetReliable was called), copy the receive-side progress
-	// into the new state so we don't reset expectSeq back to 1.
+	// Copy receive-side progress from the existing state so we don't reset
+	// expectSeq back to 1 (e.g. when reconfiguring window size mid-stream).
 	if old := ch.reliable.Load(); old != nil {
 		old.recvMu.Lock()
 		rs.expectSeq = old.expectSeq

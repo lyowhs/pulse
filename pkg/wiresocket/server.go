@@ -96,18 +96,6 @@ type ServerConfig struct {
 	// Overrides SendRateLimitBPS when set.
 	CongestionControl *CongestionConfig
 
-	// DefaultReliable configures reliable delivery applied to every channel on
-	// every accepted connection.  When nil and DisableDefaultReliable is false,
-	// reliable delivery is enabled automatically with sensible defaults.
-	// Override specific channels via Channel.SetReliable.
-	DefaultReliable *ReliableCfg
-
-	// DisableDefaultReliable, if true, disables the automatic reliable-delivery
-	// default for all channels on accepted connections.  Use for real-time or
-	// latency-sensitive workloads where head-of-line blocking is worse than a
-	// dropped frame.
-	DisableDefaultReliable bool
-
 	// WorkChannelSize is the number of incoming packets buffered between the
 	// UDP reader goroutine and the worker pool.  If the channel is full,
 	// excess packets are silently dropped.  Defaults to
@@ -158,16 +146,6 @@ func (cfg *ServerConfig) defaults() {
 		cfg.WorkChannelSize = cfg.WorkerCount * 64
 		if cfg.WorkChannelSize < 4096 {
 			cfg.WorkChannelSize = 4096
-		}
-	}
-	// Reliable delivery is on by default.
-	if !cfg.DisableDefaultReliable && cfg.DefaultReliable == nil {
-		cfg.DefaultReliable = &ReliableCfg{}
-	}
-	// CC requires reliable with enough retries to survive rate-limited sends.
-	if cfg.CongestionControl != nil && cfg.DefaultReliable != nil {
-		if cfg.DefaultReliable.MaxRetries < 30 {
-			cfg.DefaultReliable.MaxRetries = 30
 		}
 	}
 }
@@ -515,7 +493,11 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	// Having sess.router set first ensures no events are silently dropped.
 	var conn *Conn
 	if s.cfg.OnConnect != nil {
-		conn = newConn(sess, s.cfg.CoalesceInterval, s.cfg.DefaultReliable)
+		var newChannelCfg ReliableCfg
+		if s.cfg.CongestionControl != nil && newChannelCfg.MaxRetries < 30 {
+			newChannelCfg.MaxRetries = 30
+		}
+		conn = newConn(sess, s.cfg.CoalesceInterval, newChannelCfg)
 		if s.cfg.CongestionControl != nil {
 			cc := newAIMDController(normalizeCCConfig(*s.cfg.CongestionControl), conn)
 			conn.cc = cc

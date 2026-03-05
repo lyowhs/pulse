@@ -292,14 +292,6 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	rttMask := rttRingSize - 1
 	sendTimes := make([]atomic.Int64, rttRingSize)
 
-	// reliableCfg sizes the reliable send window to match the token semaphore
-	// so the reliable window never becomes a throughput bottleneck.  When
-	// reliable=false this is nil and DisableDefaultReliable suppresses reliable.
-	var reliableCfg *wiresocket.ReliableCfg
-	if reliable {
-		reliableCfg = &wiresocket.ReliableCfg{WindowSize: inflightCap}
-	}
-
 	kp, err := wiresocket.GenerateKeypair()
 	if err != nil {
 		return oneResult{}, err
@@ -332,16 +324,14 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		workerCount = 1
 	}
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
-		Addr:                   addr,
-		PrivateKey:             kp.Private,
-		OnConnect:              echoConn,
-		MaxPacketSize:          mtu,
-		CoalesceInterval:       coalesce,
-		MaxIncompleteFrames:    srvMaxIncomplete,
-		EventBufSize:           eventBufSize,
-		DisableDefaultReliable: !reliable,
-		DefaultReliable:        reliableCfg,
-		WorkerCount:            workerCount,
+		Addr:             addr,
+		PrivateKey:       kp.Private,
+		OnConnect:        makeEchoConn(reliable),
+		MaxPacketSize:    mtu,
+		CoalesceInterval: coalesce,
+		MaxIncompleteFrames: srvMaxIncomplete,
+		EventBufSize:        eventBufSize,
+		WorkerCount:         workerCount,
 		// WorkChannelSize must hold all fragments of all in-flight events so
 		// that the UDP reader goroutine never drops a fragment before a worker
 		// can reassemble it.  Add a 64-packet headroom for keepalives.
@@ -367,14 +357,12 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	}
 
 	dialCfg := wiresocket.DialConfig{
-		ServerPublicKey:        kp.Public,
-		HandshakeTimeout:       5 * time.Second,
-		MaxRetries:             10,
-		MaxPacketSize:          mtu,
-		CoalesceInterval:       coalesce,
-		EventBufSize:           eventBufSize,
-		DisableDefaultReliable: !reliable,
-		DefaultReliable:        reliableCfg,
+		ServerPublicKey:  kp.Public,
+		HandshakeTimeout: 5 * time.Second,
+		MaxRetries:       10,
+		MaxPacketSize:    mtu,
+		CoalesceInterval: coalesce,
+		EventBufSize:     eventBufSize,
 		// Double inflightCap so the client has headroom to reassemble the
 		// next batch of frames while echoes from the current batch are still
 		// in-flight back to the sender.
@@ -389,6 +377,14 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	}
 
 	ch := conn.Channel(benchChannel)
+	// Configure per-channel reliability.  Channels are reliable by default; set
+	// the window to inflightCap so the reliable send window matches the token
+	// semaphore.  Disable reliability when reliable=false.
+	if reliable {
+		ch.SetReliable(wiresocket.ReliableCfg{WindowSize: inflightCap})
+	} else {
+		ch.SetUnreliable()
+	}
 	payload := make([]byte, payloadSize)
 
 	var txMsgs, txBytes, rxMsgs, rxBytes atomic.Int64
