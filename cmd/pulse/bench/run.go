@@ -304,14 +304,6 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
-	// srvMaxIncomplete: MaxIncompleteFrames is a FRAME count (one entry per
-	// logical frame being reassembled), not a fragment count.  The server
-	// needs at most inflightCap concurrent reassembly entries — one per
-	// in-flight event.  512 is a safe default minimum.
-	srvMaxIncomplete := inflightCap
-	if srvMaxIncomplete < 512 {
-		srvMaxIncomplete = 512
-	}
 	// workerCount: reliable delivery requires in-order frame processing so
 	// that reliableState.onRecv never sees OOO gaps larger than
 	// reliableOOOWindow (256).  With GOMAXPROCS workers, goroutine scheduling
@@ -330,12 +322,8 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		OnConnect:           makeEchoConn(reliable),
 		MaxPacketSize:       mtu,
 		CoalesceInterval:    coalesce,
-		MaxIncompleteFrames: srvMaxIncomplete,
+		MaxEventPayloadSize: payloadSize,
 		WorkerCount:         workerCount,
-		// WorkChannelSize must hold all fragments of all in-flight events so
-		// that the UDP reader goroutine never drops a fragment before a worker
-		// can reassemble it.  Add a 64-packet headroom for keepalives.
-		WorkChannelSize: inflightCap*fragsPerEvent + 64,
 	})
 	if err != nil {
 		return oneResult{}, err
@@ -356,18 +344,13 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// EventBufSize = inflightCap so the server's echo peerWindow stays within
-	// inflightCap events, keeping echo fragments within the socket buffer for
-	// large fragmented payloads.  MaxIncompleteFrames is doubled to give the
-	// client headroom while echoes from one batch are still in-flight.
 	dialCfg := wiresocket.DialConfig{
 		ServerPublicKey:     kp.Public,
 		HandshakeTimeout:    5 * time.Second,
 		MaxRetries:          10,
 		MaxPacketSize:       mtu,
 		CoalesceInterval:    coalesce,
-		EventBufSize:        inflightCap,
-		MaxIncompleteFrames: inflightCap * 2,
+		MaxEventPayloadSize: payloadSize,
 	}
 	if cc {
 		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}
@@ -378,12 +361,9 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	}
 
 	ch := conn.Channel(benchChannel)
-	// Configure per-channel reliability.  Channels are reliable by default; set
-	// the window to inflightCap so the reliable send window matches the token
-	// semaphore.  Disable reliability when reliable=false.
-	if reliable {
-		ch.SetReliable(wiresocket.ReliableCfg{WindowSize: inflightCap})
-	} else {
+	// Channels are reliable by default with the window auto-sized from
+	// MaxEventPayloadSize.  Only switch to unreliable when requested.
+	if !reliable {
 		ch.SetUnreliable()
 	}
 	payload := make([]byte, payloadSize)

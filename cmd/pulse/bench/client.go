@@ -73,39 +73,19 @@ func runClient(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "client public key:  %s\n", hex.EncodeToString(kp.Public[:]))
 	}
 
-	// Compute pipeline parameters to avoid overwhelming the socket buffers.
-	// inflightCap bounds the reliable window and EventBufSize so that in-flight
-	// fragments never exceed what the kernel can actually buffer.
-	maxFrag := wiresocket.MaxFragmentPayload(mtu)
-	fragsPerEvent := 1
-	if maxFrag > 0 && size > maxFrag {
-		fragsPerEvent = (size + maxFrag - 1) / maxFrag
-	}
-	const bufRequest = 4 << 20 // matches dialSession socket buffer request
-	actualBuf := wiresocket.ProbeUDPRecvBufSize(bufRequest)
-	socketBuf := actualBuf * 3 / 4 // 75% headroom margin
-	inflightCap := socketBuf / (fragsPerEvent * mtu)
-	if inflightCap < 4 {
-		inflightCap = 4
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	fmt.Fprintf(os.Stderr, "connecting to %s …\n", serverAddr)
 
-	// EventBufSize is set to inflightCap so the server's echo peerWindow stays
-	// within inflightCap events — keeping echo fragments within the socket
-	// buffer for large fragmented payloads.  MaxIncompleteFrames is auto-
-	// computed by the library from the socket buffer.
 	dialCfg := wiresocket.DialConfig{
-		ServerPublicKey:  serverPub,
-		PrivateKey:       clientPrivKey,
-		HandshakeTimeout: 5 * time.Second,
-		MaxRetries:       10,
-		MaxPacketSize:    mtu,
-		CoalesceInterval: coalesce,
-		EventBufSize:     inflightCap,
+		ServerPublicKey:     serverPub,
+		PrivateKey:          clientPrivKey,
+		HandshakeTimeout:    5 * time.Second,
+		MaxRetries:          10,
+		MaxPacketSize:       mtu,
+		CoalesceInterval:    coalesce,
+		MaxEventPayloadSize: size,
 	}
 	if cc {
 		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}
@@ -121,13 +101,9 @@ func runClient(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "connected\n\n")
 
 	ch := conn.Channel(benchChannel)
-	// Configure per-channel reliability.  Channels are reliable by default; set
-	// the window to inflightCap so the reliable send window matches the token
-	// semaphore and is never the throughput bottleneck.  Disable reliability
-	// entirely when --reliable=false.
-	if reliable {
-		ch.SetReliable(wiresocket.ReliableCfg{WindowSize: inflightCap})
-	} else {
+	// Channels are reliable by default with the window auto-sized from
+	// MaxEventPayloadSize.  Only switch to unreliable when requested.
+	if !reliable {
 		ch.SetUnreliable()
 	}
 

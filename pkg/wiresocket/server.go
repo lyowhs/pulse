@@ -103,6 +103,14 @@ type ServerConfig struct {
 	// satisfy both when both are set.
 	AllowedPeers [][32]byte
 
+	// MaxEventPayloadSize, if non-zero, is the largest event payload the
+	// application will send per session in bytes.  The library uses it to
+	// compute fragsPerEvent and derives EventBufSize, MaxIncompleteFrames,
+	// and WorkChannelSize accordingly, so that in-flight fragments never
+	// exceed the kernel socket-buffer capacity.
+	// When zero each event is assumed to fit in a single packet (fragsPerEvent = 1).
+	MaxEventPayloadSize int
+
 	// WorkChannelSize is the number of incoming packets buffered between the
 	// UDP reader goroutine and the worker pool.  If the channel is full,
 	// excess packets are silently dropped.  Defaults to
@@ -117,13 +125,21 @@ func (cfg *ServerConfig) defaults() {
 	if cfg.MaxPacketSize == 0 {
 		cfg.MaxPacketSize = defaultMaxPacketSize
 	}
+	// fragsPerEvent: how many UDP packets one event occupies on the wire.
+	// Used to scale EventBufSize, MaxIncompleteFrames, and WorkChannelSize so
+	// that in-flight fragments never exceed the socket buffer capacity.
+	maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
+	fragsPerEvent := 1
+	if cfg.MaxEventPayloadSize > 0 && maxFrag > 0 && cfg.MaxEventPayloadSize > maxFrag {
+		fragsPerEvent = (cfg.MaxEventPayloadSize + maxFrag - 1) / maxFrag
+	}
 	// Auto-size MaxIncompleteFrames and EventBufSize from the kernel UDP socket
 	// buffer so the server never drops fragments or starve the client's send
 	// window, regardless of payload size.
 	if cfg.MaxIncompleteFrames == 0 || cfg.EventBufSize == 0 {
 		const bufRequest = 4 << 20
 		actual := ProbeUDPRecvBufSize(bufRequest)
-		ic := actual * 3 / 4 / cfg.MaxPacketSize
+		ic := actual * 3 / 4 / (fragsPerEvent * cfg.MaxPacketSize)
 		if ic < maxReassemblyBufs {
 			ic = maxReassemblyBufs
 		}
@@ -153,10 +169,9 @@ func (cfg *ServerConfig) defaults() {
 		cfg.WorkerCount = runtime.GOMAXPROCS(0)
 	}
 	if cfg.WorkChannelSize == 0 {
-		cfg.WorkChannelSize = cfg.WorkerCount * 64
-		if cfg.WorkChannelSize < 4096 {
-			cfg.WorkChannelSize = 4096
-		}
+		// Size the work channel to hold all fragments of all inflight events
+		// plus worker-count headroom and keepalive packets.
+		cfg.WorkChannelSize = max(cfg.WorkerCount*64, cfg.EventBufSize*fragsPerEvent+64, 4096)
 	}
 }
 
@@ -529,7 +544,7 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	// Having sess.router set first ensures no events are silently dropped.
 	var conn *Conn
 	if s.cfg.OnConnect != nil {
-		var newChannelCfg ReliableCfg
+		newChannelCfg := ReliableCfg{WindowSize: s.cfg.EventBufSize}
 		if s.cfg.CongestionControl != nil && newChannelCfg.MaxRetries < 30 {
 			newChannelCfg.MaxRetries = 30
 		}

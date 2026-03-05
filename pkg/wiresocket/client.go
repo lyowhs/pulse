@@ -73,6 +73,14 @@ type DialConfig struct {
 	// 65507; leave headroom for safety).
 	MaxPacketSize int
 
+	// MaxEventPayloadSize, if non-zero, is the largest event payload the
+	// application will send on this connection in bytes.  The library uses it
+	// to compute fragsPerEvent and derives EventBufSize, MaxIncompleteFrames,
+	// and the default reliable WindowSize accordingly, so that in-flight
+	// fragments never exceed the kernel socket-buffer capacity.
+	// When zero each event is assumed to fit in a single packet (fragsPerEvent = 1).
+	MaxEventPayloadSize int
+
 	// CoalesceInterval, if non-zero, enables event coalescing: events passed
 	// to Channel.Send are buffered and sent together as a single encrypted
 	// frame after this interval elapses.  This reduces per-event encryption
@@ -115,12 +123,20 @@ func (cfg *DialConfig) defaults() {
 	if cfg.MaxPacketSize == 0 {
 		cfg.MaxPacketSize = defaultMaxPacketSize
 	}
+	// fragsPerEvent: how many UDP packets one event occupies on the wire.
+	// Used to scale EventBufSize and MaxIncompleteFrames so that the total
+	// number of in-flight fragments never exceeds the socket buffer capacity.
+	maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
+	fragsPerEvent := 1
+	if cfg.MaxEventPayloadSize > 0 && maxFrag > 0 && cfg.MaxEventPayloadSize > maxFrag {
+		fragsPerEvent = (cfg.MaxEventPayloadSize + maxFrag - 1) / maxFrag
+	}
 	// Auto-size MaxIncompleteFrames and EventBufSize from the kernel UDP socket
 	// buffer so neither becomes a bottleneck regardless of payload size.
 	if cfg.MaxIncompleteFrames == 0 || cfg.EventBufSize == 0 {
 		const bufRequest = 4 << 20
 		actual := ProbeUDPRecvBufSize(bufRequest)
-		ic := actual * 3 / 4 / cfg.MaxPacketSize
+		ic := actual * 3 / 4 / (fragsPerEvent * cfg.MaxPacketSize)
 		if ic < maxReassemblyBufs {
 			ic = maxReassemblyBufs
 		}
@@ -160,18 +176,22 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 		ready := make(chan struct{})
 		close(ready) // initially connected
 
-		c := &Conn{
-			addr:    addr,
-			dialCfg: cfg,
-			ctx:     pctx,
-			cancel:  cancel,
-			done:    make(chan struct{}),
-			ready:   ready,
-			sess:    sess,
-		}
+		// Default the reliable window to EventBufSize so the send window is
+		// automatically bounded by the socket-buffer-derived inflight cap.
+		newChannelCfg := ReliableCfg{WindowSize: cfg.EventBufSize}
 		// CC requires reliable with enough retries to survive rate-limited sends.
-		if cfg.CongestionControl != nil && c.newChannelCfg.MaxRetries < 30 {
-			c.newChannelCfg.MaxRetries = 30
+		if cfg.CongestionControl != nil && newChannelCfg.MaxRetries < 30 {
+			newChannelCfg.MaxRetries = 30
+		}
+		c := &Conn{
+			addr:          addr,
+			dialCfg:       cfg,
+			ctx:           pctx,
+			cancel:        cancel,
+			done:          make(chan struct{}),
+			ready:         ready,
+			sess:          sess,
+			newChannelCfg: newChannelCfg,
 		}
 		c.ch0 = newChannel(0, c, cfg.EventBufSize)
 		c.channelMap.Store(uint16(0), c.ch0)
@@ -199,7 +219,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 
 	// Non-persistent: wire the router (inside newConn) before starting the
 	// read loop so the goroutine-start happens-before makes it visible.
-	var newChannelCfg ReliableCfg
+	newChannelCfg := ReliableCfg{WindowSize: cfg.EventBufSize}
 	if cfg.CongestionControl != nil && newChannelCfg.MaxRetries < 30 {
 		newChannelCfg.MaxRetries = 30
 	}
