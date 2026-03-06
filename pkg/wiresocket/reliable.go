@@ -113,8 +113,14 @@ type reliableState struct {
 	expectSeq uint32        // next in-order seq expected (starts at 1)
 	ooo       uint64        // SACK bitmap: bit i = received seq expectSeq+i+1
 	oooFrames [reliableOOOWindow]*Frame
-	ackDirty  bool
-	ackTimer  *time.Timer
+	// oooHead is the circular-buffer head index into oooFrames.
+	// The frame for (expectSeq+gap) is stored at slot
+	//   (oooHead + gap - 1) % reliableOOOWindow
+	// Advancing one in-order step increments oooHead by 1 (mod N) — O(1)
+	// vs the previous O(N) memmove that shift-left required.
+	oooHead  int
+	ackDirty bool
+	ackTimer *time.Timer
 
 	// windowWatchActive is true while the window-watch timer is running.
 	// When we advertise window=0 (receiver buffer full), we start polling
@@ -485,7 +491,8 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 	case seq > rs.expectSeq:
 		gap := seq - rs.expectSeq
 		if gap <= reliableOOOWindow {
-			idx := (gap - 1) % reliableOOOWindow
+			// Circular-buffer slot: slot for gap g is at (oooHead+g-1) % N.
+			idx := (rs.oooHead + int(gap) - 1) % reliableOOOWindow
 			if rs.oooFrames[idx] == nil {
 				rs.oooFrames[idx] = f
 				// The SACK bitmap (uint64) can only represent the first 64
@@ -500,6 +507,8 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 					"seq",        seq,
 					"expected",   rs.expectSeq,
 					"gap",        gap,
+					"slot",       idx,
+					"ooo_head",   rs.oooHead,
 				)
 			}
 			// else duplicate — drop
@@ -546,28 +555,38 @@ func (rs *reliableState) deliverInOrderLocked(f *Frame) {
 	}
 	rs.expectSeq++
 
-	// Drain any buffered OOO frames that are now in order.
-	// Use oooFrames[0] != nil as the condition rather than ooo&1 != 0: the
-	// SACK bitmap only tracks the first 64 slots, so frames buffered beyond
-	// slot 64 have ooo bit = 0 even though the frame is present.  Checking
-	// the pointer directly ensures we drain the full window.
-	for rs.oooFrames[0] != nil {
-		next := rs.oooFrames[0]
-		// Rotate the OOO window: shift everything down by one slot.
-		copy(rs.oooFrames[:], rs.oooFrames[1:])
-		rs.oooFrames[reliableOOOWindow-1] = nil
-		rs.ooo >>= 1 // safe: bits beyond 64 were never set, shifting 0s is fine
-
-		if next != nil {
-			rs.expectSeq++
-			for _, e := range next.Events {
-				if e.Type == channelCloseType {
-					rs.channel.closeLocal()
-				} else {
-					deliverEventToChannel(rs.channel, e)
-				}
+	// Drain any consecutively buffered OOO frames using O(1) circular-buffer
+	// head rotation.  Each advance costs one nil-check plus one slot clear,
+	// replacing the previous O(N) memmove (copy of the entire oooFrames array).
+	// oooHead always points to the slot for the current expectSeq; advancing
+	// it by 1 (mod N) makes the next slot current, without copying anything.
+	drained := 0
+	for {
+		slot := rs.oooHead
+		next := rs.oooFrames[slot]
+		if next == nil {
+			break
+		}
+		rs.oooFrames[slot] = nil
+		rs.oooHead = (rs.oooHead + 1) % reliableOOOWindow
+		rs.ooo >>= 1 // keep SACK bitmap in sync with window position
+		rs.expectSeq++
+		drained++
+		for _, e := range next.Events {
+			if e.Type == channelCloseType {
+				rs.channel.closeLocal()
+			} else {
+				deliverEventToChannel(rs.channel, e)
 			}
 		}
+	}
+	if drained > 0 {
+		dbg("reliable: drained OOO frames (circular head advance)",
+			"channel_id", rs.channel.id,
+			"drained",    drained,
+			"expect_seq", rs.expectSeq,
+			"ooo_head",   rs.oooHead,
+		)
 	}
 
 	rs.ackDirty = true
@@ -814,6 +833,7 @@ func (rs *reliableState) reset() {
 	rs.recvMu.Lock()
 	rs.expectSeq = 1
 	rs.ooo = 0
+	rs.oooHead = 0
 	for i := range rs.oooFrames {
 		rs.oooFrames[i] = nil
 	}

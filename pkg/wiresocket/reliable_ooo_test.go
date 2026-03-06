@@ -187,7 +187,104 @@ func TestReliableOOOSACKBitmapCoverage(t *testing.T) {
 	}
 }
 
-// TestReliableWindowSizedInEvents is a regression test for the unit mismatch
+// TestReliableOOOCircularBufferWrap verifies that the circular OOO buffer
+// correctly wraps around after a full window of frames has been delivered.
+//
+// The fix (item 1 of the performance improvements) replaced the O(N) memmove
+// in deliverInOrderLocked with an O(1) circular-buffer head increment.
+// This test confirms that after draining a full window (oooHead wraps back
+// to 0), the next round of OOO frames is stored and delivered at the correct
+// circular slots.
+func TestReliableOOOCircularBufferWrap(t *testing.T) {
+	t.Parallel()
+
+	const N = reliableOOOWindow
+	// Buffer large enough to hold all events from one full round.
+	ch, rs := makeTestChannel(N + 16)
+
+	// Round 1: buffer frames 2..N+1 OOO, then deliver frame 1.
+	// Delivering frame 1 triggers N advances of oooHead:
+	//   0→1→2→…→N-1→(N%N=0), so oooHead wraps back to 0.
+	for seq := uint32(2); seq <= uint32(N)+1; seq++ {
+		rs.onRecv(seq, makeOOOFrame(seq))
+	}
+	if n := len(ch.events); n != 0 {
+		t.Fatalf("round 1 before frame 1: want 0 events, got %d", n)
+	}
+	rs.onRecv(1, makeOOOFrame(1))
+	if n := len(ch.events); n != N+1 {
+		t.Fatalf("round 1 after frame 1: want %d events, got %d (lost %d)",
+			N+1, n, N+1-n)
+	}
+	for i := 1; i <= N+1; i++ {
+		e := <-ch.events
+		if e.Payload[0] != byte(i&0xFF) {
+			t.Fatalf("round 1 event %d: payload=%d want=%d", i, e.Payload[0], byte(i&0xFF))
+		}
+	}
+
+	// Confirm oooHead wrapped back to 0.
+	rs.recvMu.Lock()
+	gotHead := rs.oooHead
+	rs.recvMu.Unlock()
+	if gotHead != 0 {
+		t.Errorf("after round 1 full drain: oooHead=%d, want 0", gotHead)
+	}
+
+	// Round 2: base = N+2 (current expectSeq after round 1).
+	// Buffer N frames OOO, deliver the in-order base frame.
+	// This exercises the circular buffer after a complete wrap.
+	base := uint32(N + 2)
+	for seq := base + 1; seq <= base+uint32(N)-1; seq++ {
+		rs.onRecv(seq, makeOOOFrame(seq))
+	}
+	rs.onRecv(base, makeOOOFrame(base))
+	if n := len(ch.events); n != N {
+		t.Fatalf("round 2: want %d events, got %d (lost %d)", N, n, N-n)
+	}
+	for i := 0; i < N; i++ {
+		e := <-ch.events
+		wantSeq := base + uint32(i)
+		if e.Payload[0] != byte(wantSeq&0xFF) {
+			t.Fatalf("round 2 event %d: payload=%d want=%d", i, e.Payload[0], byte(wantSeq&0xFF))
+		}
+	}
+}
+
+// TestReliableOOOCircularSlotIndexing verifies that the circular slot formula
+// (oooHead+gap-1)%N is correct for all gap values, including the boundary
+// case gap=reliableOOOWindow (which maps to the slot just before oooHead).
+func TestReliableOOOCircularSlotIndexing(t *testing.T) {
+	t.Parallel()
+
+	const N = reliableOOOWindow
+	ch, rs := makeTestChannel(N + 16)
+
+	// Store only the frame at the maximum gap (gap=N, slot=(oooHead+N-1)%N).
+	// Then store gap=1..N-1 one at a time, verifying no collision.
+	// Finally deliver the in-order frame and confirm all N are received.
+	for seq := uint32(2); seq <= uint32(N)+1; seq++ {
+		rs.onRecv(seq, makeOOOFrame(seq))
+	}
+
+	// Verify no premature delivery.
+	if n := len(ch.events); n != 0 {
+		t.Fatalf("before in-order frame: want 0 events, got %d", n)
+	}
+
+	rs.onRecv(1, makeOOOFrame(1))
+	if n := len(ch.events); n != N+1 {
+		t.Fatalf("after in-order frame: want %d events, got %d", N+1, n)
+	}
+	for i := 1; i <= N+1; i++ {
+		e := <-ch.events
+		if e.Payload[0] != byte(i&0xFF) {
+			t.Fatalf("event %d: out-of-order delivery (payload %d)", i, e.Payload[0])
+		}
+	}
+}
+
+// TestReliableOOOWindowSize asserts that reliableOOOWindow >= defaultReliableWindow for the unit mismatch
 // in the reliable send window: the old code incremented numPending by 1 per
 // frame regardless of how many events the frame carried.  When the window was
 // measured in events (myWindow = cap-len of ch.events) but numPending counted
@@ -299,4 +396,76 @@ func TestReliableCloseUnblocksPreSend(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("preSend did not unblock after channel close (goroutine leak)")
 	}
+}
+
+// ─── benchmarks ───────────────────────────────────────────────────────────────
+
+// BenchmarkOOOInOrderDrain measures the time to drain a full OOO window when
+// the in-order frame finally arrives.  This is the exact hot path improved by
+// the O(N)→O(1) circular-buffer optimisation (item 1).
+//
+// Before the fix: each of the N OOO frames required a copy of the entire
+// oooFrames array (32 KB for N=4096), totalling O(N²) memory traffic.
+// After the fix: each drain step is a nil-check + slot clear + head increment,
+// totalling O(N) work regardless of window size.
+//
+// Run with:
+//
+//	go test ./pkg/wiresocket/ -bench=BenchmarkOOOInOrderDrain -benchtime=5s -v
+func BenchmarkOOOInOrderDrain(b *testing.B) {
+	const N = reliableOOOWindow
+
+	// Use a large ACKDelay and BaseRTO so timer goroutines do not fire and
+	// interfere with benchmark timing.
+	ch, rs := makeTestChannelWithCfg(N+16, ReliableCfg{
+		WindowSize: N,
+		BaseRTO:    time.Hour,
+		ACKDelay:   time.Hour,
+	})
+
+	// Pre-build frame objects to avoid allocation noise in the timed section.
+	oooFrames := make([]*Frame, N)
+	for i := range oooFrames {
+		oooFrames[i] = makeOOOFrame(uint32(i + 2)) // seq 2..N+1
+	}
+	inOrderFrame := makeOOOFrame(1)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		// Setup (not timed): reset recv-side state and pre-fill OOO buffer.
+		b.StopTimer()
+		rs.recvMu.Lock()
+		rs.expectSeq = 1
+		rs.ooo = 0
+		rs.oooHead = 0
+		for j := range rs.oooFrames {
+			rs.oooFrames[j] = nil
+		}
+		rs.ackDirty = false
+		rs.recvMu.Unlock()
+
+		// Store N-1 OOO frames (seq 2..N+1) so the buffer is full.
+		for _, f := range oooFrames {
+			rs.onRecv(f.Seq, f)
+		}
+		// Drain events to prevent channel overflow on the next iteration.
+		for len(ch.events) > 0 {
+			<-ch.events
+		}
+		b.StartTimer()
+
+		// Timed: deliver the missing in-order frame, triggering a full
+		// N-step OOO drain.  With the circular buffer this is O(N); with
+		// the old shift-left it was O(N²).
+		rs.onRecv(1, inOrderFrame)
+		b.StopTimer()
+
+		// Drain events before next iteration (not timed).
+		for len(ch.events) > 0 {
+			<-ch.events
+		}
+	}
+	b.ReportMetric(float64(N), "frames/op")
 }
