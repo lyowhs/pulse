@@ -184,7 +184,6 @@ func fmtDuration(d time.Duration) string {
 	}
 }
 
-
 // runOne starts an in-process echo server + client, drives traffic for dur,
 // and returns throughput, loss, latency, and retransmit metrics.
 // Returns a zero result (not an error) when the payload cannot be sent at the
@@ -385,26 +384,31 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	conn.Flush(flushCtx)
 	flushCancel()
 
-	// Wait a fixed window for in-flight echoes to return.  We use a bounded
-	// sleep rather than waiting for a target count because some echoes may be
-	// genuinely lost (dropped by the server or OS buffers), in which case
-	// waiting for rxMsgs >= txAtStop would hang forever.
-	// drainWait — long enough for the slowest coalesced round-trip to
-	// complete under moderate load.  For fragmented payloads, each event
-	// requires fragsPerEvent UDP packets in each direction; at ~5 µs per
-	// syscall that is roughly fragsPerEvent × 10 µs of serialisation delay.
-	// Use max(10 × coalesce, 100ms, fragsPerEvent × 1ms) to scale
-	// proportionally with payload size.
-	drainWait := 10 * coalesce
-	if drainWait < 100*time.Millisecond {
-		drainWait = 100 * time.Millisecond
+	// Wait for all in-flight echoes to return before closing the connection.
+	//
+	// Reliable mode: conn.Flush guarantees every sent event reached the server
+	// and the server has sent (or will send) an echo for each.  Echoes are
+	// guaranteed to arrive eventually; the only source of delay is flow-control
+	// back-pressure (the server's S→C window being throttled by a temporarily
+	// full client receive buffer).  We wait up to 10 s for rxMsgs == txAtStop.
+	//
+	// Unreliable mode: some echoes may be genuinely lost; a fixed drain window
+	// is used to avoid waiting forever.
+	if reliable {
+		drainDeadline := time.Now().Add(10 * time.Second)
+		for rxMsgs.Load() < txAtStop && time.Now().Before(drainDeadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	} else {
+		drainWait := 10 * coalesce
+		if drainWait < 100*time.Millisecond {
+			drainWait = 100 * time.Millisecond
+		}
+		if fragDelay := time.Duration(payloadSize/mtu+1) * time.Millisecond; fragDelay > drainWait {
+			drainWait = fragDelay
+		}
+		time.Sleep(drainWait)
 	}
-	// Scale drain wait for large fragmented payloads: each event requires
-	// approximately payloadSize/mtu fragments, each taking ~1ms to round-trip.
-	if fragDelay := time.Duration(payloadSize/mtu+1) * time.Millisecond; fragDelay > drainWait {
-		drainWait = fragDelay
-	}
-	time.Sleep(drainWait)
 
 	conn.Close()
 

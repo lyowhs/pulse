@@ -373,6 +373,9 @@ func (c *Conn) Recv(ctx context.Context) (*Event, error) {
 	case <-c.ch0.done:
 		return nil, ErrConnClosed
 	case e := <-c.ch0.events:
+		if rs := c.ch0.reliable.Load(); rs != nil {
+			rs.notifyWindowIncreased()
+		}
 		return e, nil
 	}
 }

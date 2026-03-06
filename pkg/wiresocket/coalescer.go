@@ -193,6 +193,19 @@ func (c *coalescer) run() {
 	addItem := func(item coalesceItem) (fullChannelId uint16, full bool) {
 		chId := item.channelId
 		pending[chId] = append(pending[chId], item.event)
+		// Limit events per frame to the channel's reliable window size.
+		// Without this, the coalescer may batch hundreds of events into a
+		// single frame (for large MTUs with small payloads), producing a
+		// frame whose evtCount permanently exceeds the peer's peerWindow
+		// (which is bounded by cap(ch.events) = EventBufSize).  preSend
+		// would then block forever.
+		if v, ok := c.conn.channelMap.Load(chId); ok {
+			if rs := v.(*Channel).reliable.Load(); rs != nil {
+				if len(pending[chId]) >= rs.cfg.WindowSize {
+					return chId, true
+				}
+			}
+		}
 		if c.maxFrameBytes > 0 {
 			// Track estimated wire bytes for this event to match the actual frame
 			// encoding from Frame.AppendMarshal.  Each event encodes as:

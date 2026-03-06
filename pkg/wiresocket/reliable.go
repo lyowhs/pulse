@@ -115,28 +115,56 @@ type reliableState struct {
 	oooFrames [reliableOOOWindow]*Frame
 	ackDirty  bool
 	ackTimer  *time.Timer
+
+	// windowWatchActive is true while the window-watch timer is running.
+	// When we advertise window=0 (receiver buffer full), we start polling
+	// every millisecond until the application drains events and myWindow()
+	// becomes positive, at which point we immediately send a window update.
+	// This prevents the sender from waiting a full ACKDelay (20ms) per event
+	// when the receive buffer was momentarily full.
+	// Protected by recvMu.
+	windowWatchActive bool
+
+	// lastAdvWindow is the window size we most recently advertised to the peer,
+	// either via a standalone ACK or piggybacked on a data frame.
+	// Initialised to cfg.WindowSize so that notifyWindowIncreased is a no-op
+	// until we actually advertise a restricted window.
+	// Protected by recvMu.
+	lastAdvWindow uint32
+
+	// lastWindowAckSeq is the AckSeq value of the most recent ACK from which
+	// we updated peerWindow.  Because multiple goroutines can call sess.send()
+	// concurrently (notifyWindowIncreased, windowWatch, preSend piggyback), ACK
+	// packets carrying different window values but the same AckSeq can be
+	// reordered by the kernel.  We apply TCP-style window update rules:
+	//   - ackSeq > lastWindowAckSeq : new receiver state, apply peerWindow = w
+	//   - ackSeq == lastWindowAckSeq: same state, take max(peerWindow, w)
+	//   - ackSeq < lastWindowAckSeq : stale packet, ignore window field
+	// This prevents a reordered smaller-window packet from permanently blocking
+	// the sender after the receiver has already advertised a larger window.
+	// Protected by sendMu.
+	lastWindowAckSeq uint32
 }
 
 func newReliableState(ch *Channel, cfg ReliableCfg) *reliableState {
 	cfg = cfg.withDefaults()
-	// peerWindow is our initial guess at the receiver's free buffer space,
-	// used before the first ACK arrives.  The library guarantees that any
-	// auto-configured receiver has EventBufSize ≥ defaultReliableWindow, so
-	// capping here prevents the first burst from overflowing a receiver whose
-	// EventBufSize is smaller than the caller's WindowSize.
-	// Small WindowSizes (e.g. unit tests) are unaffected: min(2, 4096) = 2.
+	// initPeerWindow is the assumed receiver buffer before the first ACK
+	// arrives.  Cap at defaultReliableWindow so the initial burst does not
+	// exceed what a peer with a smaller window can absorb.  Once the first
+	// real ACK arrives, onAck replaces this with the peer's actual window.
 	initPeerWindow := cfg.WindowSize
 	if initPeerWindow > defaultReliableWindow {
 		initPeerWindow = defaultReliableWindow
 	}
 	rs := &reliableState{
-		cfg:        cfg,
-		channel:    ch,
-		nextSeq:    1,
-		expectSeq:  1,
-		pending:    make([]pendingFrame, cfg.WindowSize),
-		peerWindow: initPeerWindow,
-		rto:        cfg.BaseRTO,
+		cfg:           cfg,
+		channel:       ch,
+		nextSeq:       1,
+		expectSeq:     1,
+		pending:       make([]pendingFrame, cfg.WindowSize),
+		peerWindow:    initPeerWindow,
+		rto:           cfg.BaseRTO,
+		lastAdvWindow: uint32(cap(ch.events)), // assume full receiver capacity until first ACK
 	}
 	rs.cond = sync.NewCond(&rs.sendMu)
 	return rs
@@ -205,9 +233,15 @@ func (rs *reliableState) preSend(frame *Frame) error {
 		frame.AckBitmap = rs.ooo
 		frame.WindowSize = rs.myWindow()
 		rs.ackDirty = false
+		rs.lastAdvWindow = frame.WindowSize
 		if rs.ackTimer != nil {
 			rs.ackTimer.Stop()
 			rs.ackTimer = nil
+		}
+		// Start the window watch whenever we piggyback a restricted window so
+		// the remote sender is unblocked as soon as the buffer drains.
+		if frame.WindowSize < uint32(cap(rs.channel.events)) {
+			rs.startWindowWatchLocked()
 		}
 	}
 	rs.recvMu.Unlock()
@@ -273,19 +307,48 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 	}
 
 	rs.numPending -= freed
-	if peerWindow > 0 {
-		w := int(peerWindow)
-		if w > rs.cfg.WindowSize {
-			w = rs.cfg.WindowSize
-		}
-		rs.peerWindow = w
+
+	// Update peerWindow using TCP-style sequenced rules to prevent a
+	// reordered or stale ACK packet from permanently reducing the window.
+	//
+	// Multiple goroutines (notifyWindowIncreased, windowWatch, preSend
+	// piggyback) may call sess.send() concurrently with the same AckSeq but
+	// different window values.  On loopback the kernel can serialise those
+	// sendmsg calls in any order, so the larger-window packet may arrive
+	// first and then be overwritten by the smaller-window packet.
+	//
+	// Rule: for the same AckSeq (same receiver state) the window can only
+	// have grown (the receiver was draining); take the maximum.  Only allow
+	// a decrease when AckSeq advances (new events received, buffer can fill).
+	oldWindow := rs.peerWindow
+	w := int(peerWindow)
+	if w > rs.cfg.WindowSize {
+		w = rs.cfg.WindowSize
 	}
-	if freed > 0 {
+	if ackSeq > rs.lastWindowAckSeq {
+		// New receiver state: apply the advertised window unconditionally.
+		rs.lastWindowAckSeq = ackSeq
+		rs.peerWindow = w
+	} else if ackSeq == rs.lastWindowAckSeq {
+		// Same receiver state: window can only increase.
+		if w > rs.peerWindow {
+			rs.peerWindow = w
+		}
+	}
+	// ackSeq < lastWindowAckSeq: stale packet — ignore window field.
+
+	// Wake blocked senders when frames are freed OR the window opens.
+	// Both conditions can independently allow a previously-blocked preSend
+	// to proceed; broadcasting on window increases handles the case where
+	// the receiver drained its buffer and advertised a new non-zero window
+	// without any new cumulative ACK (freed == 0).
+	if freed > 0 || rs.peerWindow > oldWindow {
 		dbg("reliable: ACK freed frames",
 			"channel_id",  rs.channel.id,
 			"freed",       freed,
 			"cum_ack_seq", ackSeq,
 			"num_pending", rs.numPending,
+			"peer_window", rs.peerWindow,
 		)
 		rs.cond.Broadcast()
 	}
@@ -545,6 +608,17 @@ func (rs *reliableState) sendACK() {
 	window := rs.myWindow()
 	rs.ackDirty = false
 	rs.ackTimer = nil
+	rs.lastAdvWindow = window
+	// Start the window watch whenever we advertise a restricted window.
+	// A restricted window (< receiver capacity) means the remote sender may
+	// block if its next frame's evtCount exceeds our advertised window.
+	// The watch polls every millisecond and sends an immediate update as soon
+	// as the application drains events and myWindow() grows.  This covers
+	// both window=0 and non-zero restricted windows that can still deadlock
+	// the sender (e.g. peerWindow=1 with evtCount=63).
+	if window < uint32(cap(rs.channel.events)) {
+		rs.startWindowWatchLocked()
+	}
 	rs.recvMu.Unlock()
 
 	sess := rs.channel.conn.sessionFast()
@@ -565,13 +639,102 @@ func (rs *reliableState) sendACK() {
 	_ = sess.send(ackFrame)
 }
 
+// startWindowWatchLocked arms the window-watch timer if not already running.
+// Must be called with recvMu held.
+func (rs *reliableState) startWindowWatchLocked() {
+	if rs.windowWatchActive {
+		return
+	}
+	rs.windowWatchActive = true
+	time.AfterFunc(time.Millisecond, rs.windowWatch)
+}
+
+// windowWatch is the periodic callback that checks whether the application has
+// drained enough events from ch.events to open the receive window.  When the
+// window becomes positive we immediately send a window-update ACK so the remote
+// sender is unblocked without waiting for the full ACKDelay (20 ms by default).
+func (rs *reliableState) windowWatch() {
+	// Stop if the channel or connection is gone.
+	select {
+	case <-rs.channel.done:
+		rs.recvMu.Lock()
+		rs.windowWatchActive = false
+		rs.recvMu.Unlock()
+		return
+	case <-rs.channel.conn.done:
+		rs.recvMu.Lock()
+		rs.windowWatchActive = false
+		rs.recvMu.Unlock()
+		return
+	default:
+	}
+
+	rs.recvMu.Lock()
+	maxCap := uint32(cap(rs.channel.events))
+	if rs.myWindow() > rs.lastAdvWindow {
+		// Window has grown beyond what we last advertised — send an immediate
+		// update so the remote sender can unblock without waiting for ACKDelay.
+		rs.windowWatchActive = false
+		rs.ackDirty = true
+		if rs.ackTimer != nil {
+			rs.ackTimer.Stop()
+			rs.ackTimer = nil
+		}
+		rs.recvMu.Unlock()
+		rs.sendACK()
+		return
+	}
+	// Stop the watch if the last advertised window already equals full capacity:
+	// a concurrent sendACK sent a full-window update, nothing left to do.
+	if rs.lastAdvWindow >= maxCap {
+		rs.windowWatchActive = false
+		rs.recvMu.Unlock()
+		return
+	}
+	// Window hasn't grown yet — reschedule poll.
+	time.AfterFunc(time.Millisecond, rs.windowWatch)
+	rs.recvMu.Unlock()
+}
+
+// notifyWindowIncreased is called by Channel.Recv (and Conn.Recv) after the
+// application drains one event from ch.events.  If the receive window has
+// grown beyond what we last advertised AND the last advertised value was
+// restricted (< full capacity), we immediately send a window-update ACK so
+// the remote sender can unblock without waiting for the ACKDelay timer.
+//
+// This handles the case where the sender's frame evtCount exceeds the last
+// advertised window (e.g. peerWindow=1, evtCount=63): the sender blocks in
+// preSend indefinitely because no new frame arrives to trigger ackDirty, and
+// the window watch only activates for window=0.  Proactive updates from the
+// receiver break this deadlock in O(evtCount) Recv calls.
+func (rs *reliableState) notifyWindowIncreased() {
+	rs.recvMu.Lock()
+	w := rs.myWindow()
+	// Only update if the window genuinely grew AND was previously restricted.
+	// lastAdvWindow is initialised to cfg.WindowSize, so this is a no-op until
+	// we have actually advertised a smaller window to the peer.
+	maxCap := uint32(cap(rs.channel.events))
+	if w <= rs.lastAdvWindow || rs.lastAdvWindow >= maxCap {
+		rs.recvMu.Unlock()
+		return
+	}
+	// Window has grown from a restricted state: send an immediate update.
+	rs.ackDirty = true
+	if rs.ackTimer != nil {
+		rs.ackTimer.Stop()
+		rs.ackTimer = nil
+	}
+	rs.recvMu.Unlock()
+	rs.sendACK()
+}
+
 // consumePendingACK reads and clears any pending ACK state for piggybacking.
 // Returns (cumAck, bitmap, window, true) if an ACK is pending, or (0,0,0,false).
 // Must NOT be called with recvMu held.
 func (rs *reliableState) consumePendingACK() (cumAck uint32, bitmap uint64, window uint32, ok bool) {
 	rs.recvMu.Lock()
-	defer rs.recvMu.Unlock()
 	if !rs.ackDirty {
+		rs.recvMu.Unlock()
 		return 0, 0, 0, false
 	}
 	cumAck = rs.expectSeq
@@ -582,6 +745,11 @@ func (rs *reliableState) consumePendingACK() (cumAck uint32, bitmap uint64, wind
 		rs.ackTimer.Stop()
 		rs.ackTimer = nil
 	}
+	// Start the window watch whenever we piggyback a restricted window.
+	if window < uint32(cap(rs.channel.events)) {
+		rs.startWindowWatchLocked()
+	}
+	rs.recvMu.Unlock()
 	return cumAck, bitmap, window, true
 }
 

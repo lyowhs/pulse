@@ -171,6 +171,13 @@ func (ch *Channel) Recv(ctx context.Context) (*Event, error) {
 	case <-ch.done:
 		return nil, ErrChannelClosed
 	case e := <-ch.events:
+		// After draining an event, proactively send a window-update ACK if our
+		// receive window has grown beyond what we last advertised.  This unblocks
+		// a remote sender whose frame evtCount exceeds the last-advertised window
+		// without waiting for the ACKDelay timer (see notifyWindowIncreased).
+		if rs := ch.reliable.Load(); rs != nil {
+			rs.notifyWindowIncreased()
+		}
 		return e, nil
 	}
 }

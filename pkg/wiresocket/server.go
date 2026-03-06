@@ -140,13 +140,23 @@ func (cfg *ServerConfig) defaults() {
 		const bufRequest = 4 << 20
 		actual := ProbeUDPRecvBufSize(bufRequest)
 		ic := actual * 3 / 4 / (fragsPerEvent * cfg.MaxPacketSize)
-		if ic < maxReassemblyBufs {
-			ic = maxReassemblyBufs
-		}
 		if cfg.MaxIncompleteFrames == 0 {
-			cfg.MaxIncompleteFrames = ic
+			// MaxIncompleteFrames needs at least maxReassemblyBufs slots for
+			// the reliable OOO SACK window.
+			mif := ic
+			if mif < maxReassemblyBufs {
+				mif = maxReassemblyBufs
+			}
+			cfg.MaxIncompleteFrames = mif
 		}
 		if cfg.EventBufSize == 0 {
+			// EventBufSize controls the token/window count.  For large
+			// payloads (many fragments per event), ic can be much smaller
+			// than maxReassemblyBufs; applying the floor would allow too
+			// many events in-flight and overflow the socket buffer.
+			if ic < 1 {
+				ic = 1
+			}
 			cfg.EventBufSize = ic
 		}
 	}
