@@ -391,3 +391,107 @@ func TestReliableCoalescedFrameNoLoss(t *testing.T) {
 		t.Logf("note: %d retransmit(s) observed on loopback (unexpected)", r)
 	}
 }
+
+// TestReliableEchoSmallWindowNoDeadlock is a regression test for the
+// out-of-order window-update deadlock (Mar 2026).
+//
+// The bug: when the server's receive buffer fills up and then drains, multiple
+// goroutines (notifyWindowIncreased in the echo goroutine, preSend piggyback in
+// the coalescer goroutine, windowWatch timer) send window-update ACKs
+// concurrently.  On a multi-CPU loopback the kernel can deliver them in any
+// order; a stale smaller-window packet arriving last caused onAck to set
+// peerWindow to the smaller value.  Since peerWindow decreased, cond.Broadcast
+// was not called, leaving preSend blocked indefinitely.  With the echo goroutine
+// idle and windowWatch stopped, there was no recovery — permanent deadlock.
+//
+// The fix (lastWindowAckSeq): for the same AckSeq, onAck takes the maximum of
+// any competing window advertisements, so a reordered smaller-window packet
+// cannot permanently reduce peerWindow.
+//
+// Test setup: EventBufSize=window forces repeated buffer-full/drain cycles; each
+// cycle produces concurrent window-update sends on multiple CPU cores, exercising
+// the race.  All N echoed events must arrive within the timeout; a deadlock would
+// cause the drain loop to stall until the context expires, failing the test.
+func TestReliableEchoSmallWindowNoDeadlock(t *testing.T) {
+	const (
+		window      = 8   // tiny EventBufSize — fills quickly, drains fast
+		N           = 200 // many fill/drain cycles to exercise the race
+		payloadSize = 512 // large enough to coalesce into multi-event frames
+	)
+
+	// WorkerCount=1: serialises onRecv so OOO gaps stay within window bounds.
+	addr, kp := serverSetup(t, wiresocket.ServerConfig{
+		WorkerCount:  1,
+		EventBufSize: window,
+		OnConnect: func(conn *wiresocket.Conn) {
+			ch := conn.Channel(1)
+			for {
+				e, err := ch.Recv(context.Background())
+				if err != nil {
+					return
+				}
+				// Echo immediately: drains ch.events and triggers concurrent
+				// notifyWindowIncreased + coalescer preSend window updates.
+				if err := ch.Send(context.Background(), e); err != nil {
+					return
+				}
+			}
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn := mustDial(t, ctx, addr, kp, wiresocket.DialConfig{
+		CoalesceInterval: 200 * time.Microsecond,
+	})
+	defer conn.Close()
+
+	ch := conn.Channel(1)
+	ch.SetReliable(wiresocket.ReliableCfg{
+		WindowSize: window,
+		ACKDelay:   5 * time.Millisecond,
+	})
+
+	var rxCount atomic.Int64
+	var rxDone sync.WaitGroup
+	rxDone.Add(1)
+	go func() {
+		defer rxDone.Done()
+		evCh := ch.Events()
+		for {
+			select {
+			case <-evCh:
+				rxCount.Add(1)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	payload := make([]byte, payloadSize)
+	for i := 0; i < N; i++ {
+		if err := ch.Send(ctx, &wiresocket.Event{Type: uint8(i % 251), Payload: payload}); err != nil {
+			t.Fatalf("Send[%d]: %v", i, err)
+		}
+	}
+
+	// Flush must complete — a deadlock would block here until the 10s timeout.
+	flushCtx, flushCancel := context.WithTimeout(ctx, 10*time.Second)
+	conn.Flush(flushCtx)
+	flushCancel()
+
+	// Drain: wait for all N echoes to arrive.  A stuck peerWindow would stall
+	// the echo return path, causing this loop to time out.
+	drainDeadline := time.Now().Add(10 * time.Second)
+	for rxCount.Load() < N && time.Now().Before(drainDeadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	rxDone.Wait()
+
+	if got := rxCount.Load(); got != N {
+		t.Errorf("echo drain: received %d/%d events (peerWindow deadlock or event loss)", got, N)
+	}
+}
