@@ -21,8 +21,6 @@ import (
 // which still provides a useful rate ramp rather than flooding the link at full
 // speed from the start.
 //
-// CongestionControl overrides SendRateLimitBPS when both are set in DialConfig
-// or ServerConfig.
 type CongestionConfig struct {
 	// InitialRate is the starting send rate in bytes/sec.
 	// Default: 65536 (64 KiB/s) — conservative enough to survive 94% loss.

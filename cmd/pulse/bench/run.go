@@ -29,6 +29,7 @@ throughput for each combination of --size and --mtu.  No second terminal needed.
 	cmd.Flags().IntSlice("size", []int{1024, 64 * 1024, 512 * 1024}, "payload size(s) in bytes to sweep")
 	cmd.Flags().Duration("coalesce", 200*time.Microsecond, "coalesce interval; 0 disables")
 	cmd.Flags().Bool("reliable", true, "use reliable delivery (default: on; set --reliable=false to disable)")
+	cmd.Flags().Int64("rate-limit", 0, "outgoing byte rate limit in bytes/s (0 = unlimited; acts as CC ceiling when --cc is set)")
 	cmd.Flags().Bool("cc", false, "enable AIMD congestion control (auto-enables reliable delivery for loss feedback)")
 	return cmd
 }
@@ -39,6 +40,7 @@ func runBench(cmd *cobra.Command, _ []string) error {
 	sizes, _ := cmd.Flags().GetIntSlice("size")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
 	reliable, _ := cmd.Flags().GetBool("reliable")
+	rateLimit, _ := cmd.Flags().GetInt64("rate-limit")
 	cc, _ := cmd.Flags().GetBool("cc")
 
 	type result struct {
@@ -61,7 +63,7 @@ func runBench(cmd *cobra.Command, _ []string) error {
 	for _, mtu := range mtus {
 		for _, size := range sizes {
 			skipped := size > wiresocket.MaxEventPayload(mtu)
-			r, err := runOne(dur, mtu, size, coalesce, reliable, cc)
+			r, err := runOne(dur, mtu, size, coalesce, reliable, rateLimit, cc)
 			if err != nil {
 				return fmt.Errorf("bench mtu=%d size=%d: %w", mtu, size, err)
 			}
@@ -187,7 +189,7 @@ func fmtDuration(d time.Duration) string {
 // and returns throughput, loss, latency, and retransmit metrics.
 // Returns a zero result (not an error) when the payload cannot be sent at the
 // given MTU.
-func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, reliable, cc bool) (oneResult, error) {
+func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, reliable bool, rateLimit int64, cc bool) (oneResult, error) {
 	if payloadSize > wiresocket.MaxEventPayload(mtu) {
 		fmt.Fprintf(os.Stderr, "  skipping mtu=%-5d payload=%-10s — exceeds 255-fragment limit\n",
 			mtu, fmtSize(int64(payloadSize)))
@@ -254,6 +256,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		MaxPacketSize:       mtu,
 		CoalesceInterval:    coalesce,
 		MaxEventPayloadSize: payloadSize,
+		SendRateLimitBPS:    rateLimit,
 	}
 	if cc {
 		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}

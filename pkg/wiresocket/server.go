@@ -86,14 +86,14 @@ type ServerConfig struct {
 	// SendRateLimitBPS, if non-zero, limits the outgoing byte rate per session
 	// to approximately this many bytes per second.  A burst of up to 2× the
 	// per-second rate is allowed before throttling begins.  0 means unlimited.
-	// Ignored when CongestionControl is non-nil.
+	// When CongestionControl is also set, acts as the MaxRate ceiling on the
+	// controller (the CC still ramps up dynamically but never exceeds this value).
 	SendRateLimitBPS int64
 
 	// CongestionControl, when non-nil, enables the AIMD congestion controller
 	// on each accepted server connection.  Each Conn gets an independent CC
 	// instance starting from the same configuration.
 	// Requires at least one reliable channel on each Conn for loss feedback.
-	// Overrides SendRateLimitBPS when set.
 	CongestionControl *CongestionConfig
 
 	// AllowedPeers, if non-empty, is a whitelist of client static public keys
@@ -543,7 +543,11 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 		}
 		conn = newConn(sess, s.cfg.CoalesceInterval, newChannelCfg)
 		if s.cfg.CongestionControl != nil {
-			cc := newAIMDController(normalizeCCConfig(*s.cfg.CongestionControl), conn)
+			ccCfg := *s.cfg.CongestionControl
+			if s.cfg.SendRateLimitBPS > 0 && ccCfg.MaxRate == 0 {
+				ccCfg.MaxRate = s.cfg.SendRateLimitBPS
+			}
+			cc := newAIMDController(normalizeCCConfig(ccCfg), conn)
 			conn.cc = cc
 			// newConn already called wireSession; install CC on the session directly.
 			conn.sess.rateLimiter = cc

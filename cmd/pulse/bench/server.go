@@ -25,6 +25,7 @@ func serverCommand() *cobra.Command {
 	cmd.Flags().Int("mtu", 1472, "UDP payload MTU in bytes")
 	cmd.Flags().Duration("coalesce", 100*time.Microsecond, "coalesce interval; 0 disables coalescing")
 	cmd.Flags().Bool("reliable", true, "use reliable delivery (default: on; set --reliable=false to disable)")
+	cmd.Flags().Int64("rate-limit", 0, "outgoing byte rate limit in bytes/s per session (0 = unlimited)")
 	cmd.Flags().StringArray("allowed-keys", nil, "hex-encoded client public key to whitelist (may be repeated)")
 	return cmd
 }
@@ -35,6 +36,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	mtu, _ := cmd.Flags().GetInt("mtu")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
 	reliable, _ := cmd.Flags().GetBool("reliable")
+	rateLimit, _ := cmd.Flags().GetInt64("rate-limit")
 	allowedKeyHexes, _ := cmd.Flags().GetStringArray("allowed-keys")
 
 	var privKey [32]byte
@@ -77,13 +79,14 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// MaxIncompleteFrames and EventBufSize are auto-computed by the library
 	// from the kernel UDP socket buffer size.
 	srvCfg := wiresocket.ServerConfig{
-		Addr:             addr,
-		PrivateKey:       privKey,
-		OnConnect:        makeEchoConn(reliable),
-		MaxPacketSize:    mtu,
-		CoalesceInterval: coalesce,
-		WorkerCount:      workerCount,
-		AllowedPeers:     allowedPeers,
+		Addr:               addr,
+		PrivateKey:         privKey,
+		OnConnect:          makeEchoConn(reliable),
+		MaxPacketSize:      mtu,
+		CoalesceInterval:   coalesce,
+		WorkerCount:        workerCount,
+		AllowedPeers:       allowedPeers,
+		SendRateLimitBPS:   rateLimit,
 	}
 	srv, err := wiresocket.NewServer(srvCfg)
 	if err != nil {

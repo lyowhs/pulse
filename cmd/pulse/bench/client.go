@@ -32,6 +32,7 @@ func clientCommand() *cobra.Command {
 	cmd.Flags().Int("mtu", 1472, "UDP payload MTU in bytes")
 	cmd.Flags().Duration("coalesce", 200*time.Microsecond, "coalesce interval; 0 disables coalescing")
 	cmd.Flags().Bool("reliable", true, "use reliable delivery (default: on; set --reliable=false to disable)")
+	cmd.Flags().Int64("rate-limit", 0, "outgoing byte rate limit in bytes/s (0 = unlimited; acts as CC ceiling when --cc is set)")
 	cmd.Flags().Bool("cc", false, "enable AIMD congestion control (auto-enables reliable delivery for loss feedback)")
 	return cmd
 }
@@ -46,6 +47,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 	mtu, _ := cmd.Flags().GetInt("mtu")
 	coalesce, _ := cmd.Flags().GetDuration("coalesce")
 	reliable, _ := cmd.Flags().GetBool("reliable")
+	rateLimit, _ := cmd.Flags().GetInt64("rate-limit")
 	cc, _ := cmd.Flags().GetBool("cc")
 
 	var serverPub [32]byte
@@ -86,6 +88,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 		MaxPacketSize:       mtu,
 		CoalesceInterval:    coalesce,
 		MaxEventPayloadSize: size,
+		SendRateLimitBPS:    rateLimit,
 	}
 	if cc {
 		dialCfg.CongestionControl = &wiresocket.CongestionConfig{}
@@ -158,8 +161,12 @@ func runClient(cmd *cobra.Command, args []string) error {
 	if cc {
 		ccStr = "yes"
 	}
-	fmt.Fprintf(os.Stdout, "  payload %-10s  duration %-8s  senders %d  mtu %d  coalesce %s  reliable %s  cc %s\n\n",
-		fmtSize(int64(size)), dur, parallel, mtu, coalesce, reliableStr, ccStr)
+	rateLimitStr := "off"
+	if rateLimit > 0 {
+		rateLimitStr = fmtSize(rateLimit) + "/s"
+	}
+	fmt.Fprintf(os.Stdout, "  payload %-10s  duration %-8s  senders %d  mtu %d  coalesce %s  reliable %s  cc %s  rate-limit %s\n\n",
+		fmtSize(int64(size)), dur, parallel, mtu, coalesce, reliableStr, ccStr, rateLimitStr)
 	if cc {
 		fmt.Fprintf(os.Stdout, "  %7s   %10s   %10s   %10s   %10s   %10s\n",
 			"elapsed", "tx msg/s", "tx Gbit/s", "rx msg/s", "rx Gbit/s", "cc KiB/s")

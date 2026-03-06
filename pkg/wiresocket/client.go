@@ -88,14 +88,14 @@ type DialConfig struct {
 	// SendRateLimitBPS, if non-zero, limits the outgoing byte rate to
 	// approximately this many bytes per second.  A burst of up to 2× the
 	// per-second rate is allowed before throttling begins.  0 means unlimited.
-	// Ignored when CongestionControl is non-nil.
+	// When CongestionControl is also set, acts as the MaxRate ceiling on the
+	// controller (the CC still ramps up dynamically but never exceeds this value).
 	SendRateLimitBPS int64
 
 	// CongestionControl, when non-nil, enables the AIMD congestion controller.
 	// The controller starts at a conservative rate, ramps up exponentially
 	// (slow start), then adjusts linearly based on retransmit-detected loss.
 	// Requires at least one reliable channel on the Conn for loss feedback.
-	// Overrides SendRateLimitBPS when set.
 	CongestionControl *CongestionConfig
 
 }
@@ -193,7 +193,11 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 		// Create CC before wireSession so wireSession can install it as the
 		// session rate limiter on the first (and every subsequent) session.
 		if cfg.CongestionControl != nil {
-			c.cc = newAIMDController(normalizeCCConfig(*cfg.CongestionControl), c)
+			ccCfg := *cfg.CongestionControl
+			if cfg.SendRateLimitBPS > 0 && ccCfg.MaxRate == 0 {
+				ccCfg.MaxRate = cfg.SendRateLimitBPS
+			}
+			c.cc = newAIMDController(normalizeCCConfig(ccCfg), c)
 		}
 		// Wire the router before starting the read loop so sess.router is
 		// visible inside the goroutine (goroutine-start happens-before).
@@ -216,7 +220,11 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 	}
 	conn := newConn(sess, cfg.CoalesceInterval, newChannelCfg)
 	if cfg.CongestionControl != nil {
-		cc := newAIMDController(normalizeCCConfig(*cfg.CongestionControl), conn)
+		ccCfg := *cfg.CongestionControl
+		if cfg.SendRateLimitBPS > 0 && ccCfg.MaxRate == 0 {
+			ccCfg.MaxRate = cfg.SendRateLimitBPS
+		}
+		cc := newAIMDController(normalizeCCConfig(ccCfg), conn)
 		conn.cc = cc
 		// wireSession already ran inside newConn; install CC on the session directly.
 		conn.sess.rateLimiter = cc
