@@ -194,3 +194,55 @@ func TestFrameTruncatedBody(t *testing.T) {
 		t.Error("UnmarshalFrame with 1-byte buffer: expected error, got nil")
 	}
 }
+
+// TestUnmarshalFrameBodyErrorPaths exercises every error branch in the body
+// parser (consumeField / consumeVarint) by feeding crafted malformed wire
+// bytes to UnmarshalFrame.  Each case must return a non-nil error.
+func TestUnmarshalFrameBodyErrorPaths(t *testing.T) {
+	cases := []struct {
+		name string
+		wire []byte
+	}{
+		{
+			// Tag varint ends immediately — no terminating byte.
+			name: "truncated_varint_tag",
+			wire: []byte{0x00, 0x00, 0x80},
+		},
+		{
+			// Tag varint spans 11 bytes with continuation bits set — overflow.
+			name: "varint_overflow_tag",
+			wire: append([]byte{0x00, 0x00},
+				0x80, 0x80, 0x80, 0x80, 0x80,
+				0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+		},
+		{
+			// Field 4 wire type 1 (I64 — AckBitmap) with only 2 payload bytes
+			// instead of the required 8.
+			// Tag: (4<<3)|1 = 0x21
+			name: "truncated_i64",
+			wire: []byte{0x00, 0x00, 0x21, 0x01, 0x02},
+		},
+		{
+			// Field 1 wire type 2 (LEN — event body) with length=16 but zero
+			// data bytes following.
+			// Tag: (1<<3)|2 = 0x0A; length varint: 0x10 = 16
+			name: "truncated_len_value",
+			wire: []byte{0x00, 0x00, 0x0A, 0x10},
+		},
+		{
+			// Tag byte 0x03 encodes field=0, wire type=3 — not a valid wire type.
+			name: "unknown_wire_type",
+			wire: []byte{0x00, 0x00, 0x03},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := wiresocket.UnmarshalFrame(tc.wire)
+			if err == nil {
+				t.Errorf("UnmarshalFrame(%s): expected error, got nil", tc.name)
+			}
+		})
+	}
+}

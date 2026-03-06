@@ -63,7 +63,8 @@
       "Read(//proc/sys/net/core/**)",
       "Bash(wc:*)",
       "Bash(/tmp/probe.go:*)",
-      "Bash(WIRESOCKET_DEBUG=1 go run:*)"
+      "Bash(WIRESOCKET_DEBUG=1 go run:*)",
+      "Bash(WSDEBUG=1 go test:*)"
     ]
   }
 }
