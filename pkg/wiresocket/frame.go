@@ -99,6 +99,45 @@ func (f *Frame) AppendMarshal(dst []byte) []byte {
 // Marshal serialises f into wire format: [channel_id(2)][LEN-field events...].
 func (f *Frame) Marshal() []byte { return f.AppendMarshal(nil) }
 
+// wireSize returns the exact number of bytes that AppendMarshal will append.
+// Used to right-size the pool buffer before marshaling, routing small frames
+// to the small pool (2 KB) instead of the large pool (65 KB).
+func (f *Frame) wireSize() int {
+	n := 2 // channel_id uint16 LE
+	for _, e := range f.Events {
+		body := 1 + len(e.Payload)
+		n++ // field tag 0x0A fits in 1 varint byte (tag < 0x80)
+		n += varintSize(uint64(body))
+		n += body
+	}
+	if f.Seq != 0 {
+		n++ // tag 0x10
+		n += varintSize(uint64(f.Seq))
+	}
+	if f.AckSeq != 0 {
+		n++ // tag 0x18
+		n += varintSize(uint64(f.AckSeq))
+	}
+	if f.AckBitmap != 0 {
+		n += 9 // tag 0x21 (1 byte) + I64 (8 bytes)
+	}
+	if f.WindowSize != 0 {
+		n++ // tag 0x28
+		n += varintSize(uint64(f.WindowSize))
+	}
+	return n
+}
+
+// varintSize returns the number of bytes needed to encode v as a varint.
+func varintSize(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
+}
+
 // UnmarshalFrame parses a Frame from wire bytes.
 //
 // It does a fast pre-pass over the body to count events and compute total

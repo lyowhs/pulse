@@ -305,7 +305,7 @@ func TestReliableWindowSizedInEvents(t *testing.T) {
 
 	// Frame 1: 3 events → numPending should become 3.
 	f1 := &Frame{Events: []*Event{{Type: 1}, {Type: 2}, {Type: 3}}}
-	if err := rs.preSend(f1); err != nil {
+	if err := rs.preSend(f1, nil); err != nil {
 		t.Fatalf("preSend f1: %v", err)
 	}
 	rs.sendMu.Lock()
@@ -316,7 +316,7 @@ func TestReliableWindowSizedInEvents(t *testing.T) {
 
 	// Frame 2: 5 events → numPending should become 8.
 	f2 := &Frame{Events: []*Event{{Type: 4}, {Type: 5}, {Type: 6}, {Type: 7}, {Type: 8}}}
-	if err := rs.preSend(f2); err != nil {
+	if err := rs.preSend(f2, nil); err != nil {
 		t.Fatalf("preSend f2: %v", err)
 	}
 	rs.sendMu.Lock()
@@ -336,7 +336,7 @@ func TestReliableWindowSizedInEvents(t *testing.T) {
 
 	// Frame 3: 2 events → numPending should become 2.
 	f3 := &Frame{Events: []*Event{{Type: 9}, {Type: 10}}}
-	if err := rs.preSend(f3); err != nil {
+	if err := rs.preSend(f3, nil); err != nil {
 		t.Fatalf("preSend f3: %v", err)
 	}
 	rs.sendMu.Lock()
@@ -370,7 +370,7 @@ func TestReliableCloseUnblocksPreSend(t *testing.T) {
 	// Fill the window: 2 single-event frames → numPending=2=peerWindow.
 	for i := range 2 {
 		f := &Frame{Events: []*Event{{Type: uint8(i)}}}
-		if err := rs.preSend(f); err != nil {
+		if err := rs.preSend(f, nil); err != nil {
 			t.Fatalf("preSend[%d]: %v", i, err)
 		}
 	}
@@ -379,7 +379,7 @@ func TestReliableCloseUnblocksPreSend(t *testing.T) {
 	errC := make(chan error, 1)
 	go func() {
 		f := &Frame{Events: []*Event{{Type: 99}}}
-		errC <- rs.preSend(f)
+		errC <- rs.preSend(f, nil)
 	}()
 
 	// Give the goroutine time to enter cond.Wait.

@@ -146,19 +146,34 @@ func (ch *Channel) Send(ctx context.Context, e *Event) error {
 		if err != nil {
 			return err
 		}
-		frame := &Frame{ChannelId: ch.id, Events: []*Event{e}}
-		if rs := ch.reliable.Load(); rs != nil {
+		// Pool the Frame + single-element Events slice via singleEventFramePool,
+		// eliminating 2 heap allocations per send.  For reliable channels the
+		// poolSF is stored in the pending ring slot and returned by onAck/reset;
+		// for unreliable channels it is returned immediately after sess.send.
+		sf := getSingleEventFrame(ch.id, e)
+		frame := &sf.f
+		// Capture rs once so the reliable-vs-unreliable decision is consistent
+		// throughout this iteration (SetUnreliable could race with us otherwise).
+		rs := ch.reliable.Load()
+		if rs != nil {
 			dbg("channel send (reliable)", "channel_id", ch.id, "event_type", e.Type)
-			if err := rs.preSend(frame); err != nil {
+			if err := rs.preSend(frame, sf); err != nil {
+				// preSend failed before storing sf in any slot; return it now.
+				putSingleEventFrame(sf)
 				if err == ErrConnClosed && ch.conn.isPersistent() {
 					continue
 				}
 				return err
 			}
+			// sf ownership transferred to the pending slot; onAck/reset returns it.
 		} else {
 			dbg("channel send", "channel_id", ch.id, "event_type", e.Type)
 		}
 		err = sess.send(frame)
+		if rs == nil {
+			// Unreliable: frame is done the moment sess.send returns.
+			putSingleEventFrame(sf)
+		}
 		if err == ErrConnClosed && ch.conn.isPersistent() {
 			dbg("channel send: connection lost, waiting for reconnect", "channel_id", ch.id)
 			continue

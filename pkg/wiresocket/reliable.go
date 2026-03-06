@@ -80,6 +80,7 @@ func (c *ReliableCfg) withDefaults() ReliableCfg {
 type pendingFrame struct {
 	seq      uint32
 	frame    *Frame    // immutable once stored; re-sent as-is on retransmit
+	poolSF   *singleEventFrame // non-nil: return to singleEventFramePool on ACK/reset
 	sentAt   time.Time
 	retries  int
 	used     bool
@@ -194,6 +195,11 @@ func newAutoReliable(ch *Channel) *reliableState {
 // piggybacks any pending ACK from the receive side, saves frame in the
 // pending ring, and arms the retransmit timer.
 //
+// poolSF, when non-nil, is a singleEventFrame from singleEventFramePool that
+// owns the Frame.  preSend stores poolSF in the ring slot so that onAck and
+// reset can return it to the pool once the frame is ACKed or the session resets.
+// Callers that allocate the frame on the heap (e.g. the coalescer) pass nil.
+//
 // The window is measured in **events** (not frames) to prevent a burst of
 // coalesced frames from overflowing the receiver's channel buffer.  A frame
 // with N events consumes N window slots; the window opens again when the
@@ -202,7 +208,7 @@ func newAutoReliable(ch *Channel) *reliableState {
 // It blocks when the send window is full (flow control) and returns
 // ErrConnClosed if the channel or connection closes while waiting.
 // The caller must call sess.send(frame) after preSend returns nil.
-func (rs *reliableState) preSend(frame *Frame) error {
+func (rs *reliableState) preSend(frame *Frame, poolSF *singleEventFrame) error {
 	// Treat ACK-only frames (no events) as costing 1 window slot so they
 	// still participate in flow control and the ring doesn't lose track.
 	evtCount := len(frame.Events)
@@ -261,6 +267,7 @@ func (rs *reliableState) preSend(frame *Frame) error {
 	slot := &rs.pending[seq%uint32(len(rs.pending))]
 	slot.seq = seq
 	slot.frame = frame
+	slot.poolSF = poolSF
 	slot.sentAt = time.Now()
 	slot.retries = 0
 	slot.used = true
@@ -296,6 +303,10 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 		slot := &rs.pending[seq%ringSize]
 		if slot.used && slot.seq == seq {
 			freed += slot.evtCount
+			if slot.poolSF != nil {
+				putSingleEventFrame(slot.poolSF)
+				slot.poolSF = nil
+			}
 			slot.used = false
 			slot.frame = nil
 		}
@@ -321,6 +332,10 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 				slot := &rs.pending[sackSeq%ringSize]
 				if slot.used && slot.seq == sackSeq {
 					freed += slot.evtCount
+					if slot.poolSF != nil {
+						putSingleEventFrame(slot.poolSF)
+						slot.poolSF = nil
+					}
 					slot.used = false
 					slot.frame = nil
 				}
@@ -666,18 +681,21 @@ func (rs *reliableState) sendACK() {
 	if sess == nil {
 		return
 	}
-	ackFrame := &Frame{
-		ChannelId:  rs.channel.id,
-		AckSeq:     cumAck,
-		AckBitmap:  bitmap,
-		WindowSize: window,
-	}
+	// Pool ACK-only frames: they have no events and are immediately done after
+	// sess.send() returns, so the pool object is safe to reuse right away.
+	ackFrame := ackFramePool.Get().(*Frame)
+	ackFrame.ChannelId = rs.channel.id
+	ackFrame.AckSeq = cumAck
+	ackFrame.AckBitmap = bitmap
+	ackFrame.WindowSize = window
 	dbg("reliable: sending ACK",
 		"channel_id", rs.channel.id,
 		"ack_seq", cumAck,
 		"window", window,
 	)
 	_ = sess.send(ackFrame)
+	*ackFrame = Frame{} // clear all fields before returning to pool
+	ackFramePool.Put(ackFrame)
 }
 
 // startWindowWatchLocked arms the window-watch timer if not already running.
@@ -835,8 +853,12 @@ func (rs *reliableState) reset() {
 		"num_pending", rs.numPending,
 	)
 	rs.sendMu.Lock()
-	// Free all pending frames.
+	// Free all pending frames; return any pool-owned frames to their pool.
 	for i := range rs.pending {
+		if rs.pending[i].poolSF != nil {
+			putSingleEventFrame(rs.pending[i].poolSF)
+			rs.pending[i].poolSF = nil
+		}
 		rs.pending[i].used = false
 		rs.pending[i].frame = nil
 	}

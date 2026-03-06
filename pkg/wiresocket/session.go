@@ -272,7 +272,10 @@ func (s *session) writeRetry(data []byte) error {
 // maxFragPayload are automatically split across multiple typeDataFragment
 // packets.  It is safe to call from multiple goroutines simultaneously.
 func (s *session) send(frame *Frame) error {
-	bp := sendBufPool.Get().(*[]byte)
+	// Right-size the pool buffer: small frames use the 2 KB pool, avoiding
+	// the 65 KB buffer that would otherwise pollute L1/L2 cache.
+	needed := sizeDataHeader + frame.wireSize() + sizeAEADTag
+	bp := getSendBuf(needed)
 
 	// Marshal the frame after a sizeDataHeader-byte placeholder for the header.
 	// Using a three-index slice lets us start from len=0 while still giving
@@ -283,7 +286,7 @@ func (s *session) send(frame *Frame) error {
 
 	if len(plain) > s.maxFragPayload {
 		err := s.sendFragments(plain) // plain is valid; bp held for the duration
-		sendBufPool.Put(bp)
+		putSendBuf(bp)
 		return err
 	}
 
@@ -291,14 +294,14 @@ func (s *session) send(frame *Frame) error {
 	if s.rateLimiter != nil {
 		n := len(plain) + sizeDataHeader + sizeAEADTag
 		if err := s.rateLimiter.wait(s.done, n); err != nil {
-			sendBufPool.Put(bp)
+			putSendBuf(bp)
 			return err
 		}
 	}
 
 	counter, ok := s.nextCounter()
 	if !ok {
-		sendBufPool.Put(bp)
+		putSendBuf(bp)
 		return ErrConnClosed
 	}
 
@@ -334,7 +337,7 @@ func (s *session) send(frame *Frame) error {
 	} else {
 		s.lastSend.Store(time.Now().UnixNano())
 	}
-	sendBufPool.Put(bp)
+	putSendBuf(bp)
 	return err
 }
 
@@ -343,7 +346,7 @@ func (s *session) send(frame *Frame) error {
 // (msgs and bps) plus one [][]byte allocation per fragment (Buffers).
 type fragSendBatch struct {
 	msgs []ipv4.Message // passed directly to WriteBatch
-	bps  []*[]byte      // pool-buffer handles; returned to sendBufPool after send
+	bps  []*[]byte      // pool-buffer handles; returned to send pool after send
 	bufs [][]byte       // backing for msgs[i].Buffers; avoids a [][]byte{} alloc per fragment
 }
 
@@ -397,6 +400,11 @@ func (s *session) sendFragments(plain []byte) error {
 		fragSendPool.Put(fb)
 	}()
 
+	// Compute the size class for per-fragment buffers once outside the loop.
+	// Each fragment is: sizeDataHeader + sizeFragmentHeader + fragPayload + sizeAEADTag.
+	// The largest fragment uses s.maxFragPayload bytes of payload.
+	fragBufNeeded := sizeDataHeader + sizeFragmentHeader + s.maxFragPayload + sizeAEADTag
+
 	for i := 0; i < fragCount; i++ {
 		start := i * s.maxFragPayload
 		end := start + s.maxFragPayload
@@ -407,14 +415,11 @@ func (s *session) sendFragments(plain []byte) error {
 
 		totalSz := sizeDataHeader + sizeFragmentHeader + len(fragData)
 
-		bp := sendBufPool.Get().(*[]byte)
+		bp := getSendBuf(fragBufNeeded)
 		if cap(*bp) < totalSz+sizeAEADTag {
-			// Undersized buffer in pool (contamination from a previous bug).
-			// Replace with a correctly-sized one so the pool stays healthy.
-			// In practice totalSz+sizeAEADTag ≤ MaxPacketSize ≤ 65535 <
-			// pool-buffer capacity, so this branch is unreachable under normal
-			// conditions.
-			*bp = make([]byte, 0, 65535+sizeAEADTag)
+			// Undersized buffer (shouldn't happen since getSendBuf allocates
+			// at least fragBufNeeded bytes, but guard for safety).
+			*bp = make([]byte, 0, fragBufNeeded)
 		}
 		buf := (*bp)[0:totalSz:cap(*bp)]
 
@@ -422,9 +427,9 @@ func (s *session) sendFragments(plain []byte) error {
 		if !ok {
 			// Return buffers for already-built fragments plus the current one.
 			for j := 0; j < i; j++ {
-				sendBufPool.Put(fb.bps[j])
+				putSendBuf(fb.bps[j])
 			}
-			sendBufPool.Put(bp)
+			putSendBuf(bp)
 			return ErrConnClosed // defer cleans up fb
 		}
 
@@ -515,7 +520,7 @@ func (s *session) sendFragments(plain []byte) error {
 	}
 
 	for _, bp := range fb.bps {
-		sendBufPool.Put(bp)
+		putSendBuf(bp)
 	}
 	if sendErr != nil {
 		dbg("send fragments failed",
@@ -539,8 +544,8 @@ func (s *session) sendKeepalive() error {
 	}
 
 	// Borrow a pool buffer so the header + AEAD tag don't heap-allocate.
-	// sizeKeepalive = sizeDataHeader(16) + sizeAEADTag(16) = 32 bytes.
-	bp := sendBufPool.Get().(*[]byte)
+	// sizeKeepalive = sizeDataHeader(16) + sizeAEADTag(16) = 32 bytes → small pool.
+	bp := getSendBuf(sizeKeepalive)
 	buf := (*bp)[:sizeDataHeader]
 	buf[0] = typeKeepalive
 	buf[1], buf[2], buf[3] = 0, 0, 0
@@ -556,7 +561,7 @@ func (s *session) sendKeepalive() error {
 		"remote_addr", s.remoteAddr.String(),
 	)
 	err := s.writeRetry(ciphertext)
-	sendBufPool.Put(bp)
+	putSendBuf(bp)
 	if err != nil {
 		dbg("send keepalive failed",
 			"local_index", s.localIndex,
@@ -604,7 +609,7 @@ func (s *session) sendDisconnect() error {
 
 	// Build a data-style header with typeDisconnect instead of typeData.
 	// Borrow a pool buffer so the header + AEAD tag don't heap-allocate.
-	bp := sendBufPool.Get().(*[]byte)
+	bp := getSendBuf(sizeDisconnect)
 	buf := (*bp)[:sizeDataHeader]
 	buf[0] = typeDisconnect
 	buf[1], buf[2], buf[3] = 0, 0, 0
@@ -619,7 +624,7 @@ func (s *session) sendDisconnect() error {
 		"remote_addr", s.remoteAddr.String(),
 	)
 	err := s.writeRetry(ciphertext)
-	sendBufPool.Put(bp)
+	putSendBuf(bp)
 	if err != nil {
 		dbg("send disconnect failed",
 			"local_index", s.localIndex,
@@ -644,13 +649,15 @@ func (s *session) receive(b []byte) bool {
 		return false // replay or too old
 	}
 
-	// Decrypt into a pool buffer to avoid per-packet heap allocation.
-	bp := recvBufPool.Get().(*[]byte)
+	// Decrypt into a right-sized pool buffer: routes small frames to the 2 KB
+	// pool, keeping the working set in L1/L2 cache.
+	cipherLen := len(b) - sizeDataHeader // ciphertext including AEAD tag
+	bp := getRecvBuf(cipherLen)
 	var nonce [12]byte
 	binary.LittleEndian.PutUint64(nonce[4:], hdr.Counter)
 	plain, err := s.recvAEAD.Open((*bp)[:0], nonce[:], b[sizeDataHeader:], nil)
 	if err != nil {
-		recvBufPool.Put(bp)
+		putRecvBuf(bp)
 		dbg("recv: decrypt failed", "local_index", s.localIndex, "counter", hdr.Counter, "err", err)
 		return false
 	}
@@ -664,14 +671,14 @@ func (s *session) receive(b []byte) bool {
 
 	if len(plain) == 0 {
 		dbg("recv: empty data frame", "local_index", s.localIndex, "counter", hdr.Counter)
-		recvBufPool.Put(bp)
+		putRecvBuf(bp)
 		return true // empty data frame — nothing to deliver
 	}
 
 	frame, err := UnmarshalFrame(plain)
 	// Return the pool buffer now: UnmarshalFrame copies Event.Payload (frame.go),
 	// so the pool memory is no longer referenced after this point.
-	recvBufPool.Put(bp)
+	putRecvBuf(bp)
 	if err != nil {
 		dbg("recv: frame unmarshal failed", "local_index", s.localIndex, "err", err)
 		return false
@@ -720,13 +727,14 @@ func (s *session) receiveFragment(b []byte) bool {
 		return false
 	}
 
-	// Decrypt into a pool buffer.
-	bp := recvBufPool.Get().(*[]byte)
+	// Decrypt into a right-sized pool buffer.
+	fragCipherLen := len(b) - sizeDataHeader
+	bp := getRecvBuf(fragCipherLen)
 	var nonce [12]byte
 	binary.LittleEndian.PutUint64(nonce[4:], counter)
 	plain, err := s.recvAEAD.Open((*bp)[:0], nonce[:], b[sizeDataHeader:], nil)
 	if err != nil {
-		recvBufPool.Put(bp)
+		putRecvBuf(bp)
 		dbg("recv: fragment decrypt failed", "local_index", s.localIndex, "counter", counter, "err", err)
 		return false
 	}
@@ -734,7 +742,7 @@ func (s *session) receiveFragment(b []byte) bool {
 	s.replay.update(counter)
 
 	if len(plain) < sizeFragmentHeader {
-		recvBufPool.Put(bp)
+		putRecvBuf(bp)
 		dbg("recv: fragment payload too short", "local_index", s.localIndex)
 		return false
 	}
@@ -745,7 +753,7 @@ func (s *session) receiveFragment(b []byte) bool {
 	data := plain[sizeFragmentHeader:] // zero-copy view into pool buffer
 
 	if fragCount == 0 || int(fragIndex) >= int(fragCount) {
-		recvBufPool.Put(bp)
+		putRecvBuf(bp)
 		dbg("recv: invalid fragment header",
 			"local_index", s.localIndex,
 			"frame_id", frameID,
@@ -763,7 +771,7 @@ func (s *session) receiveFragment(b []byte) bool {
 	if !ok {
 		if len(s.fragBufs) >= s.maxFragBufs {
 			s.fragMu.Unlock()
-			recvBufPool.Put(bp)
+			putRecvBuf(bp)
 			dbg("recv: reassembly buffer full, dropping fragment",
 				"local_index", s.localIndex,
 				"frame_id", frameID,
@@ -784,7 +792,7 @@ func (s *session) receiveFragment(b []byte) bool {
 		)
 	} else if rbuf.total != fragCount {
 		s.fragMu.Unlock()
-		recvBufPool.Put(bp)
+		putRecvBuf(bp)
 		dbg("recv: fragment count mismatch",
 			"local_index", s.localIndex,
 			"frame_id", frameID,
@@ -802,7 +810,7 @@ func (s *session) receiveFragment(b []byte) bool {
 		rbuf.lastSeen = time.Now()
 	} else {
 		// Duplicate fragment — discard the pool buffer we just decrypted into.
-		recvBufPool.Put(bp)
+		putRecvBuf(bp)
 		dbg("recv: duplicate fragment ignored",
 			"local_index", s.localIndex,
 			"frame_id", frameID,
@@ -835,7 +843,7 @@ func (s *session) receiveFragment(b []byte) bool {
 	}
 	for _, fragBp := range rbuf.bufs {
 		if fragBp != nil {
-			recvBufPool.Put(fragBp)
+			putRecvBuf(fragBp)
 		}
 	}
 
@@ -885,7 +893,7 @@ func (s *session) gcFragBufs(maxAge time.Duration) {
 			// Return pool buffers for any fragments already received.
 			for _, bp := range buf.bufs {
 				if bp != nil {
-					recvBufPool.Put(bp)
+					putRecvBuf(bp)
 				}
 			}
 			delete(s.fragBufs, id)

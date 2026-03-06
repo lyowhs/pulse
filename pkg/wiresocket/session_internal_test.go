@@ -14,7 +14,7 @@ func TestGCFragBufsEvictsStale(t *testing.T) {
 	}
 
 	// Stale entry: first fragment received, second still missing; lastSeen 2s ago.
-	bp := recvBufPool.Get().(*[]byte)
+	bp := getRecvBuf(0) // any small buffer; content doesn't matter for GC test
 	stale := &reassemblyBuf{
 		frags:    make([][]byte, 2),
 		bufs:     []*[]byte{bp, nil},

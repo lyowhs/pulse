@@ -171,21 +171,41 @@ func (c *coalescer) run() {
 	}
 
 	// sendFrame sends a frame, routing through the reliable path when applicable.
+	// For unreliable channels, the Frame struct is borrowed from ackFramePool and
+	// returned immediately after sess.send() — saving one allocation per flush.
+	// For reliable channels, the Frame is heap-allocated because it must remain
+	// alive in the pending ring until the ACK arrives.
 	sendFrame := func(sess *session, chId uint16, events []*Event) {
-		frame := &Frame{ChannelId: chId, Events: events}
+		var rs *reliableState
 		if v, ok := c.conn.channelMap.Load(chId); ok {
-			ch := v.(*Channel)
-			if rs := ch.reliable.Load(); rs != nil {
-				if err := rs.preSend(frame); err != nil {
-					dbg("coalescer: reliable preSend failed, dropping events",
-						"channel_id", chId, "count", len(events), "err", err)
-					return
-				}
-			}
+			rs = v.(*Channel).reliable.Load()
 		}
+
+		var frame *Frame
+		if rs != nil {
+			frame = &Frame{ChannelId: chId, Events: events}
+			if err := rs.preSend(frame, nil); err != nil {
+				dbg("coalescer: reliable preSend failed, dropping events",
+					"channel_id", chId, "count", len(events), "err", err)
+				return
+			}
+		} else {
+			frame = ackFramePool.Get().(*Frame)
+			frame.ChannelId = chId
+			frame.Events = events
+		}
+
 		if err := sess.send(frame); err != nil {
 			dbg("coalescer: send failed, dropping events",
 				"channel_id", chId, "count", len(events), "err", err)
+		}
+
+		if rs == nil {
+			// Unreliable: return the Frame struct to the pool now that sending
+			// is complete.  Clear Events so the event pointers are not pinned.
+			frame.Events = nil
+			frame.ChannelId = 0
+			ackFramePool.Put(frame)
 		}
 	}
 

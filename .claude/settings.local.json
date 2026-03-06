@@ -64,7 +64,8 @@
       "Bash(wc:*)",
       "Bash(/tmp/probe.go:*)",
       "Bash(WIRESOCKET_DEBUG=1 go run:*)",
-      "Bash(WSDEBUG=1 go test:*)"
+      "Bash(WSDEBUG=1 go test:*)",
+      "Bash(python3:*)"
     ]
   }
 }
