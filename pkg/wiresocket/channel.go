@@ -84,18 +84,24 @@ func (ch *Channel) SetReliable(cfg ReliableCfg) {
 	// Copy receive-side progress from the existing state so we don't reset
 	// expectSeq back to 1 (e.g. when reconfiguring window size mid-stream).
 	if old := ch.reliable.Load(); old != nil {
+		// Hold old.recvMu across both the state copy AND the Store so that
+		// onRecv's re-check (done after acquiring recvMu) can reliably detect
+		// the swap.  This guarantees that ackDirty=true set by an onRecv that
+		// raced with SetReliable is visible in the new state (because onRecv
+		// will either: set ackDirty on old state THEN release the lock, letting
+		// SetReliable copy ackDirty=true into the new state; OR onRecv gets the
+		// lock AFTER SetReliable releases it, sees the new state via re-check,
+		// and forwards to it).
 		old.recvMu.Lock()
 		rs.expectSeq = old.expectSeq
 		rs.ooo = old.ooo
 		rs.oooFrames = old.oooFrames
-		rs.ackDirty = old.ackDirty
-		if old.ackTimer != nil {
-			old.ackTimer.Stop()
-			old.ackTimer = nil
-		}
+		rs.ackDirty.Store(old.ackDirty.Load())
+		ch.reliable.Store(rs)
 		old.recvMu.Unlock()
+	} else {
+		ch.reliable.Store(rs)
 	}
-	ch.reliable.Store(rs)
 }
 
 // Send sends an event on this channel to the remote peer.

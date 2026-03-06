@@ -254,6 +254,35 @@ func (s *session) nextCounter() (uint64, bool) {
 // Uses an atomic flag rather than a channel-select for a cheaper hot-path read.
 func (s *session) isDone() bool { return s.closed.Load() }
 
+// lazyTimeThreshold is the minimum elapsed time before we update the
+// lastSend/lastRecv atomic timestamps.  At packet rates above ~1000/s,
+// avoiding the atomic store on every packet reduces cross-core cache
+// coherency traffic on the lastSend/lastRecv cache lines (item 9 optimization).
+// The threshold is well below all timeout and keepalive intervals (seconds).
+const lazyTimeThreshold = int64(time.Millisecond)
+
+// touchLastSend updates s.lastSend to now if more than lazyTimeThreshold has
+// elapsed since the last update.  Saves redundant atomic stores at high packet
+// rates while keeping the timestamp accurate to within 1 ms.
+func (s *session) touchLastSend() {
+	now := time.Now().UnixNano()
+	if now-s.lastSend.Load() > lazyTimeThreshold {
+		s.lastSend.Store(now)
+	}
+}
+
+// touchLastRecv updates s.lastRecv (and optionally s.lastDataRecv) to now if
+// more than lazyTimeThreshold has elapsed since the last update.
+func (s *session) touchLastRecv(data bool) {
+	now := time.Now().UnixNano()
+	if now-s.lastRecv.Load() > lazyTimeThreshold {
+		s.lastRecv.Store(now)
+	}
+	if data && now-s.lastDataRecv.Load() > lazyTimeThreshold {
+		s.lastDataRecv.Store(now)
+	}
+}
+
 // writeRetry calls WriteToUDP and retries on ENOBUFS.
 // On macOS the kernel UDP send buffer returns ENOBUFS (errno 55) under load
 // rather than blocking.  A brief goroutine yield and retry drains backpressure
@@ -335,7 +364,7 @@ func (s *session) send(frame *Frame) error {
 			"err", err,
 		)
 	} else {
-		s.lastSend.Store(time.Now().UnixNano())
+		s.touchLastSend()
 	}
 	putSendBuf(bp)
 	return err
@@ -532,7 +561,7 @@ func (s *session) sendFragments(plain []byte) error {
 		)
 		return sendErr
 	}
-	s.lastSend.Store(time.Now().UnixNano())
+	s.touchLastSend()
 	return nil
 }
 
@@ -569,7 +598,7 @@ func (s *session) sendKeepalive() error {
 			"err", err,
 		)
 	} else {
-		s.lastSend.Store(time.Now().UnixNano())
+		s.touchLastSend()
 	}
 	return err
 }
@@ -593,7 +622,7 @@ func (s *session) receiveKeepalive(b []byte) bool {
 		return false
 	}
 	s.replay.update(counter)
-	s.lastRecv.Store(time.Now().UnixNano())
+	s.touchLastRecv(false) // keepalive: not a data packet
 	dbg("recv keepalive", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
 	return true
 }
@@ -665,9 +694,7 @@ func (s *session) receive(b []byte) bool {
 	*bp = plain[:cap(plain)]
 
 	s.replay.update(hdr.Counter)
-	now := time.Now().UnixNano()
-	s.lastRecv.Store(now)
-	s.lastDataRecv.Store(now)
+	s.touchLastRecv(true) // data packet
 
 	if len(plain) == 0 {
 		dbg("recv: empty data frame", "local_index", s.localIndex, "counter", hdr.Counter)
@@ -847,9 +874,7 @@ func (s *session) receiveFragment(b []byte) bool {
 		}
 	}
 
-	now := time.Now().UnixNano()
-	s.lastRecv.Store(now)
-	s.lastDataRecv.Store(now)
+	s.touchLastRecv(true) // assembled fragment = data packet
 
 	if len(assembled) == 0 {
 		return true

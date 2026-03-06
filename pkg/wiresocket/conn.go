@@ -33,6 +33,10 @@ type Conn struct {
 	// coalescer batches outgoing events; nil when coalescing is disabled.
 	coalescer *coalescer
 
+	// ackBatcher sends deferred standalone ACKs for all reliable channels,
+	// replacing per-channel time.AfterFunc timers (item 6 optimization).
+	ackBatcher *ackBatcher
+
 	// mu protects sess and ready for persistent conns; unused for non-persistent.
 	mu   sync.RWMutex
 	sess *session // current session; immutable for non-persistent
@@ -93,6 +97,7 @@ func newConn(s *session, coalesceInterval time.Duration, newChannelCfg ReliableC
 	if coalesceInterval > 0 {
 		c.coalescer = newCoalescer(c, coalesceInterval, s.maxFragPayload)
 	}
+	c.ackBatcher = newAckBatcher(c)
 	c.wireSession(s)
 	dbg("conn created", "local_index", s.localIndex, "remote_addr", s.remoteAddr.String())
 	return c

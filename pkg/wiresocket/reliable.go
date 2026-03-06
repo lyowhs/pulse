@@ -124,9 +124,12 @@ type reliableState struct {
 	//   (oooHead + gap - 1) % reliableOOOWindow
 	// Advancing one in-order step increments oooHead by 1 (mod N) — O(1)
 	// vs the previous O(N) memmove that shift-left required.
-	oooHead  int
-	ackDirty bool
-	ackTimer *time.Timer
+	oooHead int
+	// ackDirty is set when the receiver has data to ACK back to the peer.
+	// It is an atomic.Bool so that preSend can fast-path check it without
+	// acquiring recvMu (item 7 optimization).  All writes still happen under
+	// recvMu; reads outside recvMu use Load() only for the fast-path check.
+	ackDirty atomic.Bool
 
 	// windowWatchActive is true while the window-watch timer is running.
 	// When we advertise window=0 (receiver buffer full), we start polling
@@ -245,24 +248,25 @@ func (rs *reliableState) preSend(frame *Frame, poolSF *singleEventFrame) error {
 	frame.Seq = seq
 
 	// Piggyback any pending ACK from the receive side (free ride on data packets).
-	rs.recvMu.Lock()
-	if rs.ackDirty {
-		frame.AckSeq = rs.expectSeq
-		frame.AckBitmap = rs.ooo
-		frame.WindowSize = rs.myWindow()
-		rs.ackDirty = false
-		rs.lastAdvWindow = frame.WindowSize
-		if rs.ackTimer != nil {
-			rs.ackTimer.Stop()
-			rs.ackTimer = nil
+	// Fast path (item 7): skip recvMu entirely when ackDirty is false, which is
+	// the common case for unidirectional streams.  When true, double-check under
+	// recvMu to handle the race where another goroutine cleared ackDirty first.
+	if rs.ackDirty.Load() {
+		rs.recvMu.Lock()
+		if rs.ackDirty.Load() {
+			frame.AckSeq = rs.expectSeq
+			frame.AckBitmap = rs.ooo
+			frame.WindowSize = rs.myWindow()
+			rs.ackDirty.Store(false)
+			rs.lastAdvWindow = frame.WindowSize
+			// Start the window watch whenever we piggyback a restricted window so
+			// the remote sender is unblocked as soon as the buffer drains.
+			if frame.WindowSize < uint32(cap(rs.channel.events)) {
+				rs.startWindowWatchLocked()
+			}
 		}
-		// Start the window watch whenever we piggyback a restricted window so
-		// the remote sender is unblocked as soon as the buffer drains.
-		if frame.WindowSize < uint32(cap(rs.channel.events)) {
-			rs.startWindowWatchLocked()
-		}
+		rs.recvMu.Unlock()
 	}
-	rs.recvMu.Unlock()
 
 	slot := &rs.pending[seq%uint32(len(rs.pending))]
 	slot.seq = seq
@@ -480,6 +484,20 @@ func (rs *reliableState) retransmit() {
 	}
 	p.sentAt = time.Now()
 	frame := p.frame
+	originalSeq := p.seq
+
+	// Temporarily steal poolSF from the pending slot so that onAck cannot
+	// call putSingleEventFrame while we are inside sess.send below (outside
+	// sendMu).  putSingleEventFrame clears slot[0] (the Event pointer for GC),
+	// but slot[0] is also frame.Events[0] — accessed by wireSize/AppendMarshal
+	// inside sess.send.  A concurrent clear would produce a nil-dereference panic.
+	//
+	// After sess.send completes we restore poolSF to the pending slot so that:
+	//  - subsequent retransmits (before ACK) find a valid Events[0], and
+	//  - onAck / reset can free the singleEventFrame in the normal way.
+	// If the slot was already ACKed (freed) while we held poolSF, we free it here.
+	retransmitSF := p.poolSF
+	p.poolSF = nil
 
 	// Mark in-flight BEFORE unlocking.  Do NOT arm the next timer here —
 	// arming it after sess.send() returns prevents goroutine pile-up when the
@@ -503,6 +521,19 @@ func (rs *reliableState) retransmit() {
 	// while we were blocked, giving us the correct (shorter) next timeout.
 	rs.sendMu.Lock()
 	rs.retransmitInFlight = false
+
+	// Restore poolSF to the pending slot.  If the slot was ACKed (or reset)
+	// while poolSF was nil (i.e. while we held it), free it now.
+	if retransmitSF != nil {
+		ringSize := uint32(len(rs.pending))
+		slot := &rs.pending[originalSeq%ringSize]
+		if slot.used && slot.seq == originalSeq {
+			slot.poolSF = retransmitSF // restore; onAck/reset will free it
+		} else {
+			putSingleEventFrame(retransmitSF) // freed while we held it
+		}
+	}
+
 	if rs.numPending > 0 && rs.rtoRunning {
 		rs.rtoTimer = time.AfterFunc(rs.rto, rs.retransmit)
 	}
@@ -515,6 +546,17 @@ func (rs *reliableState) retransmit() {
 // buffers it for later delivery when the gap is filled.
 func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 	rs.recvMu.Lock()
+
+	// Re-check after acquiring recvMu: SetReliable holds old.recvMu across
+	// its state copy AND Store, so if the new state was stored before we
+	// acquired the lock, we will see it here and forward.  This, combined with
+	// SetReliable holding the lock during Store, guarantees that ackDirty set
+	// by onRecv is always visible to the ackBatcher via the current state.
+	if current := rs.channel.reliable.Load(); current != nil && current != rs {
+		rs.recvMu.Unlock()
+		current.onRecv(seq, f)
+		return
+	}
 
 	switch {
 	case seq == rs.expectSeq:
@@ -567,8 +609,7 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 		)
 	}
 
-	rs.ackDirty = true
-	rs.scheduleACKLocked()
+	rs.ackDirty.Store(true)
 	rs.recvMu.Unlock()
 }
 
@@ -626,8 +667,9 @@ func (rs *reliableState) deliverInOrderLocked(f *Frame) {
 		)
 	}
 
-	rs.ackDirty = true
-	rs.scheduleACKLocked()
+	rs.ackDirty.Store(true)
+	// The per-Conn ackBatcher goroutine will send a standalone ACK within
+	// one batcher tick (defaultACKDelay) if no piggybacking opportunity arises.
 }
 
 // myWindow returns the number of slots available in the receive channel buffer.
@@ -642,28 +684,18 @@ func (rs *reliableState) myWindow() uint32 {
 	return uint32(avail)
 }
 
-// scheduleACKLocked arms the delayed-ACK timer if not already running.
-// Must be called with recvMu held.
-func (rs *reliableState) scheduleACKLocked() {
-	if rs.ackTimer == nil {
-		rs.ackTimer = time.AfterFunc(rs.cfg.ACKDelay, rs.sendACK)
-	}
-}
-
 // sendACK sends a standalone ACK frame back to the remote peer.
-// Called by the ackTimer AfterFunc; runs in its own goroutine.
+// Called by the ackBatcher goroutine; runs in the batcher's goroutine.
 func (rs *reliableState) sendACK() {
 	rs.recvMu.Lock()
-	if !rs.ackDirty {
-		rs.ackTimer = nil
+	if !rs.ackDirty.Load() {
 		rs.recvMu.Unlock()
 		return
 	}
 	cumAck := rs.expectSeq
 	bitmap := rs.ooo
 	window := rs.myWindow()
-	rs.ackDirty = false
-	rs.ackTimer = nil
+	rs.ackDirty.Store(false)
 	rs.lastAdvWindow = window
 	// Start the window watch whenever we advertise a restricted window.
 	// A restricted window (< receiver capacity) means the remote sender may
@@ -734,11 +766,7 @@ func (rs *reliableState) windowWatch() {
 		// Window has grown beyond what we last advertised — send an immediate
 		// update so the remote sender can unblock without waiting for ACKDelay.
 		rs.windowWatchActive = false
-		rs.ackDirty = true
-		if rs.ackTimer != nil {
-			rs.ackTimer.Stop()
-			rs.ackTimer = nil
-		}
+		rs.ackDirty.Store(true)
 		rs.recvMu.Unlock()
 		rs.sendACK()
 		return
@@ -778,38 +806,9 @@ func (rs *reliableState) notifyWindowIncreased() {
 		return
 	}
 	// Window has grown from a restricted state: send an immediate update.
-	rs.ackDirty = true
-	if rs.ackTimer != nil {
-		rs.ackTimer.Stop()
-		rs.ackTimer = nil
-	}
+	rs.ackDirty.Store(true)
 	rs.recvMu.Unlock()
 	rs.sendACK()
-}
-
-// consumePendingACK reads and clears any pending ACK state for piggybacking.
-// Returns (cumAck, bitmap, window, true) if an ACK is pending, or (0,0,0,false).
-// Must NOT be called with recvMu held.
-func (rs *reliableState) consumePendingACK() (cumAck uint32, bitmap uint64, window uint32, ok bool) {
-	rs.recvMu.Lock()
-	if !rs.ackDirty {
-		rs.recvMu.Unlock()
-		return 0, 0, 0, false
-	}
-	cumAck = rs.expectSeq
-	bitmap = rs.ooo
-	window = rs.myWindow()
-	rs.ackDirty = false
-	if rs.ackTimer != nil {
-		rs.ackTimer.Stop()
-		rs.ackTimer = nil
-	}
-	// Start the window watch whenever we piggyback a restricted window.
-	if window < uint32(cap(rs.channel.events)) {
-		rs.startWindowWatchLocked()
-	}
-	rs.recvMu.Unlock()
-	return cumAck, bitmap, window, true
 }
 
 // waitEmpty blocks until all sent frames have been ACKed by the remote peer,
@@ -882,17 +881,14 @@ func (rs *reliableState) reset() {
 	for i := range rs.oooFrames {
 		rs.oooFrames[i] = nil
 	}
-	rs.ackDirty = false
-	if rs.ackTimer != nil {
-		rs.ackTimer.Stop()
-		rs.ackTimer = nil
-	}
+	rs.ackDirty.Store(false)
 	rs.recvMu.Unlock()
 }
 
 // deliverEventToChannel pushes an event into the channel's receive buffer.
 // Mirrors the delivery logic from conn.go (drop-oldest on overflow).
 func deliverEventToChannel(ch *Channel, e *Event) {
+	dbg("deliver event", "channel_id", ch.id, "type", e.Type)
 	select {
 	case ch.events <- e:
 	default:

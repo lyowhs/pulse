@@ -173,12 +173,12 @@ func TestPutSingleEventFrameClears(t *testing.T) {
 	e := &Event{Type: 1}
 	sf := getSingleEventFrame(5, e)
 	putSingleEventFrame(sf)
-	// After put, slot and Frame fields must be zero to avoid GC pinning.
+	// After put, slot[0] must be nil to avoid GC pinning the Event.
+	// Frame fields (ChannelId, Seq, etc.) are NOT cleared by putSingleEventFrame;
+	// they are re-initialised by getSingleEventFrame after the next pool.Get,
+	// which is safe because no other goroutine may read sf.f after the put.
 	if sf.slot[0] != nil {
 		t.Error("slot[0] not cleared after putSingleEventFrame")
-	}
-	if sf.f.ChannelId != 0 || sf.f.Events != nil {
-		t.Error("Frame fields not cleared after putSingleEventFrame")
 	}
 }
 

@@ -65,7 +65,11 @@
       "Bash(/tmp/probe.go:*)",
       "Bash(WIRESOCKET_DEBUG=1 go run:*)",
       "Bash(WSDEBUG=1 go test:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(do:*)",
+      "Bash(while read f)",
+      "Bash(git stash:*)",
+      "Bash(WIRESOCKET_DEBUG=1 go test:*)"
     ]
   }
 }

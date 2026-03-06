@@ -443,7 +443,7 @@ func BenchmarkOOOInOrderDrain(b *testing.B) {
 		for j := range rs.oooFrames {
 			rs.oooFrames[j] = nil
 		}
-		rs.ackDirty = false
+		rs.ackDirty.Store(false)
 		rs.recvMu.Unlock()
 
 		// Store N-1 OOO frames (seq 2..N+1) so the buffer is full.

@@ -108,17 +108,23 @@ var singleEventFramePool = sync.Pool{New: func() any { return &singleEventFrame{
 // getSingleEventFrame borrows a singleEventFrame from the pool and initialises
 // it with chId and e.  The caller must return it with putSingleEventFrame (unreliable
 // path) or via pendingFrame.poolSF → onAck/reset (reliable path).
+//
+// All Frame fields are re-initialised here, after pool.Get's happens-before
+// barrier.  putSingleEventFrame only clears slot[0] (for GC) and skips the
+// Frame zero, so there is no write to sf.f inside putSingleEventFrame that
+// could race with a concurrent retransmit goroutine reading sf.f from its
+// captured frame pointer.
 func getSingleEventFrame(chId uint16, e *Event) *singleEventFrame {
 	sf := singleEventFramePool.Get().(*singleEventFrame)
 	sf.slot[0] = e
-	sf.f.ChannelId = chId
-	sf.f.Events = sf.slot[:1:1]
+	sf.f = Frame{ChannelId: chId, Events: sf.slot[:1:1]}
 	return sf
 }
 
 // putSingleEventFrame clears sf and returns it to the pool.
+// Only the event reference is cleared for GC; Frame fields are re-initialised
+// by getSingleEventFrame after the next pool.Get.
 func putSingleEventFrame(sf *singleEventFrame) {
 	sf.slot[0] = nil // release the Event reference for GC
-	sf.f = Frame{}   // clear all Frame fields including Events
 	singleEventFramePool.Put(sf)
 }

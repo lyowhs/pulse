@@ -539,8 +539,8 @@ func TestCoalescerFrameSizeFitsOnePkt(t *testing.T) {
 	ch := conn.Channel(1)
 	ch.SetReliable(wiresocket.ReliableCfg{WindowSize: N})
 
-	payload := make([]byte, payloadSize)
 	for i := 0; i < N; i++ {
+		payload := make([]byte, payloadSize)
 		payload[0] = byte(i)
 		if err := ch.Send(ctx, &wiresocket.Event{Type: 1, Payload: payload}); err != nil {
 			t.Fatalf("Send %d: %v", i, err)
