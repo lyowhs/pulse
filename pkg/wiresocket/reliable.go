@@ -94,9 +94,14 @@ type reliableState struct {
 
 	// ── send side ─────────────────────────────────────────────────────────
 	sendMu     sync.Mutex
-	nextSeq    uint32        // next sequence number to assign (starts at 1)
+	nextSeq uint32 // next sequence number to assign (starts at 1)
+	// oldestSeq is the lower-bound sequence number of the oldest in-flight
+	// frame.  Updated to ackSeq on every cumulative ACK so that the ring-walk
+	// in onAck and earliestPendingLocked covers only [oldestSeq, ackSeq) —
+	// O(freed frames) — rather than the full ring — O(cfg.WindowSize).
+	oldestSeq  uint32
 	pending    []pendingFrame // ring buffer; len == cfg.WindowSize; indexed by seq % len
-	numPending int           // total events (not frames) currently in-flight
+	numPending int            // total events (not frames) currently in-flight
 	peerWindow int           // receiver-advertised window in events; starts at cfg.WindowSize
 	cond       *sync.Cond     // wait when numPending >= peerWindow
 	rtoRunning        bool          // true while rtoTimer is armed or retransmit is in-flight
@@ -166,6 +171,7 @@ func newReliableState(ch *Channel, cfg ReliableCfg) *reliableState {
 		cfg:           cfg,
 		channel:       ch,
 		nextSeq:       1,
+		oldestSeq:     1,
 		expectSeq:     1,
 		pending:       make([]pendingFrame, cfg.WindowSize),
 		peerWindow:    initPeerWindow,
@@ -277,22 +283,32 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 
 	freed := 0 // accumulated event count (not frame count) freed this call
 
-	// Free all frames with seq < ackSeq (cumulative ACK).
-	// AckSeq == expectSeq on the receiver, meaning "next expected is AckSeq",
-	// so all seq < AckSeq have been received in-order.
-	// numPending tracks events; iterate by seq (frames) but accumulate evtCount.
+	// Cumulative ACK: walk only [oldestSeq, ackSeq) using ring arithmetic.
+	// AckSeq == expectSeq on the receiver ("next expected is AckSeq"), so
+	// all frames with seq < ackSeq have been received in-order.
+	//
+	// The walk is O(freed frames) instead of O(cfg.WindowSize).  At high
+	// frame rates — e.g. one ACK per frame at 100 K frames/sec with a 4096-
+	// entry window — the old O(4096) scan consumed ~400 M pointer reads/sec;
+	// the new walk touches only the actually-freed slots.
 	ringSize := uint32(len(rs.pending))
-	// Compute the oldest in-flight seq: frames are stored starting at
-	// (nextSeq - numFramesInFlight), but numPending is in events so we scan
-	// the whole ring for used+seq<ackSeq entries.
-	for i := range rs.pending {
-		slot := &rs.pending[i]
-		if !slot.used || slot.seq >= ackSeq {
-			continue
+	for seq := rs.oldestSeq; seq < ackSeq; seq++ {
+		slot := &rs.pending[seq%ringSize]
+		if slot.used && slot.seq == seq {
+			freed += slot.evtCount
+			slot.used = false
+			slot.frame = nil
 		}
-		freed += slot.evtCount
-		slot.used = false
-		slot.frame = nil
+	}
+	dbg("reliable: onAck cumulative freed",
+		"channel_id",   rs.channel.id,
+		"oldest_seq",   rs.oldestSeq,
+		"ack_seq",      ackSeq,
+		"freed_events", freed,
+	)
+	// Only advance oldestSeq forward; ignore stale ACKs (ackSeq ≤ oldestSeq).
+	if ackSeq > rs.oldestSeq {
+		rs.oldestSeq = ackSeq
 	}
 
 	// Free SACK-indicated frames (selective ACK beyond cumulative).
@@ -385,11 +401,17 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 
 // earliestPendingLocked returns the pending frame with the smallest sentAt.
 // Must be called with sendMu held.
+//
+// Scans [oldestSeq, nextSeq) using ring arithmetic — O(numInFlight frames)
+// rather than O(cfg.WindowSize).  Because oldestSeq advances on every
+// cumulative ACK, the hot path (one ACK per frame) touches only the
+// newly-freed slot(s), making retransmit-timer rearming nearly free.
 func (rs *reliableState) earliestPendingLocked() *pendingFrame {
 	var earliest *pendingFrame
-	for i := range rs.pending {
-		p := &rs.pending[i]
-		if p.used && (earliest == nil || p.sentAt.Before(earliest.sentAt)) {
+	ringSize := uint32(len(rs.pending))
+	for seq := rs.oldestSeq; seq < rs.nextSeq; seq++ {
+		p := &rs.pending[seq%ringSize]
+		if p.used && p.seq == seq && (earliest == nil || p.sentAt.Before(earliest.sentAt)) {
 			earliest = p
 		}
 	}
@@ -820,6 +842,7 @@ func (rs *reliableState) reset() {
 	}
 	rs.numPending = 0
 	rs.nextSeq = 1
+	rs.oldestSeq = 1
 	rs.peerWindow = rs.cfg.WindowSize
 	rs.rto = rs.cfg.BaseRTO
 	rs.retransmits.Store(0)

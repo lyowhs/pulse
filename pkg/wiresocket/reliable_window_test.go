@@ -19,6 +19,7 @@ package wiresocket
 
 import (
 	"testing"
+	"time"
 )
 
 // TestOnAckWindowNotDecreaseOnSameAckSeq is the primary regression test for
@@ -148,5 +149,204 @@ func TestOnAckLastWindowAckSeqMonotonic(t *testing.T) {
 			t.Errorf("onAck(ackSeq=%d, window=%d): lastWindowAckSeq=%d, want %d",
 				step.ackSeq, step.window, got, step.wantLastAckSeq)
 		}
+	}
+}
+
+// ── Item 2: oldestSeq tracking (O(freed) scan in onAck / earliestPendingLocked) ──
+
+// TestOnAckOldestSeqAdvances verifies that oldestSeq is updated to ackSeq on
+// every cumulative ACK so that subsequent scans start from the correct lower
+// bound.
+func TestOnAckOldestSeqAdvances(t *testing.T) {
+	t.Parallel()
+
+	_, rs := makeTestChannelWithCfg(64, ReliableCfg{
+		WindowSize: 16,
+		BaseRTO:    time.Hour, // prevent timer fires
+		ACKDelay:   0,
+	})
+
+	// Verify initial state.
+	if rs.oldestSeq != 1 {
+		t.Fatalf("initial oldestSeq=%d, want 1", rs.oldestSeq)
+	}
+
+	// Inject 4 pending frames manually (seq 1..4).
+	rs.sendMu.Lock()
+	for seq := uint32(1); seq <= 4; seq++ {
+		slot := &rs.pending[seq%uint32(len(rs.pending))]
+		slot.seq = seq
+		slot.used = true
+		slot.evtCount = 1
+		slot.sentAt = time.Now()
+		slot.frame = &Frame{ChannelId: 0, Seq: seq, Events: []*Event{{Type: 1}}}
+	}
+	rs.nextSeq = 5
+	rs.numPending = 4
+	rs.rtoRunning = true
+	rs.rtoTimer = time.AfterFunc(time.Hour, func() {}) // dummy; won't fire
+	rs.sendMu.Unlock()
+
+	// ACK frames 1 and 2 (ackSeq=3 means seq 1,2 received).
+	rs.onAck(3, 0, 16)
+	if rs.oldestSeq != 3 {
+		t.Errorf("after onAck(3): oldestSeq=%d, want 3", rs.oldestSeq)
+	}
+	if rs.numPending != 2 {
+		t.Errorf("after onAck(3): numPending=%d, want 2", rs.numPending)
+	}
+
+	// ACK frames 3 and 4 (ackSeq=5).
+	rs.onAck(5, 0, 16)
+	if rs.oldestSeq != 5 {
+		t.Errorf("after onAck(5): oldestSeq=%d, want 5", rs.oldestSeq)
+	}
+	if rs.numPending != 0 {
+		t.Errorf("after onAck(5): numPending=%d, want 0", rs.numPending)
+	}
+}
+
+// TestOnAckStaleAckDoesNotRewindOldestSeq ensures that a stale cumulative ACK
+// (ackSeq ≤ oldestSeq) does not rewind oldestSeq back, which would cause
+// onAck's [oldestSeq, ackSeq) loop to scan a zero-length range or, worse, wrap.
+func TestOnAckStaleAckDoesNotRewindOldestSeq(t *testing.T) {
+	t.Parallel()
+
+	_, rs := makeTestChannelWithCfg(32, ReliableCfg{
+		WindowSize: 8,
+		BaseRTO:    time.Hour,
+		ACKDelay:   0,
+	})
+
+	// Advance oldestSeq to 5 via a legitimate ACK.
+	rs.onAck(5, 0, 8)
+	if rs.oldestSeq != 5 {
+		t.Fatalf("setup: oldestSeq=%d, want 5", rs.oldestSeq)
+	}
+
+	// Send a stale ACK: ackSeq=3 < oldestSeq=5.
+	rs.onAck(3, 0, 8)
+	if rs.oldestSeq != 5 {
+		t.Errorf("stale onAck(3): oldestSeq=%d, want 5 (must not rewind)", rs.oldestSeq)
+	}
+}
+
+// TestEarliestPendingLockedScansOldestToNext verifies that earliestPendingLocked
+// skips already-freed slots (those below oldestSeq) and returns the frame with
+// the earliest sentAt within [oldestSeq, nextSeq).
+func TestEarliestPendingLockedScansOldestToNext(t *testing.T) {
+	t.Parallel()
+
+	_, rs := makeTestChannelWithCfg(64, ReliableCfg{
+		WindowSize: 8,
+		BaseRTO:    time.Hour,
+		ACKDelay:   0,
+	})
+
+	now := time.Now()
+
+	// Manually insert 3 frames at seq 3, 4, 5 (simulating oldestSeq=3 after
+	// frames 1,2 were freed by an earlier ACK).
+	rs.sendMu.Lock()
+	rs.oldestSeq = 3
+	rs.nextSeq = 6
+	for i, seq := range []uint32{3, 4, 5} {
+		slot := &rs.pending[seq%uint32(len(rs.pending))]
+		slot.seq = seq
+		slot.used = true
+		slot.evtCount = 1
+		slot.sentAt = now.Add(time.Duration(i) * time.Millisecond) // seq 3 is oldest
+	}
+	rs.numPending = 3
+
+	earliest := rs.earliestPendingLocked()
+	rs.sendMu.Unlock()
+
+	if earliest == nil {
+		t.Fatal("earliestPendingLocked returned nil, want seq=3")
+	}
+	if earliest.seq != 3 {
+		t.Errorf("earliestPendingLocked returned seq=%d, want 3", earliest.seq)
+	}
+}
+
+// TestResetResetsOldestSeq verifies that reset() resets oldestSeq to 1
+// alongside nextSeq so that the [oldestSeq, nextSeq) range is correct after
+// reconnect.
+func TestResetResetsOldestSeq(t *testing.T) {
+	t.Parallel()
+
+	_, rs := makeTestChannelWithCfg(32, ReliableCfg{
+		WindowSize: 8,
+		BaseRTO:    time.Hour,
+		ACKDelay:   0,
+	})
+
+	// Advance oldestSeq via a cumulative ACK.
+	rs.onAck(7, 0, 8)
+	if rs.oldestSeq != 7 {
+		t.Fatalf("setup: oldestSeq=%d, want 7", rs.oldestSeq)
+	}
+
+	rs.reset()
+
+	rs.sendMu.Lock()
+	gotOldest := rs.oldestSeq
+	gotNext := rs.nextSeq
+	rs.sendMu.Unlock()
+
+	if gotOldest != 1 {
+		t.Errorf("after reset: oldestSeq=%d, want 1", gotOldest)
+	}
+	if gotNext != 1 {
+		t.Errorf("after reset: nextSeq=%d, want 1", gotNext)
+	}
+}
+
+// BenchmarkOnAckSmallStep measures the cost of onAck when only one frame is
+// freed per call (the common case at high frame rates).  With oldestSeq
+// tracking the loop walks exactly 1 slot instead of the full ring.
+func BenchmarkOnAckSmallStep(b *testing.B) {
+	const windowSize = 4096
+	_, rs := makeTestChannelWithCfg(windowSize+16, ReliableCfg{
+		WindowSize: windowSize,
+		BaseRTO:    time.Hour,
+		ACKDelay:   time.Hour,
+	})
+	b.ReportAllocs()
+
+	// Fill the ring with windowSize pending frames.
+	rs.sendMu.Lock()
+	for seq := uint32(1); seq <= windowSize; seq++ {
+		slot := &rs.pending[seq%uint32(len(rs.pending))]
+		slot.seq = seq
+		slot.used = true
+		slot.evtCount = 1
+		slot.sentAt = time.Now()
+	}
+	rs.nextSeq = windowSize + 1
+	rs.oldestSeq = 1
+	rs.numPending = windowSize
+	rs.rtoRunning = true
+	rs.rtoTimer = time.AfterFunc(time.Hour, func() {})
+	rs.sendMu.Unlock()
+
+	b.ResetTimer()
+	// Each iteration: ACK one frame (ackSeq advances by 1).
+	// We wrap around mod windowSize so the benchmark can run b.N iterations.
+	seq := uint32(1)
+	for i := 0; i < b.N; i++ {
+		next := seq + 1
+		rs.onAck(next, 0, uint32(windowSize))
+		// Re-insert the freed slot so numPending doesn't drop to 0.
+		rs.sendMu.Lock()
+		slot := &rs.pending[seq%uint32(len(rs.pending))]
+		slot.seq = seq
+		slot.used = true
+		slot.evtCount = 1
+		slot.sentAt = time.Now()
+		rs.numPending++
+		rs.sendMu.Unlock()
+		seq = ((seq - 1 + 1) % uint32(windowSize)) + 1
 	}
 }

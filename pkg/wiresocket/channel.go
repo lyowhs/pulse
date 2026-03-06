@@ -110,7 +110,12 @@ func (ch *Channel) SetReliable(cfg ReliableCfg) {
 // When reliable mode is active (SetReliable was called), Send may block until
 // the remote peer's receive window has space.
 func (ch *Channel) Send(ctx context.Context, e *Event) error {
-	if c := ch.conn.coalescer; c != nil {
+	// Use the coalescer when it is configured AND the event is small enough
+	// that it may be batched with other events.  When a single event fills
+	// an entire frame (evtWire + frameHeaderBudget >= maxFrameBytes), the
+	// coalescer would flush immediately without batching anything, so we
+	// bypass it to avoid 2 extra goroutine context switches per send.
+	if c := ch.conn.coalescer; c != nil && !c.fillsPacket(e) {
 		select {
 		case <-ch.done:
 			return ErrChannelClosed
@@ -122,6 +127,10 @@ func (ch *Channel) Send(ctx context.Context, e *Event) error {
 		}
 		dbg("channel send (coalesced)", "channel_id", ch.id, "event_type", e.Type)
 		return c.push(ctx, ch.id, e)
+	}
+	if ch.conn.coalescer != nil {
+		dbg("channel send (coalescer bypass: event fills packet)",
+			"channel_id", ch.id, "event_type", e.Type, "payload_len", len(e.Payload))
 	}
 	for {
 		select {

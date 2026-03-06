@@ -6,9 +6,18 @@ import (
 	"time"
 )
 
-// coalesceInputBuf is the number of events buffered in the coalescer's input
-// channel.  Deep enough to absorb bursts without back-pressure.
-const coalesceInputBuf = 4096
+const (
+	// coalesceInputBuf is the number of events buffered in the coalescer's input
+	// channel.  Deep enough to absorb bursts without back-pressure.
+	coalesceInputBuf = 4096
+
+	// frameHeaderBudget is the conservative byte budget reserved for per-frame
+	// wire fields: ChannelId(2) + Seq(5) + AckSeq(5) + AckBitmap(9) +
+	// WindowSize(5) = 26 bytes actual; 32 for a safety margin.
+	// This constant is shared by addItem (flush threshold) and fillsPacket
+	// (coalescer-bypass predicate) to guarantee they use identical logic.
+	frameHeaderBudget = 32
+)
 
 // coalescer batches outgoing events across all channels of a Conn and flushes
 // them as single encrypted frames via sess.send.
@@ -108,6 +117,28 @@ func (c *coalescer) flush(ctx context.Context) {
 	case <-ctx.Done():
 	case <-c.conn.done:
 	}
+}
+
+// fillsPacket reports whether a single event fills or exceeds the per-frame
+// byte budget, making coalescing futile.  When true, Channel.Send bypasses
+// the coalescer goroutine entirely, sending the event on the direct path.
+// This eliminates 2 goroutine context switches per large-event send.
+//
+// The predicate mirrors addItem's flush condition: if a single event already
+// satisfies the flush threshold, adding it to the coalescer would immediately
+// produce a full frame anyway — no other events would be coalesced with it.
+func (c *coalescer) fillsPacket(e *Event) bool {
+	if c.maxFrameBytes <= 0 {
+		return false
+	}
+	payloadLen := len(e.Payload)
+	evtWire := payloadLen + 3 // tag(1) + varint(1) + type(1)
+	if payloadLen+1 >= 128 {  // body_len ≥ 128 → 2-byte varint
+		evtWire++
+	}
+	// Matches addItem's flush condition: pendingBytes[chId]+evtWire+frameHeaderBudget >= maxFrameBytes
+	// with pendingBytes[chId] == 0 (no previous events in this frame).
+	return evtWire+frameHeaderBudget >= c.maxFrameBytes
 }
 
 // push enqueues an event for coalesced delivery.  It blocks only when the
@@ -224,10 +255,7 @@ func (c *coalescer) run() {
 			pendingBytes[chId] += evtWire
 			// Flush when the current frame is large enough that adding one more
 			// event of the same size (plus frame-level header fields) would
-			// exceed maxFrameBytes.  frameHeaderBudget reserves space for
-			// ChannelId(2) + Seq(5) + AckSeq(5) + AckBitmap(9) + WindowSize(5) = 26
-			// bytes; 32 gives a conservative safety margin.
-			const frameHeaderBudget = 32
+			// exceed maxFrameBytes.
 			if pendingBytes[chId]+evtWire+frameHeaderBudget >= c.maxFrameBytes {
 				return chId, true
 			}
