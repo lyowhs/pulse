@@ -271,6 +271,47 @@ func (ch *Channel) Close() error {
 	return nil
 }
 
+// NumPending returns the number of sent frames awaiting ACK on this channel.
+// Returns 0 if reliable mode is not enabled.
+func (ch *Channel) NumPending() int32 {
+	rs := ch.reliable.Load()
+	if rs == nil {
+		return 0
+	}
+	return rs.numPendingFast.Load()
+}
+
+// RingLen returns the number of received events waiting in the channel's
+// receive buffer (not yet consumed by Recv/PopEvent).
+func (ch *Channel) RingLen() int { return ch.ring.Len() }
+
+// NextSeq returns the next sequence number that will be assigned by preSend.
+// (nextSeq - 1) equals the total number of reliable frames sent on this channel.
+// Returns 0 if reliable mode is not enabled.
+func (ch *Channel) NextSeq() uint32 {
+	rs := ch.reliable.Load()
+	if rs == nil {
+		return 0
+	}
+	rs.sendMu.Lock()
+	seq := rs.nextSeq
+	rs.sendMu.Unlock()
+	return seq
+}
+
+// ExpectSeq returns the next in-order sequence number the receive side expects.
+// Returns 0 if reliable mode is not enabled.
+func (ch *Channel) ExpectSeq() uint32 {
+	rs := ch.reliable.Load()
+	if rs == nil {
+		return 0
+	}
+	rs.recvMu.Lock()
+	seq := rs.expectSeq
+	rs.recvMu.Unlock()
+	return seq
+}
+
 // Retransmits returns the cumulative number of frame retransmit events on this
 // channel since it was created.  Returns 0 if reliable mode is not enabled.
 func (ch *Channel) Retransmits() int64 {

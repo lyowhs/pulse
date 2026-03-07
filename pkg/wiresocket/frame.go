@@ -57,7 +57,7 @@ type Frame struct {
 //	[field-1 LEN event-body]...       where event-body = [type(1)][payload...]
 //	[field-2 varint Seq]              omitted when Seq == 0
 //	[field-3 varint AckSeq]           omitted when AckSeq == 0
-//	[field-4 I64 AckBitmap]           omitted when AckBitmap == 0
+//	[field-4 varint AckBitmap]         omitted when AckBitmap == 0
 //	[field-5 varint WindowSize]       omitted when WindowSize == 0
 func (f *Frame) AppendMarshal(dst []byte) []byte {
 	dst = append(dst, byte(f.ChannelId), byte(f.ChannelId>>8))
@@ -77,17 +77,8 @@ func (f *Frame) AppendMarshal(dst []byte) []byte {
 		dst = appendVarint(dst, uint64(f.AckSeq))
 	}
 	if f.AckBitmap != 0 {
-		dst = appendVarint(dst, 0x21) // field 4, wire type 1 (I64)
-		dst = append(dst,
-			byte(f.AckBitmap),
-			byte(f.AckBitmap>>8),
-			byte(f.AckBitmap>>16),
-			byte(f.AckBitmap>>24),
-			byte(f.AckBitmap>>32),
-			byte(f.AckBitmap>>40),
-			byte(f.AckBitmap>>48),
-			byte(f.AckBitmap>>56),
-		)
+		dst = appendVarint(dst, 0x20) // field 4, wire type 0 (varint)
+		dst = appendVarint(dst, f.AckBitmap)
 	}
 	if f.WindowSize != 0 {
 		dst = appendVarint(dst, 0x28) // field 5, wire type 0 (varint)
@@ -119,7 +110,8 @@ func (f *Frame) wireSize() int {
 		n += varintSize(uint64(f.AckSeq))
 	}
 	if f.AckBitmap != 0 {
-		n += 9 // tag 0x21 (1 byte) + I64 (8 bytes)
+		n++ // tag 0x20 (1 byte)
+		n += varintSize(f.AckBitmap)
 	}
 	if f.WindowSize != 0 {
 		n++ // tag 0x28
@@ -207,7 +199,7 @@ func UnmarshalFrame(b []byte) (*Frame, error) {
 			f.Seq = uint32(val)
 		case field == 3 && wt == 0:
 			f.AckSeq = uint32(val)
-		case field == 4 && wt == 1:
+		case field == 4 && wt == 0:
 			f.AckBitmap = val
 		case field == 5 && wt == 0:
 			f.WindowSize = uint32(val)

@@ -7,6 +7,7 @@ import (
 	"math/bits"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -209,10 +210,11 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
+	var echo echoState
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
 		Addr:                addr,
 		PrivateKey:          kp.Private,
-		OnConnect:           makeEchoConn(reliable),
+		OnConnect:           makeEchoConn(reliable, &echo),
 		MaxPacketSize:       mtu,
 		CoalesceInterval:    coalesce,
 		MaxEventPayloadSize: payloadSize,
@@ -376,7 +378,9 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	// reach the server.  Flush does not close the connection, so the receiver
 	// goroutine continues running and can receive the echoes.
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	flushStart := time.Now()
 	conn.Flush(flushCtx)
+	flushDur := time.Since(flushStart)
 	flushCancel()
 
 	// Wait for all in-flight echoes to return before closing the connection.
@@ -390,9 +394,65 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	// Unreliable mode: some echoes may be genuinely lost; a fixed drain window
 	// is used to avoid waiting forever.
 	if reliable {
-		drainDeadline := time.Now().Add(10 * time.Second)
+		sessCallsAtFlush := wiresocket.DebugSessionReceiveCalls.Load()
+		drainStart := time.Now()
+		srvNumPending := int32(0)
+		srvRingLen := 0
+		srvRecv := int64(0)
+		srvSent := int64(0)
+		if echo.ch != nil {
+			srvNumPending = echo.ch.NumPending()
+			srvRingLen = echo.ch.RingLen()
+			srvRecv = echo.recvCount.Load()
+			srvSent = echo.sendCount.Load()
+		}
+		fmt.Fprintf(os.Stderr, "  [drain0] rxMsgs=%d txAtStop=%d evtDelivered=%d cli(numPending=%d ringLen=%d) srv(numPending=%d ringLen=%d echoRecv=%d echoSent=%d) flushDur=%s retxFired=%d retxSent=%d rtoArmed=%d rtoStopped=%d reset=%d preSendBlocked=%d coalPreSendFailed=%d coalSendFailed=%d\n",
+			rxMsgs.Load(), txAtStop,
+			wiresocket.DebugEventsDelivered.Load(),
+			ch.NumPending(), ch.RingLen(),
+			srvNumPending, srvRingLen, srvRecv, srvSent,
+			flushDur.Round(time.Millisecond),
+			wiresocket.DebugRetransmitFired.Load(),
+			wiresocket.DebugRetransmitSent.Load(),
+			wiresocket.DebugRTOTimerArmed.Load(),
+			wiresocket.DebugRTOTimerStopped.Load(),
+			wiresocket.DebugReliableReset.Load(),
+			wiresocket.DebugPreSendBlocked.Load(),
+			wiresocket.DebugCoalescerPreSendFailed.Load(),
+			wiresocket.DebugCoalescerSendFailed.Load())
+		drainDeadline := drainStart.Add(10 * time.Second)
+		lastRx := rxMsgs.Load()
+		lastCheck := time.Now()
+		goroutineDumped := false
 		for rxMsgs.Load() < txAtStop && time.Now().Before(drainDeadline) {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
+			curRx := rxMsgs.Load()
+			if curRx != lastRx || time.Since(lastCheck) > 2*time.Second {
+				srvNP := int32(0)
+				srvRL := 0
+				if echo.ch != nil {
+					srvNP = echo.ch.NumPending()
+					srvRL = echo.ch.RingLen()
+				}
+				fmt.Fprintf(os.Stderr, "  [drain] t+%.2fs rxMsgs=%d (+%d) cli(np=%d rl=%d) srv(np=%d rl=%d) sessRecv=%d retxFired=%d retxSent=%d rtoArmed=%d rtoStopped=%d reset=%d\n",
+					time.Since(drainStart).Seconds(), curRx, curRx-lastRx,
+					ch.NumPending(), ch.RingLen(), srvNP, srvRL,
+					wiresocket.DebugSessionReceiveCalls.Load()-sessCallsAtFlush,
+					wiresocket.DebugRetransmitFired.Load(),
+					wiresocket.DebugRetransmitSent.Load(),
+					wiresocket.DebugRTOTimerArmed.Load(),
+					wiresocket.DebugRTOTimerStopped.Load(),
+					wiresocket.DebugReliableReset.Load())
+				lastRx = curRx
+				lastCheck = time.Now()
+			}
+			// After 5 s of no progress, dump all goroutines to stderr once.
+			if !goroutineDumped && curRx == rxMsgs.Load() && time.Since(drainStart) > 5*time.Second {
+				goroutineDumped = true
+				buf := make([]byte, 1<<20)
+				n := runtime.Stack(buf, true)
+				fmt.Fprintf(os.Stderr, "  [goroutine dump at t+%.2fs]\n%s\n", time.Since(drainStart).Seconds(), buf[:n])
+			}
 		}
 	} else {
 		drainWait := 10 * coalesce
@@ -440,6 +500,49 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		if dropped := wiresocket.DebugWorkerQueueFull.Load(); dropped != 0 {
 			fmt.Fprintf(os.Stderr, "  [diag] workerQueueFull=%d\n", dropped)
 		}
+		if dropped := wiresocket.DebugRingDropped.Load(); dropped != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] ringDropped=%d\n", dropped)
+		}
+		if dropped := wiresocket.DebugOOOTooFar.Load(); dropped != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] oooTooFar=%d\n", dropped)
+		}
+		if n := wiresocket.DebugProbesFired.Load(); n != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] probesFired=%d\n", n)
+		}
+		if n := wiresocket.DebugOnAckNoUnblock.Load(); n != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] onAckNoUnblock=%d\n", n)
+		}
+		if n := wiresocket.DebugPreSendBlocked.Load(); n != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] preSendBlocked=%d\n", n)
+		}
+		fmt.Fprintf(os.Stderr, "  [diag] eventsDelivered=%d onRecvInOrder=%d onRecvDuplicate=%d\n",
+			wiresocket.DebugEventsDelivered.Load(),
+			wiresocket.DebugOnRecvInOrder.Load(),
+			wiresocket.DebugOnRecvDuplicate.Load())
+		fmt.Fprintf(os.Stderr, "  [diag] sessReceiveCalls=%d replayRejected=%d\n",
+			wiresocket.DebugSessionReceiveCalls.Load(),
+			wiresocket.DebugReplayRejected.Load())
+		fmt.Fprintf(os.Stderr, "  [diag] retxFired=%d batchEmpty=%d retxSent=%d sendErr=%d retxInFlight=%d retxSessNil=%d retxNoPending=%d epochAbort=%d rearmSkipped=%d\n",
+			wiresocket.DebugRetransmitFired.Load(),
+			wiresocket.DebugRetransmitBatchEmpty.Load(),
+			wiresocket.DebugRetransmitSent.Load(),
+			wiresocket.DebugRetransmitSendErr.Load(),
+			wiresocket.DebugRetransmitInFlight.Load(),
+			wiresocket.DebugRetransmitSessNil.Load(),
+			wiresocket.DebugRetransmitNumPendingZero.Load(),
+			wiresocket.DebugRetransmitEpochAbort.Load(),
+			wiresocket.DebugRetransmitRearmSkipped.Load())
+		fmt.Fprintf(os.Stderr, "  [diag] rtoArmed=%d rtoStopped=%d reliableReset=%d\n",
+			wiresocket.DebugRTOTimerArmed.Load(),
+			wiresocket.DebugRTOTimerStopped.Load(),
+			wiresocket.DebugReliableReset.Load())
+		fmt.Fprintf(os.Stderr, "  [diag] probesFired=%d workerQueueFull=%d flushLoopErrors=%d\n",
+			wiresocket.DebugProbesFired.Load(),
+			wiresocket.DebugWorkerQueueFull.Load(),
+			wiresocket.DebugFlushLoopErrors.Load())
+		fmt.Fprintf(os.Stderr, "  [diag] coalPreSendFailed=%d coalSendFailed=%d\n",
+			wiresocket.DebugCoalescerPreSendFailed.Load(),
+			wiresocket.DebugCoalescerSendFailed.Load())
 	}
 
 	secs := dur.Seconds()

@@ -141,6 +141,23 @@ func (c *coalescer) fillsPacket(e *Event) bool {
 	return evtWire+frameHeaderBudget >= c.maxFrameBytes
 }
 
+// pipelineIdle reports whether all channels with pending events have empty
+// reliable send pipelines (i.e. no frames are currently in-flight waiting for
+// ACK).  For unreliable channels (rs == nil) the pipeline is always idle.
+// Called lock-free from the coalescer goroutine; reads numPendingFast atomically.
+func (c *coalescer) pipelineIdle(pending map[uint16][]*Event) bool {
+	for chId := range pending {
+		if v, ok := c.conn.channelMap.Load(chId); ok {
+			if rs := v.(*Channel).reliable.Load(); rs != nil {
+				if rs.numPendingFast.Load() > 0 {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
 // push enqueues an event for coalesced delivery.  It blocks only when the
 // input buffer is full (natural back-pressure).
 func (c *coalescer) push(ctx context.Context, channelId uint16, e *Event) error {
@@ -187,6 +204,7 @@ func (c *coalescer) run() {
 			if err := rs.preSend(frame, nil); err != nil {
 				dbg("coalescer: reliable preSend failed, dropping events",
 					"channel_id", chId, "count", len(events), "err", err)
+				DebugCoalescerPreSendFailed.Add(int64(len(events)))
 				return
 			}
 		} else {
@@ -198,6 +216,7 @@ func (c *coalescer) run() {
 		if err := sess.send(frame); err != nil {
 			dbg("coalescer: send failed, dropping events",
 				"channel_id", chId, "count", len(events), "err", err)
+			DebugCoalescerSendFailed.Add(int64(len(events)))
 		}
 
 		if rs == nil {
@@ -372,13 +391,23 @@ func (c *coalescer) run() {
 				}
 				stopTimer()
 			} else if timerC == nil {
-				// Arm the one-shot flush timer on the first item of a new batch.
-				if timer == nil {
-					timer = time.NewTimer(c.interval)
+				// Nagle-equivalent: if all pending channels' send pipelines are
+				// idle (no unACKed frames in-flight), flush immediately to
+				// minimise latency.  When in-flight frames exist, arm the timer
+				// to coalesce more events into the same batch before flushing.
+				if c.pipelineIdle(pending) {
+					if sess := getSession(); sess != nil {
+						flushAll(sess)
+					}
 				} else {
-					timer.Reset(c.interval)
+					// Arm the one-shot flush timer on the first item of a new batch.
+					if timer == nil {
+						timer = time.NewTimer(c.interval)
+					} else {
+						timer.Reset(c.interval)
+					}
+					timerC = timer.C
 				}
-				timerC = timer.C
 			}
 
 		case <-timerC:

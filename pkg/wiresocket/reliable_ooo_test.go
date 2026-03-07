@@ -203,8 +203,10 @@ func TestReliableOOOCircularBufferWrap(t *testing.T) {
 	ch, rs := makeTestChannel(N + 16)
 
 	// Round 1: buffer frames 2..N+1 OOO, then deliver frame 1.
-	// Delivering frame 1 triggers N advances of oooHead:
-	//   0→1→2→…→N-1→(N%N=0), so oooHead wraps back to 0.
+	// Delivering frame 1 triggers N+1 advances of oooHead:
+	//   N advances for the N OOO frames drained, plus 1 for the nil
+	//   termination (the loop always advances before checking nil).
+	//   Result: (0 + N+1) % N = 1.
 	for seq := uint32(2); seq <= uint32(N)+1; seq++ {
 		rs.onRecv(seq, makeOOOFrame(seq))
 	}
@@ -223,12 +225,14 @@ func TestReliableOOOCircularBufferWrap(t *testing.T) {
 		}
 	}
 
-	// Confirm oooHead wrapped back to 0.
+	// Confirm oooHead is at 1 (= (N+1) % N): N advances for OOO drains
+	// plus 1 for the nil-termination advance.
 	rs.recvMu.Lock()
 	gotHead := rs.oooHead
 	rs.recvMu.Unlock()
-	if gotHead != 0 {
-		t.Errorf("after round 1 full drain: oooHead=%d, want 0", gotHead)
+	wantHead := (N + 1) % N
+	if gotHead != wantHead {
+		t.Errorf("after round 1 full drain: oooHead=%d, want %d", gotHead, wantHead)
 	}
 
 	// Round 2: base = N+2 (current expectSeq after round 1).

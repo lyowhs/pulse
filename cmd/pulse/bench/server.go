@@ -73,7 +73,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	srvCfg := wiresocket.ServerConfig{
 		Addr:             addr,
 		PrivateKey:       privKey,
-		OnConnect:        makeEchoConn(reliable),
+		OnConnect:        makeEchoConn(reliable, nil),
 		MaxPacketSize:    mtu,
 		CoalesceInterval: coalesce,
 		AllowedPeers:     allowedPeers,

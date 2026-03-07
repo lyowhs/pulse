@@ -21,7 +21,7 @@ const (
 	sizeHandshakeInit  = 148 // 1+3+4+32+48+28+16+16
 	sizeHandshakeResp  = 92  // 1+3+4+4+32+16+16+16
 	sizeCookieReply    = 64  // 1+3+4+24+32
-	sizeDataHeader     = 16  // 1+3+4+8  (payload follows)
+	sizeDataHeader     = 12  // 1+1+4+6  (payload follows)
 	sizeAEADTag        = 16
 	sizeKeepalive      = sizeDataHeader + sizeAEADTag // type=6, AEAD over empty payload
 	sizeDisconnect     = sizeDataHeader + sizeAEADTag // type=5, same layout as keepalive
@@ -31,8 +31,8 @@ const (
 	// when MaxPacketSize is not configured.
 	// Sized to keep the UDP datagram under 1232 bytes (IPv6 minimum path MTU
 	// of 1280 minus 40-byte IPv6 header minus 8-byte UDP header):
-	//   1232 - sizeDataHeader(16) - sizeFragmentHeader(8) - sizeAEADTag(16) = 1192
-	defaultMaxFragPayload = 1192
+	//   1232 - sizeDataHeader(12) - sizeFragmentHeader(8) - sizeAEADTag(16) = 1196
+	defaultMaxFragPayload = 1196
 
 	// defaultMaxPacketSize is the UDP datagram size implied by defaultMaxFragPayload.
 	defaultMaxPacketSize = 1232
@@ -211,12 +211,12 @@ func parseCookieReply(b []byte) (*CookieReply, error) {
 
 // DataHeader precedes an encrypted payload in a data packet.
 //
-// Wire layout (16 bytes):
+// Wire layout (12 bytes):
 //
 //	[0]    type = 4
-//	[1:4]  reserved
-//	[4:8]  receiver_index (uint32 LE)
-//	[8:16] counter (uint64 LE)
+//	[1]    flags (reserved, must be zero)
+//	[2:6]  receiver_index (uint32 LE)
+//	[6:12] counter (48-bit uint, little-endian)
 type DataHeader struct {
 	ReceiverIndex uint32
 	Counter       uint64
@@ -225,8 +225,14 @@ type DataHeader struct {
 func marshalDataHeader(idx uint32, counter uint64) []byte {
 	b := make([]byte, sizeDataHeader)
 	b[0] = typeData
-	binary.LittleEndian.PutUint32(b[4:], idx)
-	binary.LittleEndian.PutUint64(b[8:], counter)
+	b[1] = 0 // flags
+	binary.LittleEndian.PutUint32(b[2:], idx)
+	b[6] = byte(counter)
+	b[7] = byte(counter >> 8)
+	b[8] = byte(counter >> 16)
+	b[9] = byte(counter >> 24)
+	b[10] = byte(counter >> 32)
+	b[11] = byte(counter >> 40)
 	return b
 }
 
@@ -234,8 +240,10 @@ func parseDataHeader(b []byte) (DataHeader, error) {
 	if len(b) < sizeDataHeader || b[0] != typeData {
 		return DataHeader{}, errors.New("wiresocket: invalid DataHeader")
 	}
+	counter := uint64(b[6]) | uint64(b[7])<<8 | uint64(b[8])<<16 |
+		uint64(b[9])<<24 | uint64(b[10])<<32 | uint64(b[11])<<40
 	return DataHeader{
-		ReceiverIndex: binary.LittleEndian.Uint32(b[4:]),
-		Counter:       binary.LittleEndian.Uint64(b[8:]),
+		ReceiverIndex: binary.LittleEndian.Uint32(b[2:]),
+		Counter:       counter,
 	}, nil
 }

@@ -198,6 +198,9 @@ func (c *Conn) wireSession(sess *session) {
 			// Deliver to the channel's ring; drop newest on overflow.
 			if !ch.ring.push(e) {
 				dbg("conn: channel buffer full, dropping event", "channel_id", f.ChannelId)
+				DebugRingDropped.Add(1)
+			} else {
+				DebugEventsDelivered.Add(1)
 			}
 		}
 	}

@@ -251,16 +251,21 @@ func (s *session) close() {
 	})
 }
 
+// maxOnWireCounter is the exclusive upper bound on the 48-bit on-wire counter.
+// Counters 0..maxOnWireCounter-1 fit in the 6-byte data header field.
+const maxOnWireCounter = uint64(1) << 48
+
 // nextCounter atomically allocates the next send counter value.
-// If the counter wraps around at 2^64 (all nonce values exhausted), the
-// session is closed and (0, false) is returned — the caller must not send.
+// If all 48-bit counter values are exhausted (2^48 packets sent), the session
+// is closed and (0, false) is returned — the caller must not send.
 // Closing the session forces the application to re-dial, which performs a
 // fresh Noise IK handshake and establishes new transport keys.
 func (s *session) nextCounter() (uint64, bool) {
 	next := atomic.AddUint64(&s.sendCounter, 1)
-	if next == 0 {
-		dbg("send counter wrapped at 2^64, closing session to force re-handshake",
+	if next == 0 || next > maxOnWireCounter {
+		dbg("send counter exhausted, closing session to force re-handshake",
 			"local_index", s.localIndex,
+			"counter", next,
 		)
 		s.close()
 		return 0, false
@@ -354,9 +359,14 @@ func (s *session) send(frame *Frame) error {
 
 	// Write the data header in-place into the placeholder region.
 	buf[0] = typeData
-	buf[1], buf[2], buf[3] = 0, 0, 0
-	binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
-	binary.LittleEndian.PutUint64(buf[8:], counter)
+	buf[1] = 0 // flags
+	binary.LittleEndian.PutUint32(buf[2:], s.remoteIndex)
+	buf[6] = byte(counter)
+	buf[7] = byte(counter >> 8)
+	buf[8] = byte(counter >> 16)
+	buf[9] = byte(counter >> 24)
+	buf[10] = byte(counter >> 32)
+	buf[11] = byte(counter >> 40)
 
 	// Seal appends ciphertext to buf[:sizeDataHeader].  Because plain is a
 	// sub-slice of the same backing array and ChaCha20 is a stream cipher,
@@ -507,9 +517,14 @@ func (s *session) sendFragments(plain []byte) error {
 
 		// Data header.
 		buf[0] = typeDataFragment
-		buf[1], buf[2], buf[3] = 0, 0, 0
-		binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
-		binary.LittleEndian.PutUint64(buf[8:], counter)
+		buf[1] = 0 // flags
+		binary.LittleEndian.PutUint32(buf[2:], s.remoteIndex)
+		buf[6] = byte(counter)
+		buf[7] = byte(counter >> 8)
+		buf[8] = byte(counter >> 16)
+		buf[9] = byte(counter >> 24)
+		buf[10] = byte(counter >> 32)
+		buf[11] = byte(counter >> 40)
 
 		// Fragment header: [frame_id(4)][frag_index(2)][frag_count(2)].
 		binary.LittleEndian.PutUint32(buf[sizeDataHeader:], frameID)
@@ -571,9 +586,14 @@ func (s *session) sendKeepalive() error {
 	bp := getSendBuf(sizeKeepalive)
 	buf := (*bp)[:sizeDataHeader]
 	buf[0] = typeKeepalive
-	buf[1], buf[2], buf[3] = 0, 0, 0
-	binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
-	binary.LittleEndian.PutUint64(buf[8:], counter)
+	buf[1] = 0 // flags
+	binary.LittleEndian.PutUint32(buf[2:], s.remoteIndex)
+	buf[6] = byte(counter)
+	buf[7] = byte(counter >> 8)
+	buf[8] = byte(counter >> 16)
+	buf[9] = byte(counter >> 24)
+	buf[10] = byte(counter >> 32)
+	buf[11] = byte(counter >> 40)
 
 	var nonce [12]byte
 	binary.LittleEndian.PutUint64(nonce[4:], counter)
@@ -604,7 +624,8 @@ func (s *session) receiveKeepalive(b []byte) bool {
 		dbg("recv: keepalive packet too short", "local_index", s.localIndex, "len", len(b))
 		return false
 	}
-	counter := binary.LittleEndian.Uint64(b[8:])
+	counter := uint64(b[6]) | uint64(b[7])<<8 | uint64(b[8])<<16 |
+		uint64(b[9])<<24 | uint64(b[10])<<32 | uint64(b[11])<<40
 	if !s.replay.check(counter) {
 		dbg("recv: keepalive replay rejected", "local_index", s.localIndex, "counter", counter)
 		return false
@@ -635,9 +656,14 @@ func (s *session) sendDisconnect() error {
 	bp := getSendBuf(sizeDisconnect)
 	buf := (*bp)[:sizeDataHeader]
 	buf[0] = typeDisconnect
-	buf[1], buf[2], buf[3] = 0, 0, 0
-	binary.LittleEndian.PutUint32(buf[4:], s.remoteIndex)
-	binary.LittleEndian.PutUint64(buf[8:], counter)
+	buf[1] = 0 // flags
+	binary.LittleEndian.PutUint32(buf[2:], s.remoteIndex)
+	buf[6] = byte(counter)
+	buf[7] = byte(counter >> 8)
+	buf[8] = byte(counter >> 16)
+	buf[9] = byte(counter >> 24)
+	buf[10] = byte(counter >> 32)
+	buf[11] = byte(counter >> 40)
 
 	var nonce [12]byte
 	binary.LittleEndian.PutUint64(nonce[4:], counter)
@@ -671,12 +697,14 @@ func (s *session) sendDisconnect() error {
 // b is the full UDP payload including the 16-byte DataHeader.
 // Returns false if the packet should be silently dropped (replay, bad tag, etc.).
 func (s *session) receive(b []byte) bool {
+	DebugSessionReceiveCalls.Add(1)
 	hdr, err := parseDataHeader(b)
 	if err != nil {
 		dbg("recv: bad data header", "local_index", s.localIndex, "err", err)
 		return false
 	}
 	if !s.replay.check(hdr.Counter) {
+		DebugReplayRejected.Add(1)
 		dbg("recv: replay rejected", "local_index", s.localIndex, "counter", hdr.Counter)
 		return false // replay or too old
 	}
@@ -751,7 +779,8 @@ func (s *session) receiveFragment(b []byte) bool {
 		return false
 	}
 
-	counter := binary.LittleEndian.Uint64(b[8:])
+	counter := uint64(b[6]) | uint64(b[7])<<8 | uint64(b[8])<<16 |
+		uint64(b[9])<<24 | uint64(b[10])<<32 | uint64(b[11])<<40
 	if !s.replay.check(counter) {
 		dbg("recv: fragment replay rejected", "local_index", s.localIndex, "counter", counter)
 		return false

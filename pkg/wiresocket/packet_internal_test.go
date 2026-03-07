@@ -10,10 +10,11 @@ func TestMaxFragmentPayload(t *testing.T) {
 		mtu  int
 		want int
 	}{
-		{1232, 1192},  // defaultMaxPacketSize → defaultMaxFragPayload
-		{1472, 1432},  // common Ethernet MTU
-		{100, 60},     // small MTU
-		{40, 0},       // exactly at or below overhead; must not go negative
+		{1232, 1196},  // defaultMaxPacketSize → defaultMaxFragPayload
+		{1472, 1436},  // common Ethernet MTU
+		{100, 64},     // small MTU: 100 - 12 - 8 - 16 = 64
+		{40, 4},       // near-minimum: 40 - 12 - 8 - 16 = 4
+		{35, 0},       // below overhead; must not go negative
 		{1, 0},        // degenerate
 	}
 	for _, tc := range tests {
@@ -201,9 +202,11 @@ func TestCookieReplyParseTooShort(t *testing.T) {
 }
 
 // TestDataHeaderMarshalParse verifies DataHeader roundtrip.
+// The counter must fit in 48 bits (the on-wire field is 6 bytes).
 func TestDataHeaderMarshalParse(t *testing.T) {
 	const idx uint32 = 0xAABBCCDD
-	const counter uint64 = 0x0102030405060708
+	// 0x010203040506 fits in 6 bytes (≤ 2^48 - 1).
+	const counter uint64 = 0x010203040506
 
 	wire := marshalDataHeader(idx, counter)
 	if len(wire) != sizeDataHeader {
@@ -211,6 +214,10 @@ func TestDataHeaderMarshalParse(t *testing.T) {
 	}
 	if wire[0] != typeData {
 		t.Errorf("type byte = %d, want %d", wire[0], typeData)
+	}
+	// Verify receiver_index is at bytes [2:6].
+	if wire[1] != 0 {
+		t.Errorf("flags byte = %d, want 0", wire[1])
 	}
 
 	hdr, err := parseDataHeader(wire)

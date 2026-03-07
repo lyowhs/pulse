@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 
 	"github.com/spf13/cobra"
 
@@ -35,6 +36,13 @@ func Command() *cobra.Command {
 	return cmd
 }
 
+// echoState holds diagnostic state exposed by makeEchoConn to runOne.
+type echoState struct {
+	ch        *wiresocket.Channel
+	recvCount atomic.Int64 // events received by echo goroutine from client
+	sendCount atomic.Int64 // successful ch.Send calls by echo goroutine
+}
+
 // makeEchoConn returns an OnConnect handler that echoes every event received
 // on benchChannel back to the sender.  When reliable is false, the channel is
 // switched to unreliable (fire-and-forget) mode before the echo loop starts.
@@ -42,9 +50,12 @@ func Command() *cobra.Command {
 // With server-side coalescing enabled, ch.Send is non-blocking (pushes into
 // the coalescer's input buffer and returns immediately), so a simple
 // sequential recv→send loop is sufficient.
-func makeEchoConn(reliable bool) func(*wiresocket.Conn) {
+func makeEchoConn(reliable bool, state *echoState) func(*wiresocket.Conn) {
 	return func(conn *wiresocket.Conn) {
 		ch := conn.Channel(benchChannel)
+		if state != nil {
+			state.ch = ch
+		}
 		if !reliable {
 			ch.SetUnreliable()
 		}
@@ -54,8 +65,14 @@ func makeEchoConn(reliable bool) func(*wiresocket.Conn) {
 			if err != nil {
 				return
 			}
+			if state != nil {
+				state.recvCount.Add(1)
+			}
 			if err := ch.Send(ctx, e); err != nil {
 				return
+			}
+			if state != nil {
+				state.sendCount.Add(1)
 			}
 		}
 	}

@@ -99,6 +99,10 @@ type DialConfig struct {
 	// Requires at least one reliable channel on the Conn for loss feedback.
 	CongestionControl *CongestionConfig
 
+	// eventsPerPacket is set by defaults() and used when building newChannelCfg
+	// so that MinFrameCost caps in-flight frame count at ic regardless of
+	// how many events the coalescer packs per frame.
+	eventsPerPacket int
 }
 
 func (cfg *DialConfig) defaults() {
@@ -129,6 +133,21 @@ func (cfg *DialConfig) defaults() {
 	if cfg.MaxEventPayloadSize > 0 && maxFrag > 0 && cfg.MaxEventPayloadSize > maxFrag {
 		fragsPerEvent = (cfg.MaxEventPayloadSize + maxFrag - 1) / maxFrag
 	}
+	// eventsPerPacket: for single-fragment events (fragsPerEvent == 1), how
+	// many events fit in one coalesced frame.  Scaling EventBufSize by this
+	// factor allows the reliable window to hold inflightCap frames even when
+	// each frame carries multiple events (small payloads + coalescing).
+	eventsPerPacket := 1
+	if fragsPerEvent == 1 && cfg.MaxEventPayloadSize > 0 && maxFrag > frameHeaderBudget {
+		evtWire := cfg.MaxEventPayloadSize + 3 // tag(1) + varint(1) + type(1)
+		if cfg.MaxEventPayloadSize+1 >= 128 {  // body_len ≥ 128 → 2-byte varint
+			evtWire++
+		}
+		if ep := (maxFrag - frameHeaderBudget) / evtWire; ep > 1 {
+			eventsPerPacket = ep
+		}
+	}
+	cfg.eventsPerPacket = eventsPerPacket
 	// Auto-size MaxIncompleteFrames and EventBufSize from the kernel UDP socket
 	// buffer so neither becomes a bottleneck regardless of payload size.
 	if cfg.MaxIncompleteFrames == 0 || cfg.EventBufSize == 0 {
@@ -145,21 +164,21 @@ func (cfg *DialConfig) defaults() {
 			cfg.MaxIncompleteFrames = mif
 		}
 		if cfg.EventBufSize == 0 {
-			// EventBufSize controls the token/window count.  For large
-			// payloads (many fragments per event), ic can be much smaller
-			// than maxReassemblyBufs; applying the floor would allow too
-			// many events in-flight and overflow the socket buffer.
+			// EventBufSize controls the ring buffer capacity and flow-control
+			// window (in events).  For large payloads (many fragments per event),
+			// ic can be much smaller than maxReassemblyBufs; applying the floor
+			// would allow too many events in-flight and overflow the socket buffer.
 			if ic < 1 {
 				ic = 1
 			}
-			// Cap at reliableOOOWindow: the OOO receive buffer holds at most
-			// reliableOOOWindow in-flight frames.  A larger EventBufSize would
-			// allow more frames in-flight than the OOO buffer can hold, causing
-			// OOO gaps that exceed the buffer at the receiver (permanent drops).
+			// Cap in-flight frames at reliableOOOWindow.
 			if ic > reliableOOOWindow {
 				ic = reliableOOOWindow
 			}
-			cfg.EventBufSize = ic
+			// Scale EventBufSize (events) by eventsPerPacket so the flow-control
+			// window allows ic frames in-flight even when each frame carries
+			// multiple events.  With eventsPerPacket == 1 this is a no-op.
+			cfg.EventBufSize = ic * eventsPerPacket
 		}
 	}
 }
@@ -187,7 +206,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 
 		// Default the reliable window to EventBufSize so the send window is
 		// automatically bounded by the socket-buffer-derived inflight cap.
-		newChannelCfg := ReliableCfg{WindowSize: cfg.EventBufSize}
+		newChannelCfg := ReliableCfg{WindowSize: cfg.EventBufSize, MinFrameCost: cfg.eventsPerPacket}
 		// CC requires reliable with enough retries to survive rate-limited sends.
 		if cfg.CongestionControl != nil && newChannelCfg.MaxRetries < 30 {
 			newChannelCfg.MaxRetries = 30
@@ -232,7 +251,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 
 	// Non-persistent: wire the router (inside newConn) before starting the
 	// read loop so the goroutine-start happens-before makes it visible.
-	newChannelCfg := ReliableCfg{WindowSize: cfg.EventBufSize}
+	newChannelCfg := ReliableCfg{WindowSize: cfg.EventBufSize, MinFrameCost: cfg.eventsPerPacket}
 	if cfg.CongestionControl != nil && newChannelCfg.MaxRetries < 30 {
 		newChannelCfg.MaxRetries = 30
 	}

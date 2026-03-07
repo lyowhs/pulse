@@ -117,7 +117,7 @@ type ServerConfig struct {
 	// WorkChannelSize is the number of incoming packets buffered between the
 	// UDP reader goroutine and the worker pool.  If the channel is full,
 	// excess packets are silently dropped.  Defaults to
-	// max(WorkerCount*64, EventBufSize*fragsPerEvent*2+64, 4096) — sized to
+	// max(WorkerCount*64, EventBufSize*fragsPerEvent*4+256, 4096) — sized to
 	// hold the initial burst plus a concurrent retransmit burst without drops.
 	WorkChannelSize int
 }
@@ -134,6 +134,20 @@ func (cfg *ServerConfig) defaults() {
 	fragsPerEvent := 1
 	if cfg.MaxEventPayloadSize > 0 && maxFrag > 0 && cfg.MaxEventPayloadSize > maxFrag {
 		fragsPerEvent = (cfg.MaxEventPayloadSize + maxFrag - 1) / maxFrag
+	}
+	// eventsPerPacket: for single-fragment events (fragsPerEvent == 1), how
+	// many events fit in one coalesced frame.  Scaling EventBufSize by this
+	// factor allows the reliable window to hold inflightCap frames even when
+	// each frame carries multiple events (small payloads + coalescing).
+	eventsPerPacket := 1
+	if fragsPerEvent == 1 && cfg.MaxEventPayloadSize > 0 && maxFrag > frameHeaderBudget {
+		evtWire := cfg.MaxEventPayloadSize + 3 // tag(1) + varint(1) + type(1)
+		if cfg.MaxEventPayloadSize+1 >= 128 {  // body_len ≥ 128 → 2-byte varint
+			evtWire++
+		}
+		if ep := (maxFrag - frameHeaderBudget) / evtWire; ep > 1 {
+			eventsPerPacket = ep
+		}
 	}
 	// Auto-size MaxIncompleteFrames and EventBufSize from the kernel UDP socket
 	// buffer so the server never drops fragments or starve the client's send
@@ -152,24 +166,23 @@ func (cfg *ServerConfig) defaults() {
 			cfg.MaxIncompleteFrames = mif
 		}
 		if cfg.EventBufSize == 0 {
-			// EventBufSize controls the token/window count.  For large
-			// payloads (many fragments per event), ic can be much smaller
-			// than maxReassemblyBufs; applying the floor would allow too
-			// many events in-flight and overflow the socket buffer.
+			// EventBufSize controls the ring buffer capacity and flow-control
+			// window (in events).  For large payloads (many fragments per event),
+			// ic can be much smaller than maxReassemblyBufs; applying the floor
+			// would allow too many events in-flight and overflow the socket buffer.
 			if ic < 1 {
 				ic = 1
 			}
-			// Cap at reliableOOOWindow: the OOO receive buffer holds at most
-			// reliableOOOWindow in-flight frames.  A larger EventBufSize would
-			// allow more frames in-flight than the OOO buffer can hold, causing
-			// OOO gaps that exceed the buffer at the receiver (permanent drops).
-			// This situation arises on small-MTU paths where the socket buffer
-			// can fit more frames than reliableOOOWindow (e.g. MTU<768 on 4 MiB
-			// sockets: ic = 4194304*3/4/MTU > 4096 = reliableOOOWindow).
+			// Cap in-flight frames at reliableOOOWindow: the OOO receive buffer
+			// holds at most reliableOOOWindow frames.  Exceeding it causes OOO
+			// gaps that the buffer cannot absorb (permanent drops).
 			if ic > reliableOOOWindow {
 				ic = reliableOOOWindow
 			}
-			cfg.EventBufSize = ic
+			// Scale EventBufSize (events) by eventsPerPacket so the flow-control
+			// window allows ic frames in-flight even when each frame carries
+			// multiple events.  With eventsPerPacket == 1 this is a no-op.
+			cfg.EventBufSize = ic * eventsPerPacket
 		}
 	}
 	if cfg.SessionTimeout == 0 {
@@ -185,11 +198,20 @@ func (cfg *ServerConfig) defaults() {
 		cfg.WorkerCount = runtime.GOMAXPROCS(0)
 	}
 	if cfg.WorkChannelSize == 0 {
-		// Size the work channel to absorb the initial burst (EventBufSize
-		// events × fragsPerEvent fragments each) plus a concurrent retransmit
-		// burst of the same size, so that workerQueueFull drops do not occur
-		// even when worker goroutines are briefly preempted.
-		cfg.WorkChannelSize = max(cfg.WorkerCount*64, cfg.EventBufSize*fragsPerEvent*2+64, 4096)
+		// WorkChannelSize is sized in incoming UDP packets (frames), not events.
+		// Use EventBufSize directly as the worst-case frame count (1 event per
+		// frame).  Dividing by eventsPerPacket would assume the coalescer always
+		// packs the theoretical maximum events per frame, but in practice the
+		// coalescer timer fires early (e.g. 100 µs) and each frame may carry only
+		// a handful of events.  With a large MTU and small payload (e.g. 65507 /
+		// 128 B), eventsPerPacket = 495 but actual events/frame ≈ 38; the under-
+		// sized channel drops packets, causing retransmit storms and MaxRetries
+		// exhaustion.  Using EventBufSize directly gives a safe upper bound.
+		frameCount := cfg.EventBufSize
+		if frameCount < 1 {
+			frameCount = 1
+		}
+		cfg.WorkChannelSize = max(cfg.WorkerCount*64, frameCount*fragsPerEvent*4+256, 4096)
 	}
 }
 
@@ -296,6 +318,10 @@ type Server struct {
 	// maxFragPayload is the per-session fragment size computed from MaxPacketSize.
 	maxFragPayload int
 
+	// eventsPerPacket mirrors the value computed in cfg.defaults() so that
+	// per-connection newChannelCfg can set MinFrameCost correctly.
+	eventsPerPacket int
+
 	// totalSessions counts active sessions for monitoring.
 	totalSessions atomic.Int64
 
@@ -326,13 +352,29 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
 	pktSz := cfg.MaxPacketSize
+
+	// Recompute eventsPerPacket (same formula as serverConfig.defaults) so that
+	// per-connection newChannelCfg can set MinFrameCost and cap in-flight frames
+	// at ic regardless of how well the coalescer fills each frame.
+	ep := 1
+	if cfg.MaxEventPayloadSize > 0 && maxFrag > frameHeaderBudget {
+		evtWire := cfg.MaxEventPayloadSize + 3
+		if cfg.MaxEventPayloadSize+1 >= 128 {
+			evtWire++
+		}
+		if v := (maxFrag - frameHeaderBudget) / evtWire; v > 1 {
+			ep = v
+		}
+	}
+
 	s := &Server{
-		cfg:            cfg,
-		keypair:        kp,
-		cookies:        newCookieManager(kp.Public),
-		work:           make(chan incomingPacket, cfg.WorkChannelSize),
-		maxFragPayload: maxFrag,
-		pktBufPool:     sync.Pool{New: func() any { return make([]byte, pktSz) }},
+		cfg:             cfg,
+		keypair:         kp,
+		cookies:         newCookieManager(kp.Public),
+		work:            make(chan incomingPacket, cfg.WorkChannelSize),
+		maxFragPayload:  maxFrag,
+		eventsPerPacket: ep,
+		pktBufPool:      sync.Pool{New: func() any { return make([]byte, pktSz) }},
 	}
 	// Copy AllowedPeers from config into the runtime-mutable slice.
 	if len(cfg.AllowedPeers) > 0 {
@@ -563,7 +605,7 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	// Having sess.router set first ensures no events are silently dropped.
 	var conn *Conn
 	if s.cfg.OnConnect != nil {
-		newChannelCfg := ReliableCfg{WindowSize: s.cfg.EventBufSize}
+		newChannelCfg := ReliableCfg{WindowSize: s.cfg.EventBufSize, MinFrameCost: s.eventsPerPacket}
 		if s.cfg.CongestionControl != nil && newChannelCfg.MaxRetries < 30 {
 			newChannelCfg.MaxRetries = 30
 		}
@@ -682,14 +724,12 @@ func (s *Server) handleDisconnect(pkt incomingPacket) {
 	}
 
 	// Authenticate: decrypt the AEAD tag using the session's recv key.
-	counter := uint64(pkt.data[8]) |
-		uint64(pkt.data[9])<<8 |
-		uint64(pkt.data[10])<<16 |
-		uint64(pkt.data[11])<<24 |
-		uint64(pkt.data[12])<<32 |
-		uint64(pkt.data[13])<<40 |
-		uint64(pkt.data[14])<<48 |
-		uint64(pkt.data[15])<<56
+	counter := uint64(pkt.data[6]) |
+		uint64(pkt.data[7])<<8 |
+		uint64(pkt.data[8])<<16 |
+		uint64(pkt.data[9])<<24 |
+		uint64(pkt.data[10])<<32 |
+		uint64(pkt.data[11])<<40
 	if _, err := decryptAEAD(sess.recvKey, counter, nil, pkt.data[sizeDataHeader:]); err != nil {
 		dbg("server: disconnect auth failed", "receiver_index", idx, "err", err)
 		return
@@ -794,11 +834,11 @@ func (s *Server) Peers() [][32]byte {
 // parseReceiverIndex reads the receiver_index from a data-packet header
 // without allocating.
 func parseReceiverIndex(b []byte) uint32 {
-	// DataHeader layout: [type(1)][reserved(3)][receiver_index(4)]
-	if len(b) < 8 {
+	// DataHeader layout: [type(1)][flags(1)][receiver_index(4)]
+	if len(b) < 6 {
 		return 0
 	}
-	return uint32(b[4]) | uint32(b[5])<<8 | uint32(b[6])<<16 | uint32(b[7])<<24
+	return uint32(b[2]) | uint32(b[3])<<8 | uint32(b[4])<<16 | uint32(b[5])<<24
 }
 
 // pubFromPriv derives the X25519 public key from a private key.

@@ -57,6 +57,25 @@ type ReliableCfg struct {
 	// possible and sent immediately; this delay applies only when the
 	// channel has no data to send.  Default: 20 ms.
 	ACKDelay time.Duration
+
+	// MinFrameCost is the minimum number of window slots consumed by a
+	// single preSend call (one coalesced frame).  When non-zero, each frame
+	// costs max(len(frame.Events), MinFrameCost) window slots instead of
+	// just len(frame.Events).
+	//
+	// This prevents frames with few events (e.g. 1-event frames from a
+	// low-rate sender with a 100 µs coalesce interval) from consuming less
+	// window budget than a full UDP packet's worth.  Without this cap, the
+	// sender can have WindowSize × (1-event frames) in-flight simultaneously
+	// — WindowSize UDP packets — which overflows the OS socket buffer when
+	// WindowSize >> ic (the socket-buffer-derived frame cap).
+	//
+	// For auto-sized connections (EventBufSize = ic × eventsPerPacket), set
+	// MinFrameCost = eventsPerPacket.  This ensures at most ic frames are
+	// ever in-flight regardless of coalescing efficiency.
+	//
+	// 0 means no minimum (each frame costs max(len(Events), 1) slots).
+	MinFrameCost int
 }
 
 func (c *ReliableCfg) withDefaults() ReliableCfg {
@@ -96,6 +115,11 @@ type reliableState struct {
 	// ── send side ─────────────────────────────────────────────────────────
 	sendMu     sync.Mutex
 	nextSeq uint32 // next sequence number to assign (starts at 1)
+	// numPendingFast is a lock-free copy of numPending for the Nagle check in
+	// the coalescer: when 0, all sent frames have been ACKed and the coalescer
+	// can flush immediately instead of waiting for the timer.
+	// Updated under sendMu; read lock-free (atomic) by the coalescer goroutine.
+	numPendingFast atomic.Int32
 	// oldestSeq is the lower-bound sequence number of the oldest in-flight
 	// frame.  Updated to ackSeq on every cumulative ACK so that the ring-walk
 	// in onAck and earliestPendingLocked covers only [oldestSeq, ackSeq) —
@@ -110,6 +134,18 @@ type reliableState struct {
 	rtoTimer          *time.Timer
 	rtoEpoch          uint64        // incremented on every timer arm; stale goroutines self-abort
 	retransmitInFlight bool         // true while retransmit() goroutine is blocked in sess.send()
+
+	// probeRunning / probeEpoch implement the zero-window-probe mechanism.
+	// When preSend() is about to block (flow-control wait), it arms a probe
+	// timer that sends the oldest in-flight frame WITHOUT incrementing
+	// p.retries.  The probe forces the receiver to set ackDirty=true and reply
+	// with a fresh ACK, breaking the ackDirty=false deadlock that occurs when
+	// the remote ackBatcher has already sent a full-window ACK and then goes
+	// silent because no new frames arrive (preSend blocked → no new frames →
+	// ackDirty stays false → no ACK → preSend blocked forever).
+	// Protected by sendMu.
+	probeRunning bool
+	probeEpoch   uint64
 
 	// retransmits counts the total number of frame retransmit events since
 	// this reliableState was created or last reset.
@@ -165,13 +201,13 @@ type reliableState struct {
 func newReliableState(ch *Channel, cfg ReliableCfg) *reliableState {
 	cfg = cfg.withDefaults()
 	// initPeerWindow is the assumed receiver buffer before the first ACK
-	// arrives.  Cap at defaultReliableWindow so the initial burst does not
-	// exceed what a peer with a smaller window can absorb.  Once the first
-	// real ACK arrives, onAck replaces this with the peer's actual window.
+	// arrives.  We use the full cfg.WindowSize: both the sender and receiver
+	// are configured with the same EventBufSize, and the receiver ring is
+	// always rounded up to the next power of 2 (≥ cfg.WindowSize), so the
+	// initial burst of cfg.WindowSize events will never overflow the ring.
+	// Once the first real ACK arrives, onAck replaces this with the peer's
+	// actual advertised window.
 	initPeerWindow := cfg.WindowSize
-	if initPeerWindow > defaultReliableWindow {
-		initPeerWindow = defaultReliableWindow
-	}
 	rs := &reliableState{
 		cfg:           cfg,
 		channel:       ch,
@@ -181,7 +217,7 @@ func newReliableState(ch *Channel, cfg ReliableCfg) *reliableState {
 		pending:       make([]pendingFrame, cfg.WindowSize),
 		peerWindow:    initPeerWindow,
 		rto:           cfg.BaseRTO,
-		lastAdvWindow: uint32(ch.ring.Cap()), // assume full receiver capacity until first ACK
+		lastAdvWindow: uint32(cfg.WindowSize), // matches peerWindow cap in onAck on the remote side
 	}
 	rs.cond = sync.NewCond(&rs.sendMu)
 	return rs
@@ -201,6 +237,7 @@ func newAutoReliable(ch *Channel) *reliableState {
 //
 // Must be called with sendMu held.
 func (rs *reliableState) armRetransmitLocked() {
+	DebugRTOTimerArmed.Add(1)
 	if rs.rtoTimer != nil {
 		rs.rtoTimer.Stop()
 	}
@@ -233,9 +270,21 @@ func (rs *reliableState) preSend(frame *Frame, poolSF *singleEventFrame) error {
 	if evtCount == 0 {
 		evtCount = 1
 	}
+	// Apply the minimum frame cost so that frames with fewer events than
+	// eventsPerPacket still consume a full packet's worth of window budget.
+	// This prevents the sender from having more frames in-flight than the
+	// socket buffer can absorb when coalescing is poor (e.g. 1 event/frame).
+	if mc := rs.cfg.MinFrameCost; mc > evtCount {
+		evtCount = mc
+	}
 
 	rs.sendMu.Lock()
+	blocked := false
 	for rs.numPending+evtCount > rs.peerWindow {
+		if !blocked {
+			blocked = true
+			DebugPreSendBlocked.Add(1)
+		}
 		// Window full: block until the receiver ACKs events and frees space.
 		// cond.Wait atomically releases sendMu and suspends this goroutine.
 		dbg("reliable: send window full, waiting for ACK",
@@ -244,6 +293,11 @@ func (rs *reliableState) preSend(frame *Frame, poolSF *singleEventFrame) error {
 			"evt_count", evtCount,
 			"peer_window", rs.peerWindow,
 		)
+		// Arm a window probe so that if the receiver's ackBatcher is silent
+		// (ackDirty=false — it already sent a full-window ACK and no new
+		// frames have arrived since), the probe retransmits the oldest frame
+		// to solicit a fresh ACK and break the deadlock.
+		rs.armProbeLocked()
 		rs.cond.Wait()
 		// Check if the channel/conn closed while we were waiting.
 		select {
@@ -276,7 +330,7 @@ func (rs *reliableState) preSend(frame *Frame, poolSF *singleEventFrame) error {
 			rs.lastAdvWindow = frame.WindowSize
 			// Start the window watch whenever we piggyback a restricted window so
 			// the remote sender is unblocked as soon as the buffer drains.
-			if frame.WindowSize < uint32(rs.channel.ring.Cap()) {
+			if frame.WindowSize < uint32(rs.cfg.WindowSize) {
 				rs.startWindowWatchLocked()
 			}
 		}
@@ -292,6 +346,7 @@ func (rs *reliableState) preSend(frame *Frame, poolSF *singleEventFrame) error {
 	slot.used = true
 	slot.evtCount = evtCount
 	rs.numPending += evtCount
+	rs.numPendingFast.Store(int32(rs.numPending))
 
 	if !rs.rtoRunning {
 		rs.rtoRunning = true
@@ -363,6 +418,7 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 	}
 
 	rs.numPending -= freed
+	rs.numPendingFast.Store(int32(rs.numPending))
 
 	// Update peerWindow using TCP-style sequenced rules to prevent a
 	// reordered or stale ACK packet from permanently reducing the window.
@@ -406,13 +462,17 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 			"num_pending", rs.numPending,
 			"peer_window", rs.peerWindow,
 		)
+		rs.stopProbeLocked()
 		rs.cond.Broadcast()
+	} else {
+		DebugOnAckNoUnblock.Add(1)
 	}
 
 	// Re-arm or stop retransmit timer.
 	if rs.numPending == 0 {
 		if rs.rtoTimer != nil {
 			rs.rtoTimer.Stop()
+			DebugRTOTimerStopped.Add(1)
 		}
 		rs.rtoRunning = false
 	} else if freed > 0 {
@@ -483,6 +543,7 @@ func (rs *reliableState) retransmit(epoch uint64) {
 
 	// Self-abort if this goroutine belongs to a superseded timer.
 	if rs.rtoEpoch != epoch {
+		DebugRetransmitEpochAbort.Add(1)
 		rs.sendMu.Unlock()
 		return
 	}
@@ -492,15 +553,19 @@ func (rs *reliableState) retransmit(epoch uint64) {
 	// fire.  The in-flight goroutine will re-arm the timer once its send
 	// completes, using whatever rto (possibly reset by onAck) is current then.
 	if rs.retransmitInFlight {
+		DebugRetransmitInFlight.Add(1)
 		rs.sendMu.Unlock()
 		return
 	}
 
 	if rs.numPending == 0 {
+		DebugRetransmitNumPendingZero.Add(1)
 		rs.rtoRunning = false
 		rs.sendMu.Unlock()
 		return
 	}
+
+	DebugRetransmitFired.Add(1)
 
 	// Collect all pending frames whose RTO has expired (sentAt <= now - rto).
 	// Use the current rto (before doubling) as the expiry threshold.
@@ -560,6 +625,7 @@ func (rs *reliableState) retransmit(epoch uint64) {
 	}
 
 	if len(batch) == 0 {
+		DebugRetransmitBatchEmpty.Add(1)
 		// No expired frames yet — re-arm so the earliest pending frame is
 		// checked again after another rto.  armRetransmitLocked increments
 		// the epoch, so any concurrent or future timer goroutine from a
@@ -593,7 +659,12 @@ func (rs *reliableState) retransmit(epoch uint64) {
 				"seq", e.frame.Seq,
 				"rto", rs.rto,
 			)
-			_ = sess.send(e.frame)
+			DebugRetransmitSent.Add(1)
+			if err := sess.send(e.frame); err != nil {
+				DebugRetransmitSendErr.Add(1)
+			}
+		} else {
+			DebugRetransmitSessNil.Add(1)
 		}
 	}
 
@@ -619,6 +690,122 @@ func (rs *reliableState) retransmit(epoch uint64) {
 
 	if rs.numPending > 0 && rs.rtoRunning {
 		rs.armRetransmitLocked()
+	} else {
+		DebugRetransmitRearmSkipped.Add(1)
+	}
+	rs.sendMu.Unlock()
+}
+
+// ── window probe ──────────────────────────────────────────────────────────────
+
+// armProbeLocked starts the window-probe timer if not already active.
+// The probe fires after cfg.BaseRTO and either retransmits the oldest pending
+// frame (numPending > 0) or sends a deliberate-duplicate frame (numPending == 0)
+// to elicit a fresh window advertisement from the receiver.
+// Must be called with sendMu held.
+func (rs *reliableState) armProbeLocked() {
+	if rs.probeRunning {
+		return
+	}
+	rs.probeRunning = true
+	rs.probeEpoch++
+	epoch := rs.probeEpoch
+	time.AfterFunc(rs.cfg.BaseRTO, func() { rs.sendWindowProbe(epoch) })
+}
+
+// stopProbeLocked cancels any pending probe by bumping the epoch so that the
+// goroutine scheduled by armProbeLocked self-aborts on the mismatch.
+// Must be called with sendMu held.
+func (rs *reliableState) stopProbeLocked() {
+	if rs.probeRunning {
+		rs.probeEpoch++ // stale goroutine will self-abort on epoch mismatch
+		rs.probeRunning = false
+	}
+}
+
+// sendWindowProbe is the AfterFunc callback for the window-probe timer.
+// It sends the oldest pending frame without incrementing p.retries (so the
+// channel is never closed because of a flow-control stall) and re-arms itself
+// if the sender is still blocked.
+func (rs *reliableState) sendWindowProbe(epoch uint64) {
+	rs.sendMu.Lock()
+	if rs.probeEpoch != epoch {
+		rs.sendMu.Unlock()
+		return
+	}
+	if rs.numPending == 0 {
+		// All sent frames have been ACKed, but peerWindow is still too small
+		// for the next frame (e.g. a transient small-window ACK arrived just
+		// as the last pending frame was freed).  Send a deliberate-duplicate
+		// frame (seq = nextSeq-1) so the receiver sets ackDirty = true and
+		// the ackBatcher sends back an ACK with the current receive window.
+		// nextSeq > 1 here because peerWindow == cfg.WindowSize when nextSeq
+		// == 1 (initial state), so preSend cannot block before any frame is sent.
+		probeSeq := rs.nextSeq - 1
+		rs.sendMu.Unlock()
+
+		sess := rs.channel.conn.sessionFast()
+		if sess != nil {
+			f := ackFramePool.Get().(*Frame)
+			f.ChannelId = rs.channel.id
+			f.Seq = probeSeq
+			DebugProbesFired.Add(1)
+			_ = sess.send(f)
+			*f = Frame{}
+			ackFramePool.Put(f)
+		}
+
+		// Re-arm if not cancelled by onAck/reset while we were outside the lock.
+		rs.sendMu.Lock()
+		if rs.probeEpoch == epoch {
+			rs.probeEpoch++
+			newEpoch := rs.probeEpoch
+			time.AfterFunc(rs.cfg.BaseRTO, func() { rs.sendWindowProbe(newEpoch) })
+		}
+		rs.sendMu.Unlock()
+		return
+	}
+	p := rs.earliestPendingLocked()
+	if p == nil {
+		rs.probeRunning = false
+		rs.sendMu.Unlock()
+		return
+	}
+	frame := p.frame
+	seq := p.seq
+	// Steal poolSF to prevent onAck from calling putSingleEventFrame (which
+	// clears frame.Events[0]) while sess.send is reading the frame below.
+	// Mirrors the pattern used in retransmit().
+	sf := p.poolSF
+	p.poolSF = nil
+	rs.retransmits.Add(1)
+	rs.sendMu.Unlock()
+
+	sess := rs.channel.conn.sessionFast()
+	if sess != nil {
+		dbg("reliable: window probe (no retry increment)",
+			"channel_id", rs.channel.id,
+			"seq", frame.Seq,
+		)
+		DebugProbesFired.Add(1)
+		_ = sess.send(frame)
+	}
+
+	// Restore poolSF; free it if onAck already freed the slot while we held it.
+	rs.sendMu.Lock()
+	ringSize := uint32(len(rs.pending))
+	slot := &rs.pending[seq%ringSize]
+	if slot.used && slot.seq == seq {
+		slot.poolSF = sf
+	} else if sf != nil {
+		putSingleEventFrame(sf)
+	}
+	// Re-arm the probe if it was not cancelled by onAck/reset while we were
+	// outside the lock.  Bump the epoch so the old closure self-aborts.
+	if rs.probeEpoch == epoch {
+		rs.probeEpoch++
+		newEpoch := rs.probeEpoch
+		time.AfterFunc(rs.cfg.BaseRTO, func() { rs.sendWindowProbe(newEpoch) })
 	}
 	rs.sendMu.Unlock()
 }
@@ -646,6 +833,7 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 		// In-order: deliver this frame and any consecutive buffered OOO frames.
 		// Keep recvMu held throughout to prevent a concurrent worker from
 		// delivering the next in-sequence frame to ch.events out of order.
+		DebugOnRecvInOrder.Add(1)
 		rs.deliverInOrderLocked(f)
 		rs.recvMu.Unlock()
 		return
@@ -681,6 +869,7 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 				"expected",   rs.expectSeq,
 				"gap",        gap,
 			)
+			DebugOOOTooFar.Add(1)
 		}
 
 	default:
@@ -690,6 +879,7 @@ func (rs *reliableState) onRecv(seq uint32, f *Frame) {
 			"seq",        seq,
 			"expected",   rs.expectSeq,
 		)
+		DebugOnRecvDuplicate.Add(1)
 	}
 
 	rs.ackDirty.Store(true)
@@ -725,12 +915,28 @@ func (rs *reliableState) deliverInOrderLocked(f *Frame) {
 	for {
 		slot := rs.oooHead
 		next := rs.oooFrames[slot]
+		// Always advance the circular-buffer head and shift the SACK bitmap,
+		// whether or not there is a consecutive OOO frame at this slot.
+		//
+		// Invariant: oooHead is the slot for gap=1 (seq=expectSeq+1) from the
+		// CURRENT expectSeq.  When deliverInOrderLocked advances expectSeq by 1
+		// for each in-order or OOO frame delivered, oooHead must advance in
+		// lock-step so that stored OOO frames remain at the correct slot for
+		// their updated gap.
+		//
+		// Without this advance, an in-order delivery that finds nil at oooHead
+		// (no consecutive OOO frame) would leave oooHead un-advanced.  Any OOO
+		// frame stored at gap > 1 from the old expectSeq is then 1 slot too far
+		// from the new oooHead, making it invisible to the drain loop when the
+		// gap eventually shrinks to 1.  The server would have freed that frame
+		// via SACK (believing the client received it in OOO), so it would never
+		// retransmit it — permanently losing the events it carried.
+		rs.oooHead = (rs.oooHead + 1) % reliableOOOWindow
+		rs.ooo >>= 1 // keep SACK bitmap in sync with window position
 		if next == nil {
 			break
 		}
 		rs.oooFrames[slot] = nil
-		rs.oooHead = (rs.oooHead + 1) % reliableOOOWindow
-		rs.ooo >>= 1 // keep SACK bitmap in sync with window position
 		rs.expectSeq++
 		drained++
 		for _, e := range next.Events {
@@ -755,7 +961,12 @@ func (rs *reliableState) deliverInOrderLocked(f *Frame) {
 	// one batcher tick (defaultACKDelay) if no piggybacking opportunity arises.
 }
 
-// myWindow returns the number of slots available in the receive channel buffer.
+// myWindow returns the number of slots available in the receive channel buffer,
+// capped at cfg.WindowSize.  The cap ensures the advertised window never
+// exceeds what the remote sender can actually use: onAck on the remote side
+// clamps peerWindow to cfg.WindowSize, so advertising more than cfg.WindowSize
+// free slots is meaningless and would cause the "last advertised = full"
+// sentinel (lastAdvWindow == cfg.WindowSize) to be set correctly.
 // Must be called with recvMu held (reads channel state without extra lock).
 func (rs *reliableState) myWindow() uint32 {
 	cap := rs.channel.ring.Cap()
@@ -763,6 +974,9 @@ func (rs *reliableState) myWindow() uint32 {
 	avail := cap - used
 	if avail < 0 {
 		avail = 0
+	}
+	if avail > rs.cfg.WindowSize {
+		avail = rs.cfg.WindowSize
 	}
 	return uint32(avail)
 }
@@ -787,7 +1001,7 @@ func (rs *reliableState) sendACK() {
 	// as the application drains events and myWindow() grows.  This covers
 	// both window=0 and non-zero restricted windows that can still deadlock
 	// the sender (e.g. peerWindow=1 with evtCount=63).
-	if window < uint32(rs.channel.ring.Cap()) {
+	if window < uint32(rs.cfg.WindowSize) {
 		rs.startWindowWatchLocked()
 	}
 	rs.recvMu.Unlock()
@@ -844,7 +1058,7 @@ func (rs *reliableState) windowWatch() {
 	}
 
 	rs.recvMu.Lock()
-	maxCap := uint32(rs.channel.ring.Cap())
+	maxCap := uint32(rs.cfg.WindowSize) // matches peerWindow cap in onAck on the remote side
 	if rs.myWindow() > rs.lastAdvWindow {
 		// Window has grown beyond what we last advertised — send an immediate
 		// update so the remote sender can unblock without waiting for ACKDelay.
@@ -881,9 +1095,10 @@ func (rs *reliableState) notifyWindowIncreased() {
 	rs.recvMu.Lock()
 	w := rs.myWindow()
 	// Only update if the window genuinely grew AND was previously restricted.
-	// lastAdvWindow is initialised to cfg.WindowSize, so this is a no-op until
-	// we have actually advertised a smaller window to the peer.
-	maxCap := uint32(rs.channel.ring.Cap())
+	// lastAdvWindow is initialised to cfg.WindowSize (== the sender's peerWindow
+	// cap), so this is a no-op until we have actually advertised a smaller
+	// window to the peer.
+	maxCap := uint32(rs.cfg.WindowSize)
 	if w <= rs.lastAdvWindow || rs.lastAdvWindow >= maxCap {
 		rs.recvMu.Unlock()
 		return
@@ -930,6 +1145,7 @@ func (rs *reliableState) waitEmpty(ctx context.Context) error {
 // reset clears all pending send-side state and wakes blocked senders.
 // Called when the underlying session closes (persistent reconnect or permanent close).
 func (rs *reliableState) reset() {
+	DebugReliableReset.Add(1)
 	dbg("reliable: resetting state",
 		"channel_id",  rs.channel.id,
 		"num_pending", rs.numPending,
@@ -945,8 +1161,10 @@ func (rs *reliableState) reset() {
 		rs.pending[i].frame = nil
 	}
 	rs.numPending = 0
+	rs.numPendingFast.Store(0)
 	rs.nextSeq = 1
 	rs.oldestSeq = 1
+	rs.lastWindowAckSeq = 0
 	rs.peerWindow = rs.cfg.WindowSize
 	rs.rto = rs.cfg.BaseRTO
 	rs.retransmits.Store(0)
@@ -954,6 +1172,7 @@ func (rs *reliableState) reset() {
 		rs.rtoTimer.Stop()
 		rs.rtoRunning = false
 	}
+	rs.stopProbeLocked()
 	rs.cond.Broadcast()
 	rs.sendMu.Unlock()
 
@@ -975,5 +1194,8 @@ func deliverEventToChannel(ch *Channel, e *Event) {
 	dbg("deliver event", "channel_id", ch.id, "type", e.Type)
 	if !ch.ring.push(e) {
 		dbg("reliable: channel buffer full, dropping event", "channel_id", ch.id)
+		DebugRingDropped.Add(1)
+	} else {
+		DebugEventsDelivered.Add(1)
 	}
 }

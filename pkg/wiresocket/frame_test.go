@@ -216,9 +216,10 @@ func TestUnmarshalFrameBodyErrorPaths(t *testing.T) {
 				0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
 		},
 		{
-			// Field 4 wire type 1 (I64 — AckBitmap) with only 2 payload bytes
-			// instead of the required 8.
-			// Tag: (4<<3)|1 = 0x21
+			// Field 4 wire type 1 (I64, tag 0x21).  AckBitmap now uses wire
+			// type 0 (varint, tag 0x20), so 0x21 is still parsed by consumeField
+			// as an I64 field.  Only 2 bytes follow instead of the required 8,
+			// so consumeField returns a "truncated I64" error.
 			name: "truncated_i64",
 			wire: []byte{0x00, 0x00, 0x21, 0x01, 0x02},
 		},
