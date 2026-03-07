@@ -13,7 +13,7 @@ If you use Nostr, you already understand this concept at the application layer. 
 Instead of connecting to `wss://relay.example.com`, you connect to:
 
 ```
-wiresocket://7b3a4f2e1d9c8b7a6f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0f9e@95.217.5.195:55900
+wire://wpub1rkljs3eq0zxqt8g6dmv7pcnw5afy29hejud5hsfcxpl84rg3ty9kwn66zf@95.217.5.195:55900
 ```
 
 The public key is the identity. The IP address is just a hint for how to reach it.
@@ -59,7 +59,7 @@ Wiresocket is a UDP-based event-stream protocol that uses the Noise IK handshake
 Where today a relay publishes `wss://relay.example.com`, a wiresocket relay publishes:
 
 ```
-wiresocket://9f8e7d6c5b4a3928170615243342516f7e8d9caabb0011223344556677889900@203.0.113.42:9000
+wire://wpub1j83kf5n4vhx20gwsm6ct9raz7elpq8yd3uf0nw2xk5rcjg7et4qhaysmv@203.0.113.42:9000
 ```
 
 That string contains everything a client needs to connect: the relay's permanent identity and a current network address. If the relay moves to a new host, only the address after the `@` changes. The identity before it stays forever.
@@ -92,7 +92,7 @@ Every layer is either sovereign or a stateless transport detail.
 
 The trust dependencies in the current stack are not just points of failure, they are points of surveillance. Each one leaks metadata about who is communicating with whom.
 
-**No DNS lookups.** When you connect to `wss://relay.example.com`, your DNS resolver sees the relay's domain name. Your ISP logs it. DNS-level censorship and surveillance systems record it. With wiresocket, you connect to an IP address directly. No domain name is resolved. No relay identity is leaked to any resolver. Your client connects to `wiresocket://9f8e7d...@203.0.113.42:9000` and the only thing your network sees is a UDP packet to `203.0.113.42`.
+**No DNS lookups.** When you connect to `wss://relay.example.com`, your DNS resolver sees the relay's domain name. Your ISP logs it. DNS-level censorship and surveillance systems record it. With wiresocket, you connect to an IP address directly. No domain name is resolved. No relay identity is leaked to any resolver. Your client connects to `wire://wpub1j83kf5...@203.0.113.42:9000` and the only thing your network sees is a UDP packet to `203.0.113.42`.
 
 **No SNI metadata.** TLS, despite encrypting application data, transmits the server's hostname in plaintext during the handshake via the Server Name Indication (SNI) extension. This is visible to every network observer between client and server. It is the primary mechanism by which nation-state firewalls identify and block specific services. Wiresocket's Noise IK handshake contains no hostname, no server identifier, no plaintext metadata. An observer sees UDP packets to an IP address, nothing more.
 
@@ -100,7 +100,7 @@ The trust dependencies in the current stack are not just points of failure, they
 
 **No certificate transparency logs.** Every TLS certificate issued by a public CA is logged in Certificate Transparency logs, public, append-only ledgers that anyone can search. This means that every domain a relay operator registers is publicly discoverable, permanently. Sovereign sockets have no certificates. There is nothing to log.
 
-**IP address decoupling.** Because identity is key-based, a relay can change IP addresses freely, moving between hosting providers, rotating through Tor exit nodes, or operating behind a shifting set of addresses. Clients reconnect by public key, not by address. The relay's network location becomes fluid while its identity remains fixed. A relay that was at `wiresocket://9f8e7d...@203.0.113.42:9000` can move to `wiresocket://9f8e7d...@198.51.100.7:9000` and clients recognize it as the same relay, because it is.
+**IP address decoupling.** Because identity is key-based, a relay can change IP addresses freely, moving between hosting providers, rotating through Tor exit nodes, or operating behind a shifting set of addresses. Clients reconnect by public key, not by address. The relay's network location becomes fluid while its identity remains fixed. A relay that was at `wire://wpub1j83kf5...@203.0.113.42:9000` can move to `wire://wpub1j83kf5...@198.51.100.7:9000` and clients recognize it as the same relay, because it is.
 
 **Mutual authentication without identity servers.** In the current stack, if a relay wants to know who you are (NIP-42 AUTH), it must implement an authentication flow over the already-established WebSocket, a protocol exchange on top of an unrelated transport layer. With wiresocket, the relay receives your public key during the handshake itself, encrypted and authenticated. Authentication is not a feature bolted on top, it is the handshake. No OAuth endpoints, no login forms, no session cookies, no additional round trips.
 
@@ -135,13 +135,13 @@ wss://paid-relay.site/ws
 It would instead contain sovereign socket addresses:
 
 ```
-wiresocket://7b3a4f2e1d9c8b7a6f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0f9e@95.217.5.195:55900
-wiresocket://9f8e7d6c5b4a3928170615243342516f7e8d9caabb0011223344556677889900@203.0.113.42:9000
-wiresocket://aabb00112233445566778899ffeeddccbbaa99887766554433221100ffeeddcc@198.51.100.7:4433
+wire://wpub1rkljs3eq0zxqt8g6dmv7pcnw5afy29hejud5hsfcxpl84rg3ty9kwn66zf@95.217.5.195:55900
+wire://wpub1j83kf5n4vhx20gwsm6ct9raz7elpq8yd3uf0nw2xk5rcjg7et4qhaysmv@203.0.113.42:9000
+wire://wpub1n60sw2xk5fvpj83hqetcraz7l4gmyd3u09nw28k5rcjg7elmq4tqka43gh@198.51.100.7:4433
 ```
 
 No domains. No certificates. Just keys and addresses.
 
-Client libraries would need a wiresocket transport adapter alongside their existing WebSocket transport. Relay software could adopt wiresocket as an alternative listener, running both transports simultaneously during any transition period. A NIP could formalize the `wiresocket://` URI scheme and define how relay public keys are published in kind-10002 relay list events.
+Client libraries would need a wiresocket transport adapter alongside their existing WebSocket transport. Relay software could adopt wiresocket as an alternative listener, running both transports simultaneously during any transition period. A NIP could formalize the `wire://` URI scheme and define how relay public keys are published in kind-10002 relay list events.
 
 The application layer stays sovereign. The transport layer becomes sovereign too.
