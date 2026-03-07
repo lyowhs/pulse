@@ -108,6 +108,7 @@ type reliableState struct {
 	rtoRunning        bool          // true while rtoTimer is armed or retransmit is in-flight
 	rto               time.Duration // current RTO (doubles on retransmit)
 	rtoTimer          *time.Timer
+	rtoEpoch          uint64        // incremented on every timer arm; stale goroutines self-abort
 	retransmitInFlight bool         // true while retransmit() goroutine is blocked in sess.send()
 
 	// retransmits counts the total number of frame retransmit events since
@@ -180,7 +181,7 @@ func newReliableState(ch *Channel, cfg ReliableCfg) *reliableState {
 		pending:       make([]pendingFrame, cfg.WindowSize),
 		peerWindow:    initPeerWindow,
 		rto:           cfg.BaseRTO,
-		lastAdvWindow: uint32(cap(ch.events)), // assume full receiver capacity until first ACK
+		lastAdvWindow: uint32(ch.ring.Cap()), // assume full receiver capacity until first ACK
 	}
 	rs.cond = sync.NewCond(&rs.sendMu)
 	return rs
@@ -193,6 +194,20 @@ func newAutoReliable(ch *Channel) *reliableState {
 }
 
 // ── send side ─────────────────────────────────────────────────────────────────
+
+// armRetransmitLocked stops any pending RTO timer and arms a new one with the
+// current rs.rto.  The new timer goroutine captures the current epoch; if a
+// newer timer is armed before it fires, the goroutine self-aborts.
+//
+// Must be called with sendMu held.
+func (rs *reliableState) armRetransmitLocked() {
+	if rs.rtoTimer != nil {
+		rs.rtoTimer.Stop()
+	}
+	rs.rtoEpoch++
+	epoch := rs.rtoEpoch
+	rs.rtoTimer = time.AfterFunc(rs.rto, func() { rs.retransmit(epoch) })
+}
 
 // preSend prepares frame for reliable delivery: assigns a sequence number,
 // piggybacks any pending ACK from the receive side, saves frame in the
@@ -261,7 +276,7 @@ func (rs *reliableState) preSend(frame *Frame, poolSF *singleEventFrame) error {
 			rs.lastAdvWindow = frame.WindowSize
 			// Start the window watch whenever we piggyback a restricted window so
 			// the remote sender is unblocked as soon as the buffer drains.
-			if frame.WindowSize < uint32(cap(rs.channel.events)) {
+			if frame.WindowSize < uint32(rs.channel.ring.Cap()) {
 				rs.startWindowWatchLocked()
 			}
 		}
@@ -280,7 +295,7 @@ func (rs *reliableState) preSend(frame *Frame, poolSF *singleEventFrame) error {
 
 	if !rs.rtoRunning {
 		rs.rtoRunning = true
-		rs.rtoTimer = time.AfterFunc(rs.rto, rs.retransmit)
+		rs.armRetransmitLocked()
 	}
 	rs.sendMu.Unlock()
 	return nil
@@ -400,19 +415,25 @@ func (rs *reliableState) onAck(ackSeq uint32, bitmap uint64, peerWindow uint32) 
 			rs.rtoTimer.Stop()
 		}
 		rs.rtoRunning = false
-	} else {
+	} else if freed > 0 {
+		// The window advanced: reset RTO to BaseRTO and re-arm the timer so
+		// that the oldest remaining in-flight frame is retransmitted promptly
+		// if it goes missing.
+		//
+		// When freed == 0 (duplicate ACK: AckSeq did not advance and no SACK
+		// bits were newly set), we do NOT touch the timer.  Resetting the
+		// timer on every duplicate ACK would perpetually postpone the
+		// retransmit of a lost frame: the server's ackBatcher fires every
+		// ACKDelay (20 ms), so a 200 ms retransmit timer reset on every ACK
+		// means the lost frame is never retransmitted.
 		earliest := rs.earliestPendingLocked()
 		if earliest != nil {
 			rs.rto = rs.cfg.BaseRTO
-			if rs.rtoTimer != nil {
-				rs.rtoTimer.Stop()
-				rs.rtoTimer = nil
-			}
 			// Only arm a new timer directly if no retransmit goroutine is
 			// in-flight.  If one is, it will re-arm after its send completes
 			// using the freshly-reset rto above.
 			if !rs.retransmitInFlight {
-				rs.rtoTimer = time.AfterFunc(rs.rto, rs.retransmit)
+				rs.armRetransmitLocked()
 			}
 		}
 	}
@@ -437,10 +458,34 @@ func (rs *reliableState) earliestPendingLocked() *pendingFrame {
 	return earliest
 }
 
-// retransmit is called by the AfterFunc timer.  It retransmits the oldest
-// unACKed frame with exponential RTO backoff.
-func (rs *reliableState) retransmit() {
+// retransmitBatchEntry holds one frame's state stolen from the pending ring
+// for the duration of the batch send (outside sendMu).
+type retransmitBatchEntry struct {
+	frame *Frame
+	seq   uint32
+	sf    *singleEventFrame
+}
+
+// retransmit is called by the AfterFunc timer (via a closure that captures
+// epoch).  It retransmits ALL pending frames whose individual RTO has expired
+// in a single batch, so that an OS-level burst drop of N packets (e.g. when
+// the server goroutine is preempted by SIGURG) causes at most one RTO delay
+// rather than N × RTO.
+//
+// epoch is used to self-abort stale timer goroutines: armRetransmitLocked
+// increments rs.rtoEpoch on every arm, and this function aborts if the epoch
+// it captured no longer matches rs.rtoEpoch under sendMu.  This prevents a
+// "leaked" timer goroutine (one whose rs.rtoTimer pointer was overwritten by a
+// later armRetransmitLocked call) from performing spurious retransmits and
+// prematurely exhausting MaxRetries.
+func (rs *reliableState) retransmit(epoch uint64) {
 	rs.sendMu.Lock()
+
+	// Self-abort if this goroutine belongs to a superseded timer.
+	if rs.rtoEpoch != epoch {
+		rs.sendMu.Unlock()
+		return
+	}
 
 	// Prevent goroutine pile-up: if a previous retransmit is still blocked
 	// inside sess.send() (waiting for the CC rate limiter), skip this timer
@@ -457,85 +502,123 @@ func (rs *reliableState) retransmit() {
 		return
 	}
 
-	p := rs.earliestPendingLocked()
-	if p == nil {
-		rs.rtoRunning = false
-		rs.sendMu.Unlock()
-		return
+	// Collect all pending frames whose RTO has expired (sentAt <= now - rto).
+	// Use the current rto (before doubling) as the expiry threshold.
+	now := time.Now()
+	cutoff := now.Add(-rs.rto)
+	ringSize := uint32(len(rs.pending))
+
+	// Stack-allocated backing array for small batches; grows to heap only for
+	// large windows where many frames expire simultaneously.
+	var stackBuf [16]retransmitBatchEntry
+	batch := stackBuf[:0]
+
+	maxRetriesSeq := uint32(0)
+	maxRetriesHit := false
+	for seq := rs.oldestSeq; seq < rs.nextSeq; seq++ {
+		p := &rs.pending[seq%ringSize]
+		if !p.used || p.seq != seq {
+			continue
+		}
+		if p.sentAt.After(cutoff) {
+			continue // RTO not yet expired for this frame
+		}
+		p.retries++
+		rs.retransmits.Add(1)
+		if p.retries > rs.cfg.MaxRetries {
+			maxRetriesSeq = seq
+			maxRetriesHit = true
+			break
+		}
+		p.sentAt = now
+		// Steal poolSF: prevents onAck from calling putSingleEventFrame
+		// (which clears frame.Events[0]) while sess.send reads it below.
+		sf := p.poolSF
+		p.poolSF = nil
+		batch = append(batch, retransmitBatchEntry{frame: p.frame, seq: seq, sf: sf})
 	}
 
-	p.retries++
-	rs.retransmits.Add(1)
-	if p.retries > rs.cfg.MaxRetries {
+	if maxRetriesHit {
+		// Restore poolSFs already stolen before hitting MaxRetries.
+		for _, e := range batch {
+			if e.sf != nil {
+				slot := &rs.pending[e.seq%ringSize]
+				if slot.used && slot.seq == e.seq {
+					slot.poolSF = e.sf
+				} else {
+					putSingleEventFrame(e.sf)
+				}
+			}
+		}
 		rs.sendMu.Unlock()
 		dbg("reliable: max retries exceeded, closing channel",
 			"channel_id", rs.channel.id,
-			"seq", p.seq,
-			"retries", p.retries,
+			"seq", maxRetriesSeq,
 		)
 		rs.channel.closeLocal()
 		return
 	}
 
-	// Exponential backoff.
+	if len(batch) == 0 {
+		// No expired frames yet — re-arm so the earliest pending frame is
+		// checked again after another rto.  armRetransmitLocked increments
+		// the epoch, so any concurrent or future timer goroutine from a
+		// previous arm will self-abort on the epoch check above.
+		if rs.numPending > 0 && rs.rtoRunning {
+			rs.armRetransmitLocked()
+		}
+		rs.sendMu.Unlock()
+		return
+	}
+
+	// Exponential backoff (once per retransmit round, not per frame).
 	rs.rto *= 2
 	if rs.rto > maxRTO {
 		rs.rto = maxRTO
 	}
-	p.sentAt = time.Now()
-	frame := p.frame
-	originalSeq := p.seq
-
-	// Temporarily steal poolSF from the pending slot so that onAck cannot
-	// call putSingleEventFrame while we are inside sess.send below (outside
-	// sendMu).  putSingleEventFrame clears slot[0] (the Event pointer for GC),
-	// but slot[0] is also frame.Events[0] — accessed by wireSize/AppendMarshal
-	// inside sess.send.  A concurrent clear would produce a nil-dereference panic.
-	//
-	// After sess.send completes we restore poolSF to the pending slot so that:
-	//  - subsequent retransmits (before ACK) find a valid Events[0], and
-	//  - onAck / reset can free the singleEventFrame in the normal way.
-	// If the slot was already ACKed (freed) while we held poolSF, we free it here.
-	retransmitSF := p.poolSF
-	p.poolSF = nil
 
 	// Mark in-flight BEFORE unlocking.  Do NOT arm the next timer here —
-	// arming it after sess.send() returns prevents goroutine pile-up when the
-	// CC rate limiter blocks the send for longer than the current RTO.
+	// arming it after all sends complete prevents goroutine pile-up when the
+	// CC rate limiter blocks for longer than the current RTO.
 	rs.retransmitInFlight = true
 	rs.sendMu.Unlock()
 
-	// Re-send outside the lock.  sess.send re-encrypts with a fresh nonce.
-	if sess := rs.channel.conn.sessionFast(); sess != nil {
-		dbg("reliable: retransmitting frame",
-			"channel_id", rs.channel.id,
-			"seq", frame.Seq,
-			"rto", rs.rto,
-		)
-		_ = sess.send(frame)
+	// Re-send all expired frames outside the lock.
+	// sess.send re-encrypts each with a fresh nonce.
+	sess := rs.channel.conn.sessionFast()
+	for _, e := range batch {
+		if sess != nil {
+			dbg("reliable: retransmitting frame",
+				"channel_id", rs.channel.id,
+				"seq", e.frame.Seq,
+				"rto", rs.rto,
+			)
+			_ = sess.send(e.frame)
+		}
 	}
 
-	// Re-arm the retransmit timer now that the (potentially rate-limited)
-	// send has completed.  Clear the in-flight flag so the next timer fire
-	// can proceed.  Use rs.rto as-is: onAck may have reset it to BaseRTO
-	// while we were blocked, giving us the correct (shorter) next timeout.
+	// Re-arm the retransmit timer now that all sends have completed.
+	// Clear the in-flight flag so the next timer fire can proceed.
+	// Use rs.rto as-is: onAck may have reset it to BaseRTO while we were
+	// blocked, giving the correct (shorter) next timeout.
 	rs.sendMu.Lock()
 	rs.retransmitInFlight = false
 
-	// Restore poolSF to the pending slot.  If the slot was ACKed (or reset)
-	// while poolSF was nil (i.e. while we held it), free it now.
-	if retransmitSF != nil {
-		ringSize := uint32(len(rs.pending))
-		slot := &rs.pending[originalSeq%ringSize]
-		if slot.used && slot.seq == originalSeq {
-			slot.poolSF = retransmitSF // restore; onAck/reset will free it
-		} else {
-			putSingleEventFrame(retransmitSF) // freed while we held it
+	// Restore poolSF for each batch entry.  If a slot was ACKed (or reset)
+	// while we held its poolSF, free the singleEventFrame here instead.
+	for _, e := range batch {
+		if e.sf != nil {
+			slot := &rs.pending[e.seq%ringSize]
+			if slot.used && slot.seq == e.seq {
+				slot.poolSF = e.sf // restore; onAck/reset will free it
+			} else {
+				putSingleEventFrame(e.sf) // freed while we held it
+			}
 		}
 	}
 
 	if rs.numPending > 0 && rs.rtoRunning {
-		rs.rtoTimer = time.AfterFunc(rs.rto, rs.retransmit)
+		rs.armRetransmitLocked()
 	}
 	rs.sendMu.Unlock()
 }
@@ -675,8 +758,8 @@ func (rs *reliableState) deliverInOrderLocked(f *Frame) {
 // myWindow returns the number of slots available in the receive channel buffer.
 // Must be called with recvMu held (reads channel state without extra lock).
 func (rs *reliableState) myWindow() uint32 {
-	cap := cap(rs.channel.events)
-	used := len(rs.channel.events)
+	cap := rs.channel.ring.Cap()
+	used := rs.channel.ring.Len()
 	avail := cap - used
 	if avail < 0 {
 		avail = 0
@@ -704,7 +787,7 @@ func (rs *reliableState) sendACK() {
 	// as the application drains events and myWindow() grows.  This covers
 	// both window=0 and non-zero restricted windows that can still deadlock
 	// the sender (e.g. peerWindow=1 with evtCount=63).
-	if window < uint32(cap(rs.channel.events)) {
+	if window < uint32(rs.channel.ring.Cap()) {
 		rs.startWindowWatchLocked()
 	}
 	rs.recvMu.Unlock()
@@ -761,7 +844,7 @@ func (rs *reliableState) windowWatch() {
 	}
 
 	rs.recvMu.Lock()
-	maxCap := uint32(cap(rs.channel.events))
+	maxCap := uint32(rs.channel.ring.Cap())
 	if rs.myWindow() > rs.lastAdvWindow {
 		// Window has grown beyond what we last advertised — send an immediate
 		// update so the remote sender can unblock without waiting for ACKDelay.
@@ -800,7 +883,7 @@ func (rs *reliableState) notifyWindowIncreased() {
 	// Only update if the window genuinely grew AND was previously restricted.
 	// lastAdvWindow is initialised to cfg.WindowSize, so this is a no-op until
 	// we have actually advertised a smaller window to the peer.
-	maxCap := uint32(cap(rs.channel.events))
+	maxCap := uint32(rs.channel.ring.Cap())
 	if w <= rs.lastAdvWindow || rs.lastAdvWindow >= maxCap {
 		rs.recvMu.Unlock()
 		return
@@ -885,21 +968,12 @@ func (rs *reliableState) reset() {
 	rs.recvMu.Unlock()
 }
 
-// deliverEventToChannel pushes an event into the channel's receive buffer.
-// Mirrors the delivery logic from conn.go (drop-oldest on overflow).
+// deliverEventToChannel pushes an event into the channel's ring buffer.
+// For reliable channels, flow control ensures the ring is never full in normal
+// operation.  On overflow, the newest event is dropped (drop-newest policy).
 func deliverEventToChannel(ch *Channel, e *Event) {
 	dbg("deliver event", "channel_id", ch.id, "type", e.Type)
-	select {
-	case ch.events <- e:
-	default:
-		dbg("reliable: channel buffer full, dropping oldest event", "channel_id", ch.id)
-		select {
-		case <-ch.events:
-		default:
-		}
-		select {
-		case ch.events <- e:
-		default:
-		}
+	if !ch.ring.push(e) {
+		dbg("reliable: channel buffer full, dropping event", "channel_id", ch.id)
 	}
 }

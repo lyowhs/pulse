@@ -232,25 +232,29 @@ func TestCoalescerDrainOnClose(t *testing.T) {
 		// conn.Done() fires.
 		WorkerCount: 1,
 		OnConnect: func(conn *wiresocket.Conn) {
-			// Read from the raw events channel so we can drain it even after
-			// conn.Done() closes.  conn.Recv() uses a select that may pick
-			// <-conn.Done() over pending events once the disconnect arrives,
-			// silently losing buffered events.
-			events := conn.Events()
+			// Use Events()/PopEvent() to drain events even after conn.Done()
+			// closes.  conn.Recv() returns ErrConnClosed on conn closure,
+			// which would silently discard buffered events.
+			sigCh := conn.Events()
 			done := conn.Done()
 			for {
 				select {
-				case e := <-events:
-					received <- e
+				case <-sigCh:
+					for {
+						e, ok := conn.PopEvent()
+						if !ok {
+							break
+						}
+						received <- e
+					}
 				case <-done:
 					// Connection closed; drain any events already buffered.
 					for {
-						select {
-						case e := <-events:
-							received <- e
-						default:
+						e, ok := conn.PopEvent()
+						if !ok {
 							return
 						}
+						received <- e
 					}
 				}
 			}

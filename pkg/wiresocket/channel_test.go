@@ -312,15 +312,19 @@ func TestChannelEventsReturnsSameChannel(t *testing.T) {
 	conn := mustDial(t, ctx, addr, kp)
 	ch := conn.Channel(1)
 
-	evtCh := ch.Events()
-	if evtCh == nil {
+	sigCh := ch.Events()
+	if sigCh == nil {
 		t.Fatal("Channel.Events() returned nil")
 	}
 
 	select {
-	case e := <-evtCh:
+	case <-sigCh:
+		e, ok := ch.PopEvent()
+		if !ok {
+			t.Fatal("Events() signalled but PopEvent returned nothing")
+		}
 		if e.Type != 77 {
-			t.Errorf("received Type=%d via Events(), want 77", e.Type)
+			t.Errorf("received Type=%d via Events()/PopEvent(), want 77", e.Type)
 		}
 	case <-ctx.Done():
 		t.Error("timeout: no event on Channel.Events()")
@@ -372,7 +376,14 @@ func TestConcurrentSendRecv(t *testing.T) {
 			case <-ctx.Done():
 				return
 			case <-conn.Events():
-				total.Add(1)
+				// Drain all available events after the signal.
+				for {
+					_, ok := conn.PopEvent()
+					if !ok {
+						break
+					}
+					total.Add(1)
+				}
 			}
 		}
 	}()

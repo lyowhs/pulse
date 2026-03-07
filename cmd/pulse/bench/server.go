@@ -68,25 +68,16 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		allowedPeers = append(allowedPeers, pk)
 	}
 
-	// With reliable delivery, serialise packet processing to prevent goroutine
-	// scheduling reorder on loopback from creating OOO gaps larger than the
-	// reliableOOOWindow.
-	workerCount := 0 // default: GOMAXPROCS
-	if reliable {
-		workerCount = 1
-	}
-
 	// MaxIncompleteFrames and EventBufSize are auto-computed by the library
 	// from the kernel UDP socket buffer size.
 	srvCfg := wiresocket.ServerConfig{
-		Addr:               addr,
-		PrivateKey:         privKey,
-		OnConnect:          makeEchoConn(reliable),
-		MaxPacketSize:      mtu,
-		CoalesceInterval:   coalesce,
-		WorkerCount:        workerCount,
-		AllowedPeers:       allowedPeers,
-		SendRateLimitBPS:   rateLimit,
+		Addr:             addr,
+		PrivateKey:       privKey,
+		OnConnect:        makeEchoConn(reliable),
+		MaxPacketSize:    mtu,
+		CoalesceInterval: coalesce,
+		AllowedPeers:     allowedPeers,
+		SendRateLimitBPS: rateLimit,
 	}
 	srv, err := wiresocket.NewServer(srvCfg)
 	if err != nil {

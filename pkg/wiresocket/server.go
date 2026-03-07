@@ -39,11 +39,14 @@ type ServerConfig struct {
 	// WorkerCount is the number of concurrent packet-processing goroutines.
 	// Defaults to GOMAXPROCS.
 	//
-	// When reliable delivery is enabled, use WorkerCount = 1 on loopback or
-	// other low-latency paths.  Multiple workers process packets concurrently,
-	// and goroutine scheduling jitter on loopback can reorder packets enough to
-	// create out-of-order gaps larger than the receiver's SACK window (64
-	// entries), causing permanent frame drops and retransmit storms.
+	// Multiple workers process packets concurrently; goroutine scheduling on
+	// loopback can reorder frames between workers, but the receiver's OOO
+	// buffer (reliableOOOWindow = 4096 entries) is large enough to absorb any
+	// practical reordering from a reasonably-sized worker pool.  Using a
+	// single worker (WorkerCount = 1) eliminates reordering but starves the
+	// work channel under retransmit bursts because the sole worker goroutine
+	// can be preempted for longer than the client's retransmit timeout,
+	// causing overflow drops and permanent frame loss.
 	WorkerCount int
 
 	// UnderLoad, if set, returns true when the server is under DoS stress and
@@ -114,9 +117,8 @@ type ServerConfig struct {
 	// WorkChannelSize is the number of incoming packets buffered between the
 	// UDP reader goroutine and the worker pool.  If the channel is full,
 	// excess packets are silently dropped.  Defaults to
-	// max(WorkerCount*64, 4096).  Increase this when sending large fragmented
-	// frames so the reader does not drop fragments before workers can process
-	// them (e.g. set to inflightCap * fragsPerEvent + 64).
+	// max(WorkerCount*64, EventBufSize*fragsPerEvent*2+64, 4096) — sized to
+	// hold the initial burst plus a concurrent retransmit burst without drops.
 	WorkChannelSize int
 }
 
@@ -157,6 +159,16 @@ func (cfg *ServerConfig) defaults() {
 			if ic < 1 {
 				ic = 1
 			}
+			// Cap at reliableOOOWindow: the OOO receive buffer holds at most
+			// reliableOOOWindow in-flight frames.  A larger EventBufSize would
+			// allow more frames in-flight than the OOO buffer can hold, causing
+			// OOO gaps that exceed the buffer at the receiver (permanent drops).
+			// This situation arises on small-MTU paths where the socket buffer
+			// can fit more frames than reliableOOOWindow (e.g. MTU<768 on 4 MiB
+			// sockets: ic = 4194304*3/4/MTU > 4096 = reliableOOOWindow).
+			if ic > reliableOOOWindow {
+				ic = reliableOOOWindow
+			}
 			cfg.EventBufSize = ic
 		}
 	}
@@ -173,9 +185,11 @@ func (cfg *ServerConfig) defaults() {
 		cfg.WorkerCount = runtime.GOMAXPROCS(0)
 	}
 	if cfg.WorkChannelSize == 0 {
-		// Size the work channel to hold all fragments of all inflight events
-		// plus worker-count headroom and keepalive packets.
-		cfg.WorkChannelSize = max(cfg.WorkerCount*64, cfg.EventBufSize*fragsPerEvent+64, 4096)
+		// Size the work channel to absorb the initial burst (EventBufSize
+		// events × fragsPerEvent fragments each) plus a concurrent retransmit
+		// burst of the same size, so that workerQueueFull drops do not occur
+		// even when worker goroutines are briefly preempted.
+		cfg.WorkChannelSize = max(cfg.WorkerCount*64, cfg.EventBufSize*fragsPerEvent*2+64, 4096)
 	}
 }
 
@@ -384,10 +398,11 @@ func (s *Server) Serve(ctx context.Context) error {
 			if err != nil {
 				select {
 				case <-ctx.Done():
+					return
 				default:
-					// Transient error — continue.
+					// Transient error (e.g. EINTR from Go async preemption) — retry.
+					continue
 				}
-				return
 			}
 			for i := 0; i < n; i++ {
 				msg := &msgs[i]
@@ -403,6 +418,7 @@ func (s *Server) Serve(ctx context.Context) error {
 				default:
 					// Worker queue full — drop packet (caller will retransmit).
 					s.pktBufPool.Put(rawBuf)
+					DebugWorkerQueueFull.Add(1)
 					if addr != nil {
 						dbg("server: worker queue full, dropping packet", "remote_addr", addr.String())
 					}
@@ -604,10 +620,12 @@ func (s *Server) handleData(pkt incomingPacket) {
 	sess, ok := s.sessions.Load(idx)
 	if !ok {
 		dbg("server: data packet for unknown session", "receiver_index", idx)
+		DebugDataDroppedUnknown.Add(1)
 		return
 	}
 	if sess.isDone() {
 		dbg("server: data packet for closed session", "receiver_index", idx)
+		DebugDataDroppedClosed.Add(1)
 		s.sessions.Delete(idx)
 		return
 	}

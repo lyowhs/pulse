@@ -136,6 +136,17 @@ type session struct {
 	fragCounter atomic.Uint32
 	fragMu      sync.Mutex
 	fragBufs    map[uint32]*reassemblyBuf
+
+	// sendQ is the async send queue for encrypted single-packet frames.
+	// Populated by send(); drained by the flushLoop goroutine, which calls
+	// WriteBatch (sendmmsg on Linux) to amortise per-syscall overhead.
+	// sendFragments bypasses the queue (it already builds its own batch).
+	sendQ chan sendQueueItem
+
+	// flushDone is closed by flushLoop when it exits.  clientReadLoop waits
+	// on this before closing the UDP socket so that any packets already queued
+	// in sendQ are transmitted before the socket becomes invalid.
+	flushDone chan struct{}
 }
 
 func newSession(
@@ -199,6 +210,8 @@ func newSession(
 		keepalive:      keepalive,
 		maxFragBufs:    maxFragBufs,
 		rateLimiter:    rl,
+		sendQ:          make(chan sendQueueItem, sendQueueCapFor(eventBuf)),
+		flushDone:      make(chan struct{}),
 	}
 	now := time.Now().UnixNano()
 	s.lastRecv.Store(now)
@@ -211,6 +224,11 @@ func newSession(
 		"timeout", timeout,
 		"keepalive", keepalive,
 	)
+	// Start the async send-queue flush goroutine (Item 1 optimisation).
+	go func() {
+		s.flushLoop()
+		close(s.flushDone)
+	}()
 	return s
 }
 
@@ -355,18 +373,43 @@ func (s *session) send(frame *Frame) error {
 		"plain_bytes", len(plain),
 		"packet_bytes", len(packet),
 	)
+
+	// If the session is already closing, flushLoop may have drained sendQ and
+	// exited.  Use synchronous write so late callers (e.g. ackBatcher's final
+	// sweep) still deliver their packets.
+	if s.closed.Load() {
+		err := s.writeRetry(packet)
+		putSendBuf(bp)
+		if err == nil {
+			s.touchLastSend()
+		}
+		return err
+	}
+
+	// Async path: enqueue to flushLoop for batched sendmmsg (Item 1).
+	// bp ownership transfers to the queue; flushLoop returns it to the pool.
+	//
+	// sendQueueCapFor(eventBufSize) sizes the queue to exceed inflightCap so
+	// that a full window burst can be enqueued without blocking.  The
+	// non-blocking select preserves the parallel pipeline between callers and
+	// flushLoop (blocking would serialise them, halving throughput at high
+	// frame rates).
+	//
+	// The synchronous fallback is a true last-resort safety net (OOM, giant
+	// buffer, etc.).  Under normal operation the queue never fills because
+	// sendQueueCapFor(eventBufSize) > inflightCap, so a sync bypass never
+	// reorders frames.
+	select {
+	case s.sendQ <- sendQueueItem{pkt: packet, bp: bp}:
+		s.touchLastSend()
+		return nil
+	default:
+	}
 	err := s.writeRetry(packet)
-	if err != nil {
-		dbg("send packet failed",
-			"local_index", s.localIndex,
-			"remote_index", s.remoteIndex,
-			"counter", counter,
-			"err", err,
-		)
-	} else {
+	putSendBuf(bp)
+	if err == nil {
 		s.touchLastSend()
 	}
-	putSendBuf(bp)
 	return err
 }
 
@@ -495,58 +538,9 @@ func (s *session) sendFragments(plain []byte) error {
 		}
 	}
 
-	// Send all fragments — one syscall for the entire frame on Linux
-	// (sendmmsg via PacketConn.WriteBatch), or a plain WriteToUDP loop elsewhere.
-	// ipv4.Message and ipv6.Message are both aliases for socket.Message, so the
-	// same msgs slice is accepted by both WriteBatch overloads without conversion.
-	var sendErr error
-	switch {
-	case s.pc != nil:
-		sent := 0
-		for sent < fragCount {
-			n, err := s.pc.WriteBatch(fb.msgs[sent:], 0)
-			sent += n
-			if err != nil {
-				if errors.Is(err, syscall.ENOBUFS) {
-					dbg("send: ENOBUFS on WriteBatch, retrying",
-						"local_index", s.localIndex,
-						"sent",        sent,
-						"total",       fragCount,
-					)
-					runtime.Gosched()
-					continue
-				}
-				sendErr = err
-				break
-			}
-		}
-	case s.pc6 != nil:
-		sent := 0
-		for sent < fragCount {
-			n, err := s.pc6.WriteBatch(fb.msgs[sent:], 0)
-			sent += n
-			if err != nil {
-				if errors.Is(err, syscall.ENOBUFS) {
-					dbg("send: ENOBUFS on WriteBatch, retrying",
-						"local_index", s.localIndex,
-						"sent",        sent,
-						"total",       fragCount,
-					)
-					runtime.Gosched()
-					continue
-				}
-				sendErr = err
-				break
-			}
-		}
-	default:
-		for _, msg := range fb.msgs {
-			if err := s.writeRetry(msg.Buffers[0]); err != nil {
-				sendErr = err
-				break
-			}
-		}
-	}
+	// Send all fragments — one syscall on Linux (sendmmsg via WriteBatch),
+	// or a plain loop on other platforms.
+	sendErr := s.writeBatchMsgs(fb.msgs)
 
 	for _, bp := range fb.bps {
 		putSendBuf(bp)
@@ -652,6 +646,15 @@ func (s *session) sendDisconnect() error {
 		"local_index", s.localIndex,
 		"remote_addr", s.remoteAddr.String(),
 	)
+	// Queue through sendQ so the disconnect is sent AFTER any data frames
+	// already in the queue.  This guarantees that the peer receives all data
+	// before it tears down the session on the disconnect packet.
+	// Fall back to writeRetry if the queue is full.
+	select {
+	case s.sendQ <- sendQueueItem{pkt: ciphertext, bp: bp}:
+		return nil
+	default:
+	}
 	err := s.writeRetry(ciphertext)
 	putSendBuf(bp)
 	if err != nil {

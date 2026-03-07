@@ -462,7 +462,14 @@ func TestReliableEchoSmallWindowNoDeadlock(t *testing.T) {
 		for {
 			select {
 			case <-evCh:
-				rxCount.Add(1)
+				// Drain all available events — the signal channel (cap=1)
+				// coalesces multiple pushes into one signal.
+				for {
+					if _, ok := ch.PopEvent(); !ok {
+						break
+					}
+					rxCount.Add(1)
+				}
 			case <-ctx.Done():
 				return
 			}

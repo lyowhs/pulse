@@ -196,6 +196,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	}
 	fmt.Fprintf(os.Stderr, "  running mtu=%-5d payload=%-10s duration=%s …\n",
 		mtu, fmtSize(int64(payloadSize)), dur)
+	wiresocket.ResetDebugCounters()
 
 	kp, err := wiresocket.GenerateKeypair()
 	if err != nil {
@@ -208,18 +209,6 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
-	// workerCount: reliable delivery requires in-order frame processing so
-	// that reliableState.onRecv never sees OOO gaps larger than
-	// reliableOOOWindow (256).  With GOMAXPROCS workers, goroutine scheduling
-	// stalls let frames overtake each other on loopback, creating gaps that
-	// exceed 256 → permanent frame drops → retransmit storm → conn.Flush
-	// timeout → large lost count.  A single worker serialises onRecv calls,
-	// keeping the gap ≤ 1 on an in-order loopback path.  When reliable is
-	// disabled the multi-worker path is safe (no OOO state to overflow).
-	workerCount := 0 // 0 = default (GOMAXPROCS)
-	if reliable {
-		workerCount = 1
-	}
 	srv, err := wiresocket.NewServer(wiresocket.ServerConfig{
 		Addr:                addr,
 		PrivateKey:          kp.Private,
@@ -227,7 +216,6 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 		MaxPacketSize:       mtu,
 		CoalesceInterval:    coalesce,
 		MaxEventPayloadSize: payloadSize,
-		WorkerCount:         workerCount,
 	})
 	if err != nil {
 		return oneResult{}, err
@@ -307,7 +295,7 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 
 	var hist rttHistogram
 
-	// Receiver goroutine — reads from ch.Events() directly rather than
+	// Receiver goroutine — reads from ch.Events() signal channel rather than
 	// ch.Recv so that closing ch.done (which happens inside conn.Close)
 	// does NOT cause it to exit before draining the buffer.  It runs until
 	// drainCtx is cancelled, which we defer until all echoes are confirmed.
@@ -315,26 +303,33 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	rxDone.Add(1)
 	go func() {
 		defer rxDone.Done()
-		evCh := ch.Events()
+		sigCh := ch.Events()
 		var rxCount int
 		for {
 			select {
-			case e := <-evCh:
-				// Compute RTT using the timestamp stored by the sender for
-				// this event.  rxCount matches txCount because the echo
-				// server reflects events in order and there is a single
-				// sender goroutine.
-				ts := sendTimes[rxCount&rttMask].Load()
-				if ts > 0 {
-					hist.record(time.Duration(time.Now().UnixNano() - ts))
-				}
-				rxCount++
-				rxMsgs.Add(1)
-				rxBytes.Add(int64(len(e.Payload)))
-				// Return the token so the sender can issue another event.
-				select {
-				case tokens <- struct{}{}:
-				default: // sender already stopped; discard
+			case <-sigCh:
+				// Drain all available events after the signal.
+				for {
+					e, ok := ch.PopEvent()
+					if !ok {
+						break
+					}
+					// Compute RTT using the timestamp stored by the sender for
+					// this event.  rxCount matches txCount because the echo
+					// server reflects events in order and there is a single
+					// sender goroutine.
+					ts := sendTimes[rxCount&rttMask].Load()
+					if ts > 0 {
+						hist.record(time.Duration(time.Now().UnixNano() - ts))
+					}
+					rxCount++
+					rxMsgs.Add(1)
+					rxBytes.Add(int64(len(e.Payload)))
+					// Return the token so the sender can issue another event.
+					select {
+					case tokens <- struct{}{}:
+					default: // sender already stopped; discard
+					}
 				}
 			case <-drainCtx.Done():
 				return
@@ -426,6 +421,25 @@ func runOne(dur time.Duration, mtu, payloadSize int, coalesce time.Duration, rel
 	var lossRate float64
 	if txAtStop > 0 {
 		lossRate = float64(lost) / float64(txAtStop) * 100
+	}
+
+	// Print diagnostic counters only when there is genuine packet loss —
+	// teardown-time errors (flushLoopErrors, dataDroppedUnknown) are expected
+	// when the server closes while the client has in-flight retransmits and
+	// do not indicate a bug when lost == 0.
+	if lost > 0 {
+		if flushErrs := wiresocket.DebugFlushLoopErrors.Load(); flushErrs != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] flushLoopErrors=%d\n", flushErrs)
+		}
+		if dropped := wiresocket.DebugDataDroppedClosed.Load(); dropped != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] dataDroppedClosed=%d\n", dropped)
+		}
+		if dropped := wiresocket.DebugDataDroppedUnknown.Load(); dropped != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] dataDroppedUnknown=%d\n", dropped)
+		}
+		if dropped := wiresocket.DebugWorkerQueueFull.Load(); dropped != 0 {
+			fmt.Fprintf(os.Stderr, "  [diag] workerQueueFull=%d\n", dropped)
+		}
 	}
 
 	secs := dur.Seconds()

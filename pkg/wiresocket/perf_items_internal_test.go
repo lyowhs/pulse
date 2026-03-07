@@ -112,7 +112,7 @@ func BenchmarkPreSendAckDirtyTrue(b *testing.B) {
 		rs.recvMu.Lock()
 		rs.ackDirty.Store(true)
 		rs.expectSeq = uint32(i + 1)
-		rs.lastAdvWindow = uint32(cap(ch.events)) // suppress windowWatch
+		rs.lastAdvWindow = uint32(ch.ring.Cap()) // suppress windowWatch
 		rs.recvMu.Unlock()
 
 		e := &Event{Type: 1}

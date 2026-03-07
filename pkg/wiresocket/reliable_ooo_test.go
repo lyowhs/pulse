@@ -77,7 +77,7 @@ func TestReliableOOOBeyond64(t *testing.T) {
 	}
 
 	// No events should be in ch.events yet: frame 1 (expectSeq=1) hasn't arrived.
-	if n := len(ch.events); n != 0 {
+	if n := ch.ring.Len(); n != 0 {
 		t.Fatalf("before frame 1: want 0 events in buffer, got %d", n)
 	}
 
@@ -85,13 +85,13 @@ func TestReliableOOOBeyond64(t *testing.T) {
 	rs.onRecv(1, makeOOOFrame(1))
 
 	// All total frames must now be in ch.events, delivered in order.
-	if n := len(ch.events); n != total {
+	if n := ch.ring.Len(); n != total {
 		t.Fatalf("after frame 1: want %d events in buffer, got %d (lost %d)",
 			total, n, total-n)
 	}
 
 	for i := 1; i <= total; i++ {
-		e := <-ch.events
+		e := ch.ring.mustPop()
 		want := byte(i & 0xFF)
 		if e.Payload[0] != want {
 			t.Fatalf("event %d: payload byte = %d, want %d (out-of-order delivery)",
@@ -118,21 +118,21 @@ func TestReliableOOOFullWindow(t *testing.T) {
 	}
 
 	// Nothing should be delivered yet.
-	if n := len(ch.events); n != 0 {
+	if n := ch.ring.Len(); n != 0 {
 		t.Fatalf("before frame 1: want 0 events, got %d", n)
 	}
 
 	// Frame 1 unlocks the full window.
 	rs.onRecv(1, makeOOOFrame(1))
 
-	if n := len(ch.events); n != total {
+	if n := ch.ring.Len(); n != total {
 		t.Fatalf("after frame 1: want %d events, got %d (lost %d)",
 			total, n, total-n)
 	}
 
 	// Verify in-order delivery.
 	for i := 1; i <= total; i++ {
-		e := <-ch.events
+		e := ch.ring.mustPop()
 		want := byte(i & 0xFF)
 		if e.Payload[0] != want {
 			t.Fatalf("event %d: payload byte = %d, want %d", i, e.Payload[0], want)
@@ -169,18 +169,18 @@ func TestReliableOOOSACKBitmapCoverage(t *testing.T) {
 		rs.onRecv(seq, makeOOOFrame(seq))
 	}
 
-	if n := len(ch.events); n != 0 {
+	if n := ch.ring.Len(); n != 0 {
 		t.Fatalf("before frame 1: want 0 events, got %d", n)
 	}
 
 	// Deliver frame 1 — drain through the SACK bitmap path.
 	rs.onRecv(1, makeOOOFrame(1))
 
-	if n := len(ch.events); n != total {
+	if n := ch.ring.Len(); n != total {
 		t.Fatalf("after frame 1: want %d events, got %d", total, n)
 	}
 	for i := 1; i <= total; i++ {
-		e := <-ch.events
+		e := ch.ring.mustPop()
 		if e.Payload[0] != byte(i&0xFF) {
 			t.Fatalf("event %d: wrong payload", i)
 		}
@@ -208,16 +208,16 @@ func TestReliableOOOCircularBufferWrap(t *testing.T) {
 	for seq := uint32(2); seq <= uint32(N)+1; seq++ {
 		rs.onRecv(seq, makeOOOFrame(seq))
 	}
-	if n := len(ch.events); n != 0 {
+	if n := ch.ring.Len(); n != 0 {
 		t.Fatalf("round 1 before frame 1: want 0 events, got %d", n)
 	}
 	rs.onRecv(1, makeOOOFrame(1))
-	if n := len(ch.events); n != N+1 {
+	if n := ch.ring.Len(); n != N+1 {
 		t.Fatalf("round 1 after frame 1: want %d events, got %d (lost %d)",
 			N+1, n, N+1-n)
 	}
 	for i := 1; i <= N+1; i++ {
-		e := <-ch.events
+		e := ch.ring.mustPop()
 		if e.Payload[0] != byte(i&0xFF) {
 			t.Fatalf("round 1 event %d: payload=%d want=%d", i, e.Payload[0], byte(i&0xFF))
 		}
@@ -239,11 +239,11 @@ func TestReliableOOOCircularBufferWrap(t *testing.T) {
 		rs.onRecv(seq, makeOOOFrame(seq))
 	}
 	rs.onRecv(base, makeOOOFrame(base))
-	if n := len(ch.events); n != N {
+	if n := ch.ring.Len(); n != N {
 		t.Fatalf("round 2: want %d events, got %d (lost %d)", N, n, N-n)
 	}
 	for i := 0; i < N; i++ {
-		e := <-ch.events
+		e := ch.ring.mustPop()
 		wantSeq := base + uint32(i)
 		if e.Payload[0] != byte(wantSeq&0xFF) {
 			t.Fatalf("round 2 event %d: payload=%d want=%d", i, e.Payload[0], byte(wantSeq&0xFF))
@@ -268,16 +268,16 @@ func TestReliableOOOCircularSlotIndexing(t *testing.T) {
 	}
 
 	// Verify no premature delivery.
-	if n := len(ch.events); n != 0 {
+	if n := ch.ring.Len(); n != 0 {
 		t.Fatalf("before in-order frame: want 0 events, got %d", n)
 	}
 
 	rs.onRecv(1, makeOOOFrame(1))
-	if n := len(ch.events); n != N+1 {
+	if n := ch.ring.Len(); n != N+1 {
 		t.Fatalf("after in-order frame: want %d events, got %d", N+1, n)
 	}
 	for i := 1; i <= N+1; i++ {
-		e := <-ch.events
+		e := ch.ring.mustPop()
 		if e.Payload[0] != byte(i&0xFF) {
 			t.Fatalf("event %d: out-of-order delivery (payload %d)", i, e.Payload[0])
 		}
@@ -451,8 +451,8 @@ func BenchmarkOOOInOrderDrain(b *testing.B) {
 			rs.onRecv(f.Seq, f)
 		}
 		// Drain events to prevent channel overflow on the next iteration.
-		for len(ch.events) > 0 {
-			<-ch.events
+		for ch.ring.Len() > 0 {
+			ch.ring.mustPop()
 		}
 		b.StartTimer()
 
@@ -463,8 +463,8 @@ func BenchmarkOOOInOrderDrain(b *testing.B) {
 		b.StopTimer()
 
 		// Drain events before next iteration (not timed).
-		for len(ch.events) > 0 {
-			<-ch.events
+		for ch.ring.Len() > 0 {
+			ch.ring.mustPop()
 		}
 	}
 	b.ReportMetric(float64(N), "frames/op")

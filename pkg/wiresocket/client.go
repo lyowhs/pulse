@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -150,6 +151,13 @@ func (cfg *DialConfig) defaults() {
 			// many events in-flight and overflow the socket buffer.
 			if ic < 1 {
 				ic = 1
+			}
+			// Cap at reliableOOOWindow: the OOO receive buffer holds at most
+			// reliableOOOWindow in-flight frames.  A larger EventBufSize would
+			// allow more frames in-flight than the OOO buffer can hold, causing
+			// OOO gaps that exceed the buffer at the receiver (permanent drops).
+			if ic > reliableOOOWindow {
+				ic = reliableOOOWindow
 			}
 			cfg.EventBufSize = ic
 		}
@@ -408,6 +416,10 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 	defer func() {
 		dbg("client: read loop stopped", "local_index", sess.localIndex)
 		sess.close()
+		// Wait for flushLoop to drain any queued packets before closing the
+		// UDP socket.  Without this, flushAndDrainSendQ would try to write
+		// to a closed socket and the queued packets would be silently lost.
+		<-sess.flushDone
 		conn.Close()
 	}()
 
@@ -438,6 +450,9 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 					continue
 				}
 				dbg("client: session expired after read timeout", "local_index", sess.localIndex)
+			} else if errors.Is(err, syscall.EINTR) {
+				// Transient signal interrupt (e.g. Go async preemption via SIGURG) — retry.
+				continue
 			} else {
 				dbg("client: read error", "local_index", sess.localIndex, "err", err)
 			}

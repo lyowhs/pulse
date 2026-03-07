@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrChannelClosed is returned when an operation is performed on a closed Channel.
@@ -29,7 +30,7 @@ const channelCloseType = uint8(255)
 type Channel struct {
 	id        uint16
 	conn      *Conn
-	events    chan *Event
+	ring      *eventRing // lock-free MPSC event buffer (Item 2)
 	done      chan struct{}
 	closeOnce sync.Once
 
@@ -43,10 +44,10 @@ type Channel struct {
 func newChannel(id uint16, conn *Conn, bufSize int) *Channel {
 	dbg("channel opened", "channel_id", id, "buf_size", bufSize)
 	ch := &Channel{
-		id:     id,
-		conn:   conn,
-		events: make(chan *Event, bufSize),
-		done:   make(chan struct{}),
+		id:   id,
+		conn: conn,
+		ring: newEventRing(bufSize),
+		done: make(chan struct{}),
 	}
 	ch.reliable.Store(newReliableState(ch, conn.newChannelCfg))
 	return ch
@@ -193,30 +194,58 @@ func (ch *Channel) Send(ctx context.Context, e *Event) error {
 //
 // For persistent conns, Recv blocks transparently during reconnection.
 func (ch *Channel) Recv(ctx context.Context) (*Event, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-ch.conn.done:
-		return nil, ErrConnClosed
-	case <-ch.done:
-		return nil, ErrChannelClosed
-	case e := <-ch.events:
-		// After draining an event, proactively send a window-update ACK if our
-		// receive window has grown beyond what we last advertised.  This unblocks
-		// a remote sender whose frame evtCount exceeds the last-advertised window
-		// without waiting for the ACKDelay timer (see notifyWindowIncreased).
-		if rs := ch.reliable.Load(); rs != nil {
-			rs.notifyWindowIncreased()
+	for {
+		// Non-blocking pop first (avoids goroutine scheduling for hot path).
+		if e, ok := ch.ring.pop(); ok {
+			// After draining an event, proactively send a window-update ACK if
+			// our receive window has grown beyond what we last advertised.
+			if rs := ch.reliable.Load(); rs != nil {
+				rs.notifyWindowIncreased()
+			}
+			return e, nil
 		}
-		return e, nil
+		// Block until a signal arrives, the context expires, or we are closed.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ch.conn.done:
+			return nil, ErrConnClosed
+		case <-ch.done:
+			// Prefer ErrConnClosed when the conn was also closed (e.g. conn.Close()
+			// closes conn.done then calls ch.closeLocal(), so both are closed).
+			select {
+			case <-ch.conn.done:
+				return nil, ErrConnClosed
+			default:
+				return nil, ErrChannelClosed
+			}
+		case <-ch.ring.Sig():
+			// Retry the pop on the next iteration.
+		}
 	}
 }
 
-// Events returns the read-only channel of incoming events on this channel.
+// Events returns a signal channel (capacity 1) that receives a struct{}
+// whenever at least one event is available in the channel's receive buffer.
+// Use PopEvent to retrieve the actual event(s) after receiving the signal.
 //
 // Prefer Recv for most use-cases; Events is provided for select-loop
 // integration where the caller drives its own multiplex logic.
-func (ch *Channel) Events() <-chan *Event { return ch.events }
+func (ch *Channel) Events() <-chan struct{} { return ch.ring.Sig() }
+
+// PopEvent removes and returns one event from the channel's receive buffer
+// without blocking.  Returns (nil, false) if the buffer is empty.
+// After a signal on Events(), call PopEvent in a loop until it returns false
+// to drain all pending events.
+func (ch *Channel) PopEvent() (*Event, bool) {
+	e, ok := ch.ring.pop()
+	if ok {
+		if rs := ch.reliable.Load(); rs != nil {
+			rs.notifyWindowIncreased()
+		}
+	}
+	return e, ok
+}
 
 // Done returns a channel that is closed when this channel is closed.
 func (ch *Channel) Done() <-chan struct{} { return ch.done }
@@ -259,10 +288,34 @@ func (ch *Channel) closeLocal() {
 	ch.closeOnce.Do(func() {
 		dbg("channel closed", "channel_id", ch.id)
 		close(ch.done)
+		// Close the ring so any goroutine blocked in Recv (waiting on ring.Sig)
+		// is woken and can observe the done channel.
+		ch.ring.close()
 		// Wake any goroutine blocked in preSend's cond.Wait so it can
 		// detect the channel-closed condition and return ErrChannelClosed.
 		if rs := ch.reliable.Load(); rs != nil {
 			rs.cond.Broadcast()
 		}
 	})
+}
+
+// recvTimeout blocks for up to timeout waiting for an event.
+// Used internally by tests and helpers; not part of the public API.
+func (ch *Channel) recvTimeout(timeout time.Duration) (*Event, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if e, ok := ch.ring.pop(); ok {
+			return e, true
+		}
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			return nil, false
+		}
+		t := time.NewTimer(rem)
+		select {
+		case <-ch.ring.Sig():
+			t.Stop()
+		case <-t.C:
+		}
+	}
 }

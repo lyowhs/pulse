@@ -195,19 +195,9 @@ func (c *Conn) wireSession(sess *session) {
 				}
 				return
 			}
-			// Deliver to the channel's buffer; drop oldest on overflow.
-			select {
-			case ch.events <- e:
-			default:
-				dbg("conn: channel buffer full, dropping oldest", "channel_id", f.ChannelId)
-				select {
-				case <-ch.events:
-				default:
-				}
-				select {
-				case ch.events <- e:
-				default:
-				}
+			// Deliver to the channel's ring; drop newest on overflow.
+			if !ch.ring.push(e) {
+				dbg("conn: channel buffer full, dropping event", "channel_id", f.ChannelId)
 			}
 		}
 	}
@@ -319,7 +309,7 @@ func (c *Conn) getOrOpenChannel(id uint16) *Channel {
 	if v, ok := c.channelMap.Load(id); ok {
 		return v.(*Channel)
 	}
-	ch := newChannel(id, c, cap(c.ch0.events))
+	ch := newChannel(id, c, c.ch0.ring.Cap())
 	// LoadOrStore is race-safe: only one goroutine wins; the rest use the winner.
 	actual, loaded := c.channelMap.LoadOrStore(id, ch)
 	if loaded {
@@ -370,25 +360,20 @@ func (c *Conn) SendFrame(ctx context.Context, frame *Frame) error {
 // Recv blocks until an event arrives on channel 0, ctx is cancelled, or the
 // connection is closed.
 func (c *Conn) Recv(ctx context.Context) (*Event, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.done:
-		return nil, ErrConnClosed
-	case <-c.ch0.done:
-		return nil, ErrConnClosed
-	case e := <-c.ch0.events:
-		if rs := c.ch0.reliable.Load(); rs != nil {
-			rs.notifyWindowIncreased()
-		}
-		return e, nil
-	}
+	return c.ch0.Recv(ctx)
 }
 
-// Events returns the underlying read-only channel of incoming events on
-// channel 0.
-func (c *Conn) Events() <-chan *Event {
-	return c.ch0.events
+// Events returns the signal channel for channel 0's receive buffer.
+// See Channel.Events for details.
+func (c *Conn) Events() <-chan struct{} {
+	return c.ch0.Events()
+}
+
+// PopEvent removes and returns one event from channel 0's receive buffer
+// without blocking.  Returns (nil, false) if the buffer is empty.
+// See Channel.PopEvent for details.
+func (c *Conn) PopEvent() (*Event, bool) {
+	return c.ch0.PopEvent()
 }
 
 // Done returns a channel that is closed when the Conn is permanently finished.
