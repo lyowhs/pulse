@@ -597,7 +597,7 @@ func (s *Server) handleHandshakeInit(ctx context.Context, pkt incomingPacket) {
 	}
 
 	sendKey, recvKey := hs.TransportKeys(false) // false = responder
-	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize, s.cfg.SessionTimeout, s.cfg.KeepaliveInterval, s.cfg.MaxIncompleteFrames, s.maxFragPayload, s.cfg.SendRateLimitBPS)
+	sess := newSession(localIdx, msg.SenderIndex, sendKey, recvKey, pkt.addr, s.conn, s.cfg.EventBufSize, s.cfg.SessionTimeout, s.cfg.KeepaliveInterval, 0 /* rekeyAfter: server does not initiate rekey */, s.cfg.MaxIncompleteFrames, s.maxFragPayload, s.cfg.SendRateLimitBPS)
 
 	// Wire the router before storing the session or sending the response.
 	// Once the session is visible to other workers (via sessions.Store) and

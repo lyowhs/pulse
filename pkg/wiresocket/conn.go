@@ -229,6 +229,7 @@ func (c *Conn) wireSession(sess *session) {
 }
 
 // reconnectLoop watches the current session for termination and reconnects.
+// It also initiates proactive rekeying when the session's key lifetime expires.
 // It runs for the lifetime of a persistent Conn.
 func (c *Conn) reconnectLoop() {
 	defer func() {
@@ -245,17 +246,55 @@ func (c *Conn) reconnectLoop() {
 		sess := c.sess
 		c.mu.RUnlock()
 
+		// Arm a timer to proactively rekey when the session's key lifetime
+		// expires.  A nil rekeyC (when rekeying is disabled) never fires.
+		var rekeyTimer *time.Timer
+		var rekeyC <-chan time.Time
+		if sess.rekeyAfterTime > 0 {
+			rekeyIn := sess.rekeyAfterTime - time.Since(sess.created)
+			if rekeyIn < 0 {
+				rekeyIn = 0
+			}
+			rekeyTimer = time.NewTimer(rekeyIn)
+			rekeyC = rekeyTimer.C
+		}
+
+		isRekey := false
 		select {
 		case <-c.ctx.Done():
+			if rekeyTimer != nil {
+				rekeyTimer.Stop()
+			}
 			if sess != nil {
 				_ = sess.sendDisconnect()
 				sess.close()
 			}
 			return
 		case <-sess.done:
+			if rekeyTimer != nil {
+				rekeyTimer.Stop()
+			}
+		case <-rekeyC:
+			isRekey = true
 		}
 
-		dbg("persistent: connection lost", "addr", c.addr)
+		if isRekey {
+			dbg("persistent: proactive rekey triggered",
+				"addr", c.addr, "session_age", time.Since(sess.created))
+			// Drain pending frames so the peer receives them before we close.
+			c.rekeyDrain()
+			sess.close()
+			// Interrupt any blocking ReadBatch so clientReadLoop exits its
+			// main loop promptly rather than waiting up to sess.timeout.
+			// This is safe for client sessions (dedicated UDP socket).
+			sess.udpConn.SetReadDeadline(time.Now())
+			// Wait until clientReadLoop has exited its packet-processing loop.
+			// This guarantees wireSession's rs.reset() calls below are not
+			// concurrent with onRecv/onAck calls from the old session's router.
+			<-sess.readLoopDone
+		} else {
+			dbg("persistent: connection lost", "addr", c.addr)
+		}
 
 		c.mu.Lock()
 		c.sess = nil
@@ -276,7 +315,8 @@ func (c *Conn) reconnectLoop() {
 			case <-time.After(backoff):
 			}
 
-			dbg("persistent: attempting reconnect", "addr", c.addr, "backoff", backoff)
+			dbg("persistent: attempting reconnect", "addr", c.addr,
+				"is_rekey", isRekey, "backoff", backoff)
 			raddr, udpConn, newSess, err := dialSession(c.ctx, c.addr, reconnectCfg)
 			if err != nil {
 				dbg("persistent: reconnect failed", "addr", c.addr, "err", err)
@@ -287,12 +327,12 @@ func (c *Conn) reconnectLoop() {
 				continue
 			}
 
-			dbg("persistent: reconnected", "addr", c.addr)
+			dbg("persistent: reconnected", "addr", c.addr, "is_rekey", isRekey)
 			// Wire the router before starting the read loop so the happens-before
 			// boundary ensures sess.router is visible inside the goroutine.
 			c.wireSession(newSess)
 			go clientReadLoop(udpConn, newSess, raddr)
-			go clientKeepaliveLoop(newSess)
+			go clientKeepaliveLoop(newSess, true)
 
 			c.mu.Lock()
 			c.sess = newSess
@@ -390,6 +430,10 @@ func (c *Conn) Done() <-chan struct{} {
 // events and waiting for reliable-channel ACKs before tearing down the session.
 const defaultDrainTimeout = 5 * time.Second
 
+// rekeyDrainTimeout is the maximum time rekeyDrain waits for pending reliable
+// frames to be ACKed before closing the old session and initiating rekey.
+const rekeyDrainTimeout = 5 * time.Second
+
 // Flush flushes any events buffered in the coalescer, sending them to the
 // remote peer immediately.  Unlike Close, Flush does not send a disconnect or
 // tear down the session — the connection remains open for further sends and
@@ -451,6 +495,29 @@ func (c *Conn) Close() error {
 	_ = c.sess.sendDisconnect()
 	c.sess.close()
 	return nil
+}
+
+// rekeyDrain flushes the coalescer and waits for all reliable channels to
+// receive ACKs from the current peer, bounded by rekeyDrainTimeout.  It is
+// called by reconnectLoop before closing the old session for a proactive rekey
+// so that in-flight frames are delivered before the session switches.
+// Unlike drainBeforeClose, it flushes rather than stops the coalescer — the
+// coalescer keeps running and will serve the new session after reconnect.
+func (c *Conn) rekeyDrain() {
+	ctx, cancel := context.WithTimeout(context.Background(), rekeyDrainTimeout)
+	defer cancel()
+	if c.coalescer != nil {
+		c.coalescer.flush(ctx)
+	}
+	c.channelMap.Range(func(_, v any) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		if rs := v.(*Channel).reliable.Load(); rs != nil {
+			_ = rs.waitEmpty(ctx)
+		}
+		return true
+	})
 }
 
 // drainBeforeClose flushes pending coalesced events and waits for reliable

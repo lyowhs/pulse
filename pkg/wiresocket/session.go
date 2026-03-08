@@ -33,7 +33,11 @@ type reassemblyBuf struct {
 const (
 	keepaliveInterval = 10 * time.Second
 	sessionTimeout    = 180 * time.Second
-	rekeyAfterTime    = 180 * time.Second
+	// defaultRekeyAfterTime is the default session key lifetime before a new
+	// handshake is initiated.  Chosen to be 60 s less than sessionTimeout so
+	// that a persistent connection has a full minute to complete the new
+	// handshake before the old session expires.
+	defaultRekeyAfterTime = 120 * time.Second
 	// rekeyAfterMessages: after 2^60 packets, re-key (effectively infinite
 	// for most workloads; included for completeness).
 	rekeyAfterMessages = uint64(1) << 60
@@ -123,6 +127,10 @@ type session struct {
 	// How often to send keepalive probes when data is idle.
 	keepalive time.Duration
 
+	// rekeyAfterTime is the maximum session key lifetime before a new handshake
+	// is initiated (persistent client connections only).  0 means disabled.
+	rekeyAfterTime time.Duration
+
 	// Maximum number of partially-reassembled fragmented frames buffered.
 	maxFragBufs int
 
@@ -147,6 +155,14 @@ type session struct {
 	// on this before closing the UDP socket so that any packets already queued
 	// in sendQ are transmitted before the socket becomes invalid.
 	flushDone chan struct{}
+
+	// readLoopDone is closed by clientReadLoop at the start of its defer,
+	// before sess.close() is called.  It signals that the read loop has
+	// exited its main packet-processing loop and will not call the session
+	// router again.  The rekey path in reconnectLoop waits on this channel
+	// before calling wireSession so that rs.reset() is never concurrent with
+	// a router call (onRecv/onAck) from the old session.
+	readLoopDone chan struct{}
 }
 
 func newSession(
@@ -157,6 +173,7 @@ func newSession(
 	eventBuf int,
 	timeout time.Duration,
 	keepalive time.Duration,
+	rekeyAfter time.Duration,
 	maxFragBufs int,
 	maxFragPayload int,
 	sendRateLimitBPS int64,
@@ -208,10 +225,12 @@ func newSession(
 		created:        time.Now(),
 		timeout:        timeout,
 		keepalive:      keepalive,
+		rekeyAfterTime: rekeyAfter,
 		maxFragBufs:    maxFragBufs,
 		rateLimiter:    rl,
 		sendQ:          make(chan sendQueueItem, sendQueueCapFor(eventBuf)),
 		flushDone:      make(chan struct{}),
+		readLoopDone:   make(chan struct{}),
 	}
 	now := time.Now().UnixNano()
 	s.lastRecv.Store(now)
@@ -968,9 +987,13 @@ func (s *session) isExpired() bool {
 }
 
 // needsRekey reports whether the session has exceeded the recommended key
-// lifetime and a new handshake should be initiated.
+// lifetime and a new handshake should be initiated.  Returns false when
+// rekeying is disabled (rekeyAfterTime == 0, e.g. server-side sessions).
 func (s *session) needsRekey() bool {
-	return time.Since(s.created) > rekeyAfterTime ||
+	if s.rekeyAfterTime == 0 {
+		return false
+	}
+	return time.Since(s.created) > s.rekeyAfterTime ||
 		atomic.LoadUint64(&s.sendCounter) >= rekeyAfterMessages
 }
 

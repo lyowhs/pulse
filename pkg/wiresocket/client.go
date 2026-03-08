@@ -57,6 +57,13 @@ type DialConfig struct {
 	// idle.  Defaults to 10 s.  Must be less than the server's SessionTimeout.
 	KeepaliveInterval time.Duration
 
+	// RekeyAfterTime is the maximum session key lifetime before a new
+	// handshake is initiated (persistent connections only).  Defaults to
+	// 120 s — 60 s less than the default SessionTimeout, giving a full minute
+	// for the new handshake to complete.
+	// Zero uses the library default.
+	RekeyAfterTime time.Duration
+
 	// MaxIncompleteFrames is the maximum number of partially-reassembled
 	// fragmented frames buffered per session.  Excess fragments are dropped.
 	// Defaults to 64.
@@ -120,6 +127,9 @@ func (cfg *DialConfig) defaults() {
 	}
 	if cfg.KeepaliveInterval == 0 {
 		cfg.KeepaliveInterval = keepaliveInterval
+	}
+	if cfg.RekeyAfterTime == 0 {
+		cfg.RekeyAfterTime = defaultRekeyAfterTime
 	}
 	// MaxPacketSize must be resolved before buffer-derived defaults.
 	if cfg.MaxPacketSize == 0 {
@@ -241,7 +251,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 		c.wireSession(sess)
 		dbg("persistent conn created", "addr", addr, "local_index", sess.localIndex)
 		go clientReadLoop(udpConn, sess, raddr)
-		go clientKeepaliveLoop(sess)
+		go clientKeepaliveLoop(sess, true)
 		go c.reconnectLoop()
 		if c.cc != nil {
 			go c.cc.run()
@@ -268,7 +278,7 @@ func Dial(ctx context.Context, addr string, cfg DialConfig) (*Conn, error) {
 		go cc.run()
 	}
 	go clientReadLoop(udpConn, sess, raddr)
-	go clientKeepaliveLoop(sess)
+	go clientKeepaliveLoop(sess, false)
 	return conn, nil
 }
 
@@ -390,7 +400,7 @@ func dialSession(ctx context.Context, addr string, cfg DialConfig) (*net.UDPAddr
 			)
 			sendKey, recvKey := hs.TransportKeys(true)
 			maxFrag := cfg.MaxPacketSize - sizeDataHeader - sizeFragmentHeader - sizeAEADTag
-			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize, cfg.SessionTimeout, cfg.KeepaliveInterval, cfg.MaxIncompleteFrames, maxFrag, cfg.SendRateLimitBPS)
+			sess := newSession(localIdx, resp.SenderIndex, sendKey, recvKey, raddr, conn, cfg.EventBufSize, cfg.SessionTimeout, cfg.KeepaliveInterval, cfg.RekeyAfterTime, cfg.MaxIncompleteFrames, maxFrag, cfg.SendRateLimitBPS)
 			return raddr, conn, sess, nil
 
 		case typeCookieReply:
@@ -433,6 +443,10 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 	dbg("client: read loop started", "local_index", sess.localIndex, "remote_addr", raddr.String())
 
 	defer func() {
+		// Signal that the main packet-processing loop has exited.  The rekey
+		// path in reconnectLoop waits on readLoopDone before calling
+		// wireSession to ensure rs.reset() is never concurrent with onRecv/onAck.
+		close(sess.readLoopDone)
 		dbg("client: read loop stopped", "local_index", sess.localIndex)
 		sess.close()
 		// Wait for flushLoop to drain any queued packets before closing the
@@ -505,7 +519,10 @@ func clientReadLoop(conn *net.UDPConn, sess *session, raddr *net.UDPAddr) {
 }
 
 // clientKeepaliveLoop sends keepalives and enforces the session timeout.
-func clientKeepaliveLoop(sess *session) {
+// persistent should be true for persistent Conn sessions; the reconnectLoop
+// handles proactive rekeying for those.  For non-persistent sessions,
+// clientKeepaliveLoop closes the session itself when the key lifetime expires.
+func clientKeepaliveLoop(sess *session, persistent bool) {
 	dbg("client: keepalive loop started", "local_index", sess.localIndex)
 	ticker := time.NewTicker(sess.keepalive)
 	defer ticker.Stop()
@@ -517,6 +534,12 @@ func clientKeepaliveLoop(sess *session) {
 		case <-ticker.C:
 			if sess.isExpired() {
 				dbg("client: session expired, closing", "local_index", sess.localIndex)
+				sess.close()
+				return
+			}
+			if !persistent && sess.needsRekey() {
+				dbg("client: session key lifetime exceeded, closing non-persistent connection",
+					"local_index", sess.localIndex)
 				sess.close()
 				return
 			}

@@ -1148,7 +1148,7 @@ func (rs *reliableState) reset() {
 	DebugReliableReset.Add(1)
 	dbg("reliable: resetting state",
 		"channel_id",  rs.channel.id,
-		"num_pending", rs.numPending,
+		"num_pending", rs.numPendingFast.Load(), // atomic: safe before sendMu
 	)
 	rs.sendMu.Lock()
 	// Free all pending frames; return any pool-owned frames to their pool.
